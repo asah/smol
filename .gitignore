@@ -1,3 +1,9 @@
+# postgres dir for LLMs to study
+postgres/
+
+# temp dirs
+results/
+
 # Prerequisites
 *.d
 
@@ -31,7 +37,7 @@
 
 # Executables
 *.exe
-*.out
+a.out
 *.app
 *.i*86
 *.x86_64

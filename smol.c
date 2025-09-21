@@ -59,6 +59,7 @@
 #include "miscadmin.h"
 #include "utils/guc.h"
 #include "port/atomics.h"
+#include "access/itup.h"
 
 PG_MODULE_MAGIC;
 
@@ -70,6 +71,8 @@ PG_MODULE_MAGIC;
 
 static bool smol_debug_log = false; /* toggled by GUC smol.debug_log */
 static int  smol_parallel_chunk_pages = 8; /* tunable via GUC */
+static int  smol_prefetch_distance = 1;    /* tunable via GUC */
+static int  smol_tuple_reset_period = 8192; /* amortize tuple pallocs */
 
 #if SMOL_TRACE
 #define SMOL_LOG(msg) \
@@ -103,6 +106,28 @@ _PG_init(void)
                             8,
                             1,
                             65536,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.prefetch_distance",
+                            "Number of pages to prefetch ahead in serial scans",
+                            "In serial scans, smol will prefetch this many pages ahead to reduce I/O stalls.",
+                            &smol_prefetch_distance,
+                            1,
+                            0,
+                            256,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.tuple_reset_period",
+                            "Reset tuple memory context after this many tuples",
+                            "Avoid per-tuple resets by batching frees to amortize overhead.",
+                            &smol_tuple_reset_period,
+                            8192,
+                            1,
+                            1048576,
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
@@ -157,6 +182,14 @@ typedef struct SmolScanOpaqueData
     uint32      pchunk_next;
     uint32      pchunk_end;
     uint32      pchunk_size;
+    int         prefetch_dist;  /* serial-scan prefetch distance */
+    int         tuple_since_reset; /* counter to amortize resets */
+    int         tuple_reset_period; /* GUC snapshot */
+    /* Prebuilt index tuple buffer to avoid per-row palloc */
+    IndexTuple  itup_buf;       /* reusable IndexTuple */
+    int         itup_len;       /* total length */
+    int         itup_data_off;  /* data start offset */
+    int32      *itup_write_off; /* [natts] aligned write offsets within data */
 } SmolScanOpaqueData;
 
 typedef SmolScanOpaqueData *SmolScanOpaque;
@@ -197,6 +230,7 @@ static SmolBuildState *smol_build_state_g = NULL; /* used by qsort comparator */
 static bool smol_tuple_matches_keys(IndexScanDesc scan, SmolTuple *itup);
 static void smol_extract_tuple_values(IndexScanDesc scan, SmolTuple *itup);
 static void smol_seek_lower_bound(IndexScanDesc scan);
+static BlockNumber smol_find_lower_bound_block(IndexScanDesc scan);
 static Datum smol_load_attr0(TupleDesc tupdesc, SmolTuple *stup);
 static int  smol_build_entry_cmp(const void *pa, const void *pb);
 static void smol_write_sorted_entries(SmolBuildState *bst);
@@ -624,6 +658,7 @@ smolbeginscan(Relation index, int nkeys, int norderbys)
     so->attlen = (int16 *) palloc(sizeof(int16) * so->natts);
     so->attbyval = (bool *) palloc(sizeof(bool) * so->natts);
     so->offsets = (int32 *) palloc(sizeof(int32) * so->natts);
+    so->itup_write_off = (int32 *) palloc(sizeof(int32) * so->natts);
     {
         int i;
         int32 off = 0;
@@ -638,8 +673,52 @@ smolbeginscan(Relation index, int nkeys, int norderbys)
     }
     so->pchunk_next = so->pchunk_end = 0;
     so->pchunk_size = smol_parallel_chunk_pages; /* pages per worker chunk */
+    so->prefetch_dist = smol_prefetch_distance;
+    so->tuple_since_reset = 0;
+    so->tuple_reset_period = smol_tuple_reset_period;
     
     scan->opaque = so;
+
+    /* Build a reusable IndexTuple buffer with correct alignment */
+    {
+        TupleDesc tupdesc = RelationGetDescr(index);
+        /* Prepare dummy values for an initial form to get header/len */
+        Datum *dvals = (Datum *) palloc(sizeof(Datum) * so->natts);
+        bool  *dnull = (bool *) palloc(sizeof(bool) * so->natts);
+        int i;
+        for (i = 0; i < so->natts; i++)
+        {
+            dnull[i] = false;
+            dvals[i] = (Datum) 0;
+        }
+        /* Allocate once; this tuple will be reused per row */
+        MemoryContext oldcxt = MemoryContextSwitchTo(CurrentMemoryContext);
+        IndexTuple itup = index_form_tuple(tupdesc, dvals, dnull);
+        MemoryContextSwitchTo(oldcxt);
+        pfree(dvals);
+        pfree(dnull);
+
+        so->itup_buf = itup;
+        so->itup_len = IndexTupleSize(itup);
+        so->itup_data_off = IndexInfoFindDataOffset(itup->t_info);
+
+        /* Compute aligned write offsets inside itup data area */
+        int32 offa = so->itup_data_off;
+        for (i = 0; i < so->natts; i++)
+        {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            char align = attr->attalign;
+            if (align == 's')
+                offa = (offa + 1) & ~1;
+            else if (align == 'i')
+                offa = (offa + 3) & ~3;
+            else if (align == 'd')
+                offa = MAXALIGN(offa);
+            /* 'c' means no alignment */
+            so->itup_write_off[i] = offa;
+            offa += attr->attlen;
+        }
+    }
     
     return scan;
 }
@@ -711,8 +790,8 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
         SMOL_LOGF("scan start nblocks=%u", nblocks);
         if (nblocks <= 1) /* only metapage exists */
             return false;
-        /* Wire up shared parallel state if available */
-        if (scan->parallel_scan && so->shared_pscan == NULL)
+        /* Wire up shared parallel state if available and forward */
+        if (dir == ForwardScanDirection && scan->parallel_scan && so->shared_pscan == NULL)
         {
             ParallelIndexScanDesc piscan = scan->parallel_scan;
             SmolParallelSharedDesc *ps = (SmolParallelSharedDesc *) OffsetToPointer(piscan, piscan->ps_offset);
@@ -723,10 +802,27 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                 ps->endBlock = (uint32) nblocks;
             }
         }
-        if (scan->parallel_scan && so->shared_pscan)
+        if (dir == ForwardScanDirection && scan->parallel_scan && so->shared_pscan)
         {
             /* Acquire a small chunk from the shared counter */
             SmolParallelSharedDesc *ps = (SmolParallelSharedDesc *) so->shared_pscan;
+            /* Adjust shared start block to lower bound if applicable */
+            if (so->nkeys > 0)
+            {
+                uint32 cur = pg_atomic_read_u32(&ps->nextBlock);
+                if (cur <= 1)
+                {
+                    BlockNumber lb = smol_find_lower_bound_block(scan);
+                    uint32 want = (uint32) Max((BlockNumber)1, lb);
+                    uint32 expected = cur;
+                    /* Try to advance nextBlock to lower bound */
+                    while (expected < want && !pg_atomic_compare_exchange_u32(&ps->nextBlock, &expected, want))
+                    {
+                        /* expected updated with current value; loop if still behind */
+                        ;
+                    }
+                }
+            }
             if (so->pchunk_next >= so->pchunk_end)
             {
                 uint32 base = pg_atomic_fetch_add_u32(&ps->nextBlock, so->pchunk_size);
@@ -743,14 +839,27 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
         }
         else
         {
-            smol_seek_lower_bound(scan);
-            if (!BufferIsValid(so->currBuf))
+            if (dir == BackwardScanDirection)
             {
-                /* fallback */
-                so->currBuf = ReadBuffer(index, 1);
+                /* Start from the last data page for backward scans */
+                BlockNumber lastblk = nblocks - 1;
+                so->currBuf = ReadBuffer(index, lastblk);
                 LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
-                so->currPos = FirstOffsetNumber;
+                Page page0 = BufferGetPage(so->currBuf);
+                so->currPos = PageGetMaxOffsetNumber(page0);
                 so->started = true;
+            }
+            else
+            {
+                smol_seek_lower_bound(scan);
+                if (!BufferIsValid(so->currBuf))
+                {
+                    /* fallback */
+                    so->currBuf = ReadBuffer(index, 1);
+                    LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
+                    so->currPos = FirstOffsetNumber;
+                    so->started = true;
+                }
             }
         }
     }
@@ -760,7 +869,9 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
         page = BufferGetPage(so->currBuf);
         maxoff = PageGetMaxOffsetNumber(page);
         
-        while (so->currPos <= maxoff)
+        /* Iterate over items on the current page in requested direction */
+        while ((dir != BackwardScanDirection && so->currPos <= maxoff) ||
+               (dir == BackwardScanDirection && so->currPos >= FirstOffsetNumber))
         {
             ItemId itemid = PageGetItemId(page, so->currPos);
             SMOL_LOGF("page=%u pos=%u used=%d dead=%d", BufferGetBlockNumber(so->currBuf), so->currPos, ItemIdIsUsed(itemid), ItemIdIsDead(itemid));
@@ -778,7 +889,10 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                     ItemPointerSetBlockNumber(&scan->xs_heaptid, 0);
                     ItemPointerSetOffsetNumber(&scan->xs_heaptid, FirstOffsetNumber);
                     SMOL_LOGF("return tuple at page=%u pos=%u", BufferGetBlockNumber(so->currBuf), so->currPos);
-                    so->currPos++;
+                    if (dir == BackwardScanDirection)
+                        so->currPos--;
+                    else
+                        so->currPos++;
                     return true;
                 }
                 else
@@ -786,14 +900,17 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                     SMOL_LOGF("tuple did not match scankeys at pos=%u", so->currPos);
                 }
             }
-            so->currPos++;
+            if (dir == BackwardScanDirection)
+                so->currPos--;
+            else
+                so->currPos++;
         }
         
         /* Move to next page */
         BlockNumber currblk2 = BufferGetBlockNumber(so->currBuf);
         UnlockReleaseBuffer(so->currBuf);
         so->currBuf = InvalidBuffer;
-        if (scan->parallel_scan && so->shared_pscan)
+        if (dir == ForwardScanDirection && scan->parallel_scan && so->shared_pscan)
         {
             SmolParallelSharedDesc *ps = (SmolParallelSharedDesc *) so->shared_pscan;
             if (so->pchunk_next >= so->pchunk_end)
@@ -805,22 +922,52 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                     break;
             }
             uint32 blk = so->pchunk_next++;
+            /* Optional light prefetch within the current chunk */
+            if (so->prefetch_dist > 0 && index->rd_smgr)
+            {
+                for (int k = 1; k <= so->prefetch_dist; k++)
+                {
+                    uint32 pblk = blk + k;
+                    if (pblk < so->pchunk_end)
+                        smgrprefetch(index->rd_smgr, MAIN_FORKNUM, (BlockNumber) pblk);
+                    else
+                        break;
+                }
+            }
             so->currBuf = ReadBuffer(index, (BlockNumber) blk);
             LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
             so->currPos = FirstOffsetNumber;
         }
         else
         {
-            BlockNumber nextblk = currblk2 + 1;
+            BlockNumber nextblk = (dir == BackwardScanDirection) ? (currblk2 - 1) : (currblk2 + 1);
             nblocks = RelationGetNumberOfBlocks(index);
-            if (nextblk < nblocks)
+            if ((dir != BackwardScanDirection && nextblk < nblocks) ||
+                (dir == BackwardScanDirection && nextblk >= 1))
             {
-                SMOL_LOGF("advance to next page %u", nextblk);
-                if (nextblk + 1 < nblocks && index->rd_smgr)
-                    smgrprefetch(index->rd_smgr, MAIN_FORKNUM, nextblk + 1);
+                SMOL_LOGF("advance to %s page %u", (dir == BackwardScanDirection ? "prev" : "next"), nextblk);
+                if (dir != BackwardScanDirection && so->prefetch_dist > 0 && index->rd_smgr)
+                {
+                    for (int k = 1; k <= so->prefetch_dist; k++)
+                    {
+                        BlockNumber pblk = nextblk + k;
+                        if (pblk < nblocks)
+                            smgrprefetch(index->rd_smgr, MAIN_FORKNUM, pblk);
+                        else
+                            break;
+                    }
+                }
                 so->currBuf = ReadBuffer(index, nextblk);
                 LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
-                so->currPos = FirstOffsetNumber;
+                if (dir == BackwardScanDirection)
+                {
+                    Page p = BufferGetPage(so->currBuf);
+                    so->currPos = PageGetMaxOffsetNumber(p);
+                }
+                else
+                {
+                    so->currPos = FirstOffsetNumber;
+                }
             }
             else
             {
@@ -844,8 +991,8 @@ smolendscan(IndexScanDesc scan)
     if (so->scankeys)
         pfree(so->scankeys);
 
-    if (scan->xs_itup)
-        pfree(scan->xs_itup);
+    if (((SmolScanOpaque) scan->opaque)->itup_buf)
+        pfree(((SmolScanOpaque) scan->opaque)->itup_buf);
 
     if (so->values_buf)
         pfree(so->values_buf);
@@ -886,23 +1033,23 @@ smol_tuple_matches_keys(IndexScanDesc scan, SmolTuple *itup)
             /* FIXED: More robust data extraction */
             dataptr = itup->data + so->offsets[attno];
             attr = TupleDescAttr(indexTupdesc, attno);
-            /* Fast path: first-key int2/int4/int8 direct compare by strategy */
-            if (attno == 0 && attr->attbyval && (attr->attlen == 2 || attr->attlen == 4 || attr->attlen == 8))
+            /* Fast path: integer types (int2/int4/int8) direct compare by strategy for any key */
+            if (attr->atttypid == INT2OID || attr->atttypid == INT4OID || attr->atttypid == INT8OID)
             {
                 int cmpv = 0;
-                if (attr->attlen == 2)
+                if (attr->atttypid == INT2OID)
                 {
                     int16 v; memcpy(&v, dataptr, 2);
                     int16 a = DatumGetInt16(key->sk_argument);
                     cmpv = (v > a) - (v < a);
                 }
-                else if (attr->attlen == 4)
+                else if (attr->atttypid == INT4OID)
                 {
                     int32 v; memcpy(&v, dataptr, 4);
                     int32 a = DatumGetInt32(key->sk_argument);
                     cmpv = (v > a) - (v < a);
                 }
-                else /* 8 */
+                else /* INT8OID */
                 {
                     int64 v; memcpy(&v, dataptr, 8);
                     int64 a = DatumGetInt64(key->sk_argument);
@@ -1004,13 +1151,19 @@ smol_extract_tuple_values(IndexScanDesc scan, SmolTuple *stup)
         dataptr += so->attlen[i];
     }
 
-    /* Free prior tuple, reset per-tuple context, and materialize */
-    if (scan->xs_itup)
-        pfree(scan->xs_itup);
-    MemoryContext oldcxt = MemoryContextSwitchTo(so->tuple_cxt);
-    MemoryContextReset(so->tuple_cxt);
-    scan->xs_itup = index_form_tuple(tupdesc, values, isnull);
-    MemoryContextSwitchTo(oldcxt);
+    /* Populate prebuilt IndexTuple buffer in-place (no per-row palloc) */
+    {
+        char *base = (char *) so->itup_buf;
+        for (i = 0; i < natts; i++)
+        {
+            char *dst = base + so->itup_write_off[i];
+            if (so->attbyval[i])
+                store_att_byval(dst, values[i], so->attlen[i]);
+            else
+                memcpy(dst, DatumGetPointer(values[i]), so->attlen[i]);
+        }
+        scan->xs_itup = so->itup_buf;
+    }
     scan->xs_itupdesc = tupdesc;
     SMOL_LOG("materialized xs_itup");
 
@@ -1019,6 +1172,14 @@ smol_extract_tuple_values(IndexScanDesc scan, SmolTuple *stup)
     ItemPointerSetInvalid(&scan->xs_heaptid);
 
     /* values/isnull buffers are reused across tuples */
+
+    /* Amortize context resets to reduce per-tuple overhead */
+    so->tuple_since_reset++;
+    if (so->tuple_since_reset >= so->tuple_reset_period)
+    {
+        MemoryContextReset(so->tuple_cxt);
+        so->tuple_since_reset = 0;
+    }
 }
 
 /* ---- Local helpers ----------------------------------------------------- */
@@ -1455,6 +1616,114 @@ smol_seek_lower_bound(IndexScanDesc scan)
         so->currPos = FirstOffsetNumber;
     }
     so->started = true;
+}
+
+/* Compute the first data block to scan based on lower-bound scankey on attno=1. */
+static BlockNumber
+smol_find_lower_bound_block(IndexScanDesc scan)
+{
+    Relation index = scan->indexRelation;
+    TupleDesc tupdesc = RelationGetDescr(index);
+    SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
+    BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+    int i;
+    bool have_lb = false;
+    int lb_strategy = 0; /* 3:=,4:>=,5:> */
+    Datum lb_value = (Datum) 0;
+    Oid coll = index->rd_indcollation[0];
+    FmgrInfo *cmp = NULL;
+
+    if (nblocks <= 1)
+        return 1;
+
+    for (i = 0; i < so->nkeys; i++)
+    {
+        ScanKey key = &so->scankeys[i];
+        if (key->sk_attno == 1 && (key->sk_strategy == 3 || key->sk_strategy == 4 || key->sk_strategy == 5))
+        {
+            have_lb = true;
+            lb_strategy = key->sk_strategy;
+            lb_value = key->sk_argument;
+            (void) lb_strategy;
+            break;
+        }
+    }
+    if (!have_lb)
+        return 1;
+
+    cmp = index_getprocinfo(index, 1, 1);
+
+    BlockNumber low = 1;
+    BlockNumber high = nblocks - 1; /* inclusive */
+
+    /* Consult metapage directory if present */
+    Buffer mbuf = ReadBuffer(index, 0);
+    LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+    Page mpage = BufferGetPage(mbuf);
+    SmolMetaPageData *meta = (SmolMetaPageData *) PageGetContents(mpage);
+    char *mdir = ((char *) meta) + sizeof(SmolMetaPageData);
+    int dkeylen = meta->dir_keylen;
+    uint32 dcount = meta->dir_count;
+    if (dkeylen > 0 && dcount > 0)
+    {
+        const char *mdir_last = mdir + (size_t)dcount * dkeylen;
+        int32 target32 = 0; int64 target64 = 0; int16 target16 = 0;
+        if (dkeylen == 2) target16 = DatumGetInt16(lb_value);
+        else if (dkeylen == 4) target32 = DatumGetInt32(lb_value);
+        else if (dkeylen == 8) target64 = DatumGetInt64(lb_value);
+
+        int64 lo = 0, hi = (int64)dcount - 1;
+        while (lo < hi)
+        {
+            int64 mid = lo + (hi - lo) / 2;
+            const char *entry = mdir_last + (size_t)mid * dkeylen;
+            int32 cmpdir;
+            if (dkeylen == 2)
+            { int16 v; memcpy(&v, entry, 2); cmpdir = (v < target16) ? -1 : (v > target16) ? 1 : 0; }
+            else if (dkeylen == 4)
+            { int32 v; memcpy(&v, entry, 4); cmpdir = (v < target32) ? -1 : (v > target32) ? 1 : 0; }
+            else
+            { int64 v; memcpy(&v, entry, 8); cmpdir = (v < target64) ? -1 : (v > target64) ? 1 : 0; }
+            if (cmpdir < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        low = (BlockNumber) lo + 1;
+        if (low > high) low = high;
+    }
+    UnlockReleaseBuffer(mbuf);
+
+    /* Fallback: page-level binary search by last key */
+    while (low < high)
+    {
+        BlockNumber mid = low + (high - low) / 2;
+        Buffer buf = ReadBuffer(index, mid);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        Page page = BufferGetPage(buf);
+        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        OffsetNumber pos = maxoff;
+        int32 c = -1;
+        while (pos >= FirstOffsetNumber)
+        {
+            ItemId itemid = PageGetItemId(page, pos);
+            if (ItemIdIsUsed(itemid) && !ItemIdIsDead(itemid))
+                break;
+            pos--;
+        }
+        if (pos >= FirstOffsetNumber)
+        {
+            SmolTuple *stup = (SmolTuple *) PageGetItem(page, PageGetItemId(page, pos));
+            Datum lastkey = smol_load_attr0(tupdesc, stup);
+            c = DatumGetInt32(FunctionCall2Coll(cmp, coll, lastkey, lb_value));
+        }
+        UnlockReleaseBuffer(buf);
+        if (c < 0)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return low;
 }
 static void
 smol_mark_heapblk0_allvisible(Relation heap)

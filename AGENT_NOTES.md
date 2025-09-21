@@ -40,6 +40,10 @@ This file summarizes the hard‑won details needed to work on the `smol` Postgre
 - Start cluster: `docker exec smol-dev-ctr bash -lc 'pg_ctlcluster 16 main start'`
 - Run tests: `docker exec smol-dev-ctr bash -lc 'su - postgres -c "cd /workspace && make installcheck"'`
 
+Reproducibility policy
+- Always run builds and regression tests inside Docker. Local host toolchains can have SDK or permission issues (e.g., macOS sysroot). Use the `smol-dev` container to ensure consistent PG 16 headers and tools.
+- Quick one-shot: `docker run --rm -t -v "$PWD":/workspace -w /workspace smol-dev bash -lc 'make clean && make && make install && make installcheck'`
+
 Regression suite
 - `sql/smol_basic.sql` and `expected/smol_basic.out` cover: IOS ordering, reject non‑IOS scans, NULL build error, and sealing writes.
 - Note: `DROP TRIGGER IF EXISTS` emits NOTICEs when triggers are absent; expected output should include them or use an alternative to suppress noise.
@@ -179,3 +183,12 @@ Open TODOs (next iteration targets)
 
 Notes for restart
 - If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context.
+
+### Delta Since Snapshot
+- Added GUC `smol.prefetch_distance` (default 1) and wired serial-scan prefetch to read up to N pages ahead; also light prefetch within a parallel chunk.
+- Implemented basic backward scan support in `amgettuple` for serial scans (ORDER BY ... DESC works). Parallel scans continue to operate forward only.
+- Extended integer fast-path comparisons (int2/int4/int8) to apply to any key attribute in `smol_tuple_matches_keys`.
+- Added regression tests:
+  - `sql/smol_desc.sql` / `expected/smol_desc.out` for descending order.
+  - `sql/smol_multicol.sql` / `expected/smol_multicol.out` for multi-column ordering and filtering.
+- Updated `Makefile` to include new tests in `REGRESS`.

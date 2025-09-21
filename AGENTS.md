@@ -25,7 +25,10 @@
 - Files: keep module in `smol.c`; extension script named `smol--X.Y.sql` on version bumps.
 
 ## Testing Guidelines
-- Add small, deterministic SQL scripts at repo root. Name tests `<feature>_test.sql`; benchmarks `<scenario>_benchmark.sql`.
+- Place SQL under these directories:
+  - `sql/` for regression tests (used by `make installcheck`).
+  - `bench/` for benchmarks and ad-hoc validation (parameterized psql scripts).
+- Avoid loose SQL files at repo root; use parameters to reduce file count.
 - Verify index-only behavior with `EXPLAIN (ANALYZE, BUFFERS)`: expect `Index Only Scan` using `smol`.
 - Run examples: `psql -f debug_test.sql` and review output; avoid long benchmarks by default.
 

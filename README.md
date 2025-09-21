@@ -83,23 +83,27 @@ CREATE INDEX idx_smol ON some_table USING smol (col1, col2);
 Planner
 - Favor IOS as usual; SMOL will error if planner attempts non‑IOS
 - Parallel scans are supported and often chosen on large relations
+- Mixed‑type comparisons across int2/int4/int8 are indexable (Index Cond) via SMOL's cross‑type operators.
+- Sealing is explicit: use `smol_seal_table('tbl'::regclass)` / `smol_unseal_table('tbl'::regclass)`; the AM remains read‑only for inserts while any SMOL index exists (no auto‑sealing on CREATE INDEX).
 
 ## Tests & Benchmarks
 
 Regression
-- `make installcheck` (runs `sql/smol_basic.sql`): verifies IOS, ordering, and NULL rejection
+- Recommended (reproducible via Docker): `make dockercheck`
+  - Builds the Docker image, installs the extension in a clean PostgreSQL 16 environment, starts the cluster, and runs pg_regress.
+- Local (if you have PG dev headers): `make installcheck`
+  - Runs `sql/smol_basic.sql` plus any additional tests included in `REGRESS`.
 
-Benchmarks (root)
-- `bench_brc.sql` — BRC‑style (two int2), BTREE vs SMOL; ensures BTREE VM bits for IOS
-- `bench_fixed.sql` — Combined fixed‑width benchmarks:
-  - SMALLINT uniprocessor
-  - SMALLINT parallel
-  - INT4 uniprocessor
-  - INT4 parallel
+Benchmarks (parameterized)
+- Generic: `bench/smol_bench.sql`
+  - Params: `dtype` (int2|int4|int8), `rows`, `par_workers`, `maxval`, `thr`, and optional `nofilter` for full scans.
+  - Example: `psql -v dtype=int2 -v rows=50000000 -v par_workers=6 -v maxval=32767 -v thr=5000 -f bench/smol_bench.sql`
+- Correctness: `bench/smol_correctness.sql` (int2 + int4 sums vs BTREE)
+  - Params: `rows_si`, `rows_i4`.
 
-Run in Docker
-- `docker exec smol-dev-ctr bash -lc "su - postgres -c 'psql -f /workspace/bench_brc.sql'"`
-- `docker exec smol-dev-ctr bash -lc "su - postgres -c 'psql -f /workspace/bench_fixed.sql'"`
+Convenience (Docker)
+- `make dockercheck` — run regression in a container
+- `make dockerbench-50m-par6` — 50M int2 with 6 workers at `thr=5000` and `thr=30000`
 
 Interpreting results
 - Check `pg_relation_size` for index size; expect SMOL < BTREE

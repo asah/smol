@@ -1,57 +1,95 @@
 -- basic regression for smol: ordered, read-only (via sealing), index-only, drop/recreate, multi-index
 CREATE EXTENSION IF NOT EXISTS plpgsql;
+NOTICE:  extension "plpgsql" already exists, skipping
 CREATE EXTENSION smol;
 SET smol.debug_log = on;  -- enable verbose tracing during tests
-
 -- base table without NULLs
 CREATE TABLE t(a int, b int);
 INSERT INTO t(a,b)
 SELECT i, i*10 FROM generate_series(1,10) AS s(i);
-
 -- build index (locks table via AM), then seal table from writes
 CREATE INDEX t_a_smol ON t USING smol(a);
 SELECT smol_seal_table('t'::regclass);
+NOTICE:  trigger "smol_block_ins" for relation "t" does not exist, skipping
+NOTICE:  trigger "smol_block_upd" for relation "t" does not exist, skipping
+NOTICE:  trigger "smol_block_del" for relation "t" does not exist, skipping
+ smol_seal_table 
+-----------------
+ 
+(1 row)
 
 -- index-only scan: ensure results and order
 SET enable_seqscan = off;
 SELECT a FROM t WHERE a >= 7 ORDER BY a;
+ a  
+----
+  7
+  8
+  9
+ 10
+(4 rows)
+
 -- also verify DESC ordering works
 SELECT a FROM t WHERE a >= 7 ORDER BY a DESC;
+ a  
+----
+ 10
+  9
+  8
+  7
+(4 rows)
 
 -- reject non-index-only scans
 SET enable_indexonlyscan = off;  -- planner will try Index Scan
 SET enable_indexscan = on;
 SELECT a FROM t WHERE a >= 7;
-
+ERROR:  smol supports index-only scans only
 -- restore index-only path
 SET enable_indexonlyscan = on;
 SET enable_indexscan = off;
-
 -- writes should be blocked while sealed
 -- expect ERROR
 INSERT INTO t VALUES (11, 110);
-
+ERROR:  table is sealed: writes are disabled
 -- drop index and recreate with same name; index should work
 DROP INDEX t_a_smol;
 CREATE INDEX t_a_smol ON t USING smol(a);
 SELECT a FROM t WHERE a >= 7 ORDER BY a;
+ a  
+----
+  7
+  8
+  9
+ 10
+(4 rows)
 
 -- unseal table and confirm writes are allowed again
 SELECT smol_unseal_table('t'::regclass);
+ smol_unseal_table 
+-------------------
+ 
+(1 row)
+
 -- with SMOL index present, writes still fail (AM is read-only)
 -- expect ERROR
 INSERT INTO t VALUES (11, 110);
+ERROR:  smol is read-only: aminsert is not supported
 -- drop SMOL index; writes should now succeed
 DROP INDEX t_a_smol;
 INSERT INTO t VALUES (11, 110);
 SELECT a FROM t WHERE a >= 10 ORDER BY a;
+ a  
+----
+ 10
+ 11
+(2 rows)
 
 -- verify NULLs unsupported at build time
 CREATE TABLE t_null(a int);
 INSERT INTO t_null VALUES (1), (NULL);
 -- expect ERROR
 CREATE INDEX t_null_idx ON t_null USING smol(a);
-
+ERROR:  smol does not support NULL values
 -- multi-column table: create multiple SMOL indexes and verify basic scans
 CREATE TABLE tm(a int, b int, c int, d int);
 INSERT INTO tm VALUES
@@ -67,4 +105,20 @@ CREATE INDEX tm_ab_smol ON tm USING smol(a, b);
 CREATE INDEX tm_cd_smol ON tm USING smol(c, d);
 SET enable_seqscan = off;
 SELECT a,b FROM tm WHERE a = 2 ORDER BY b;
+ a | b  
+---+----
+ 2 |  5
+ 2 | 10
+ 2 | 20
+(3 rows)
+
 SELECT c,d FROM tm WHERE c >= 40 ORDER BY c;
+ c  |  d  
+----+-----
+ 40 | 400
+ 50 | 500
+ 60 | 600
+ 70 | 700
+ 80 | 800
+(5 rows)
+
