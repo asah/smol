@@ -40,6 +40,45 @@
 - Directory-assisted lower-bound + prefetching noticeably helps selective scans; chunking scales well with more workers.
 - Feature scope is unchanged: fixed-width, non-NULL key types; no INCLUDE columns; no bitmap scans; read-only AM.
 
+**Deeper Performance Analysis**
+- Scan-time vs build-time: Comparator specialization speeds index build (qsort hot path), not query time. Measured speedups come from scan-time changes: directory seeks, parallel chunking, and prefetch.
+- Why full-scan gains ~2x: With par=2 and mostly warm cache, work is dominated by touching all pages and summing. Conservative prefetch (1) adds little when I/O isn’t the bottleneck. Chunking helps modestly with only two workers.
+- Why selective gains are larger: For predicates like `b > const`, the metapage first/last-key directory lets scans jump near the first qualifying page, avoiding wasted reads. Combined with tighter packing, fewer buffers are touched and parallel workers keep busy.
+- Why par=6 shines: More workers increase coordination overhead in naive schedulers. Chunk-based scheduling reduces contention and improves balance, amplifying benefits at higher parallelism (e.g., ~4.1x over BTREE in selective run).
+- Compare to baseline smol.c: Improvements will be most visible on selective, higher-parallel runs with integer first keys. Full-scan, low-par cases show smaller but consistent gains. For a definitive delta, run the A/B plan below.
+
+**How To Realize Larger Gains**
+- Tune GUCs for your hardware profile:
+  - `smol.prefetch_distance`: try 4–8 to hide disk latency on cold-cache or I/O-bound runs.
+  - `smol.parallel_chunk_pages`: try 16–64 to reduce atomic updates per chunk and improve per-worker throughput.
+- Scale parallelism: Use `max_parallel_workers_per_gather` of 4–8+ (and ensure enough global workers). Chunking yields better scaling under higher `par_workers`.
+- Target selective scans: Keep the first index key as int2/int4/int8 (directory-enabled) and shape predicates as lower bounds (`b > c`) to exploit directory seeks.
+- Evaluate on cold cache: Prefetching shows its value when reads hit storage rather than cache.
+
+**Evidence From Current Runs**
+- Full scan, par=2: `results/bench_20M_int2_par2_fullscan.out:1` — BTREE ~1021.8 ms vs SMOL ~513.2 ms (IOS, Heap Fetches: 0).
+- Selective, par=2: `results/bench_20M_int2_par2_thr5000.out:1` — BTREE ~943.8 ms vs SMOL ~452.4 ms.
+- Selective, par=6: `results/bench_20M_int2_par6_thr5000.out:1` — BTREE ~1111.7 ms vs SMOL ~273.3 ms.
+
+**A/B Validation Plan (Baseline vs Enhanced)**
+- Baseline build: restore/keep `smol.c` (baseline), `make && make install`, run 20M benches; save outputs.
+- Enhanced build: copy `CLAUDE_GROK_ENHANCED_smol.c` over `smol.c`, rebuild/install, run identical benches; save outputs.
+- Compare cases: full scan par={2,6}, selective par={2,6}, dtypes {int2,int4,int8}.
+
+Example (inside Docker):
+- Baseline: `make clean && make && make install` then `psql -v dtype=int2 -v rows=20000000 -v par_workers=6 -v thr=5000 -f bench/smol_bench.sql`
+- Enhanced: `cp CLAUDE_GROK_ENHANCED_smol.c smol.c && make clean && make && make install` then rerun the same command.
+
+**Suggested Experiment Matrix**
+- dtype: int2, int4, int8
+- par_workers: 1, 2, 4, 8
+- smol.prefetch_distance: 1, 4, 8
+- smol.parallel_chunk_pages: 8, 32, 64
+- predicate: full-scan vs `b > 5000`
+
+**Caveats**
+- Prototype limitations remain: no WAL/FSM, placeholder cost model, no bitmap scans or INCLUDE columns, fixed-width types only. Planner choices may still vary; include `EXPLAIN (ANALYZE, BUFFERS)` for verification.
+
 **Reproduce**
 - Build Docker image: `docker build -t smol-dev .`
 - Run container: `docker run --rm -it -v "$PWD":/workspace -w /workspace smol-dev bash`
@@ -52,4 +91,3 @@
 **Tunable GUCs**
 - `smol.parallel_chunk_pages` — pages per parallel work chunk (load balance vs. overhead).
 - `smol.prefetch_distance` — pages to prefetch ahead (serial and within-chunk prefetching).
-
