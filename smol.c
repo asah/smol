@@ -137,7 +137,7 @@ _PG_init(void)
 
 /* metapage magic/version */
 #define SMOL_META_MAGIC   0x53534D4C /* 'SSML' */
-#define SMOL_META_VERSION 1
+#define SMOL_META_VERSION 2
 
 typedef struct SmolMetaPageData
 {
@@ -146,7 +146,8 @@ typedef struct SmolMetaPageData
     uint16      nkeyatts;   /* number of key attributes */
     uint16      natts;      /* total attributes incl. INCLUDE */
     uint16      dir_keylen; /* 0 (none), 2, 4, 8 for first-key directory entry size */
-    uint32      dir_count;  /* number of entries (data pages) */
+    uint32      dir_count;  /* number of entries (pages or groups) */
+    uint16      dir_group;  /* grouping factor (pages per entry), 1 = per-page */
 } SmolMetaPageData;
 
 /*
@@ -190,6 +191,21 @@ typedef struct SmolScanOpaqueData
     int         itup_len;       /* total length */
     int         itup_data_off;  /* data start offset */
     int32      *itup_write_off; /* [natts] aligned write offsets within data */
+
+    /* Directory for page/group min/max on first key (optional, cached from metapage) */
+    int         dir_keylen;     /* 0 if none */
+    uint32      dir_count;      /* number of directory entries */
+    uint16      dir_group;      /* pages per entry (1 = per-page) */
+    char       *dir_first;      /* [dir_count * dir_keylen] */
+    char       *dir_last;       /* [dir_count * dir_keylen] */
+
+    /* Simplified numeric bounds for first key (int2/int4/int8 only) */
+    bool        has_lb;
+    bool        lb_incl;
+    int64       lb_i64;
+    bool        has_ub;
+    bool        ub_incl;
+    int64       ub_i64;
 } SmolScanOpaqueData;
 
 typedef SmolScanOpaqueData *SmolScanOpaque;
@@ -235,6 +251,9 @@ static Datum smol_load_attr0(TupleDesc tupdesc, SmolTuple *stup);
 static int  smol_build_entry_cmp(const void *pa, const void *pb);
 static void smol_write_sorted_entries(SmolBuildState *bst);
 static void smol_mark_heapblk0_allvisible(Relation heap);
+static void smol_scan_load_dir(IndexScanDesc scan);
+static void smol_update_bounds(IndexScanDesc scan);
+static bool smol_dir_get_group_range(SmolScanOpaque so, BlockNumber blk, int64 *out_min, int64 *out_max);
 
 /* Forward declarations */
 static IndexBuildResult *smolbuild(Relation heap, Relation index, IndexInfo *indexInfo);
@@ -504,6 +523,7 @@ smolbuildempty(Relation index)
     meta->natts = RelationGetNumberOfAttributes(index);
     meta->dir_keylen = 0;
     meta->dir_count = 0;
+    meta->dir_group = 1;
 
     MarkBufferDirty(buf);
     UnlockReleaseBuffer(buf);
@@ -679,6 +699,10 @@ smolbeginscan(Relation index, int nkeys, int norderbys)
     
     scan->opaque = so;
 
+    /* Load metapage directory (if present) and compute initial bounds */
+    smol_scan_load_dir(scan);
+    smol_update_bounds(scan);
+
     /* Build a reusable IndexTuple buffer with correct alignment */
     {
         TupleDesc tupdesc = RelationGetDescr(index);
@@ -763,6 +787,9 @@ smolrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
         so->values_buf = (Datum *) palloc(sizeof(Datum) * so->natts);
         so->isnull_buf = (bool *) palloc(sizeof(bool) * so->natts);
     }
+
+    /* Recompute bounds if scan keys changed */
+    smol_update_bounds(scan);
 }
 
 /*
@@ -832,6 +859,19 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                     return false;
             }
             uint32 blk = so->pchunk_next++;
+            /* Prefetch a few pages ahead within this chunk (start) */
+            if (so->prefetch_dist > 0 && index->rd_smgr)
+            {
+                int k;
+                for (k = 0; k < so->prefetch_dist; k++)
+                {
+                    uint32 pblk = blk + (uint32) k;
+                    if (pblk < so->pchunk_end)
+                        smgrprefetch(index->rd_smgr, MAIN_FORKNUM, (BlockNumber) pblk);
+                    else
+                        break;
+                }
+            }
             so->currBuf = ReadBuffer(index, (BlockNumber) blk);
             LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
             so->currPos = FirstOffsetNumber;
@@ -847,6 +887,18 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                 LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
                 Page page0 = BufferGetPage(so->currBuf);
                 so->currPos = PageGetMaxOffsetNumber(page0);
+                /* Prefetch a few pages back for backward scan start */
+                if (so->prefetch_dist > 0 && index->rd_smgr)
+                {
+                    int k;
+                    for (k = 1; k <= so->prefetch_dist; k++)
+                    {
+                        if (lastblk >= (BlockNumber) k)
+                            smgrprefetch(index->rd_smgr, MAIN_FORKNUM, lastblk - (BlockNumber) k);
+                        else
+                            break;
+                    }
+                }
                 so->started = true;
             }
             else
@@ -860,6 +912,21 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                     so->currPos = FirstOffsetNumber;
                     so->started = true;
                 }
+                /* Prefetch a few pages ahead at serial-forward scan start */
+                if (so->prefetch_dist > 0 && index->rd_smgr)
+                {
+                    BlockNumber curblk = BufferGetBlockNumber(so->currBuf);
+                    BlockNumber nb = RelationGetNumberOfBlocks(index);
+                    int k;
+                    for (k = 1; k <= so->prefetch_dist; k++)
+                    {
+                        BlockNumber pblk = curblk + (BlockNumber) k;
+                        if (pblk < nb)
+                            smgrprefetch(index->rd_smgr, MAIN_FORKNUM, pblk);
+                        else
+                            break;
+                    }
+                }
             }
         }
     }
@@ -868,6 +935,51 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
     {
         page = BufferGetPage(so->currBuf);
         maxoff = PageGetMaxOffsetNumber(page);
+
+        /* Page-level pruning using directory min/max on first key */
+        if (so->dir_keylen > 0 && (so->has_lb || so->has_ub))
+        {
+            int64 gmin = 0, gmax = 0;
+            BlockNumber curblk = BufferGetBlockNumber(so->currBuf);
+            if (smol_dir_get_group_range(so, curblk, &gmin, &gmax))
+            {
+                bool below_lb = so->has_lb && (so->lb_incl ? (gmax < so->lb_i64) : (gmax <= so->lb_i64));
+                bool above_ub = so->has_ub && (so->ub_incl ? (gmin > so->ub_i64) : (gmin >= so->ub_i64));
+                if (below_lb)
+                {
+                    /* Entire page (group) below lower bound: skip page */
+                    if (dir == BackwardScanDirection)
+                        so->currPos = 0; /* will move to prev page */
+                    else
+                        so->currPos = maxoff + 1; /* will move to next page */
+                }
+                else if (above_ub)
+                {
+                    /* Entire page (group) above upper bound */
+                    UnlockReleaseBuffer(so->currBuf);
+                    so->currBuf = InvalidBuffer;
+                    if (dir == BackwardScanDirection)
+                    {
+                        /* continue to previous page */
+                        BlockNumber nextblk = curblk - 1;
+                        if (nextblk >= 1)
+                        {
+                            so->currBuf = ReadBuffer(index, nextblk);
+                            LockBuffer(so->currBuf, BUFFER_LOCK_SHARE);
+                            Page p = BufferGetPage(so->currBuf);
+                            so->currPos = PageGetMaxOffsetNumber(p);
+                            continue; /* re-evaluate on new page */
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        /* In forward scans, we've passed the upper bound */
+                        return false;
+                    }
+                }
+            }
+        }
         
         /* Iterate over items on the current page in requested direction */
         while ((dir != BackwardScanDirection && so->currPos <= maxoff) ||
@@ -925,7 +1037,8 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
             /* Optional light prefetch within the current chunk */
             if (so->prefetch_dist > 0 && index->rd_smgr)
             {
-                for (int k = 1; k <= so->prefetch_dist; k++)
+                int k;
+                for (k = 1; k <= so->prefetch_dist; k++)
                 {
                     uint32 pblk = blk + k;
                     if (pblk < so->pchunk_end)
@@ -948,7 +1061,8 @@ smolgettuple(IndexScanDesc scan, ScanDirection dir)
                 SMOL_LOGF("advance to %s page %u", (dir == BackwardScanDirection ? "prev" : "next"), nextblk);
                 if (dir != BackwardScanDirection && so->prefetch_dist > 0 && index->rd_smgr)
                 {
-                    for (int k = 1; k <= so->prefetch_dist; k++)
+                    int k;
+                    for (k = 1; k <= so->prefetch_dist; k++)
                     {
                         BlockNumber pblk = nextblk + k;
                         if (pblk < nblocks)
@@ -998,6 +1112,10 @@ smolendscan(IndexScanDesc scan)
         pfree(so->values_buf);
     if (so->isnull_buf)
         pfree(so->isnull_buf);
+    if (so->dir_first)
+        pfree(so->dir_first);
+    if (so->dir_last)
+        pfree(so->dir_last);
     if (so->tuple_cxt)
         MemoryContextDelete(so->tuple_cxt);
     
@@ -1197,7 +1315,7 @@ smol_build_entry_cmp(const void *pa, const void *pb)
     if (bst->nkeyatts > 0)
     {
         Form_pg_attribute attr0 = TupleDescAttr(bst->itupdesc, 0);
-        if (attr0->attbyval && (attr0->attlen == 2 || attr0->attlen == 4))
+        if (attr0->attbyval && (attr0->attlen == 2 || attr0->attlen == 4 || attr0->attlen == 8))
         {
             if (attr0->attlen == 2)
             {
@@ -1205,10 +1323,16 @@ smol_build_entry_cmp(const void *pa, const void *pb)
                 int16 vb = DatumGetInt16(b->values[0]);
                 if (va < vb) return -1; else if (va > vb) return 1;
             }
-            else /* 4 */
+            else if (attr0->attlen == 4)
             {
                 int32 va = DatumGetInt32(a->values[0]);
                 int32 vb = DatumGetInt32(b->values[0]);
+                if (va < vb) return -1; else if (va > vb) return 1;
+            }
+            else /* 8 */
+            {
+                int64 va = DatumGetInt64(a->values[0]);
+                int64 vb = DatumGetInt64(b->values[0]);
                 if (va < vb) return -1; else if (va > vb) return 1;
             }
             /* tie-break on remaining keys using generic comparator */
@@ -1266,6 +1390,7 @@ smol_write_sorted_entries(SmolBuildState *bst)
         meta->natts = bst->natts;
         meta->dir_keylen = 0;
         meta->dir_count = 0;
+        meta->dir_group = 1;
         SMOL_LOG("initialized metapage");
         MarkBufferDirty(buf);
         UnlockReleaseBuffer(buf);
@@ -1425,7 +1550,7 @@ smol_write_sorted_entries(SmolBuildState *bst)
         }
     }
 
-    /* Write directories into metapage if available and fit */
+    /* Write directories into metapage if available and fit (with grouping if needed) */
     if (dir_keylen > 0 && dircnt > 0)
     {
         Buffer mbuf = ReadBuffer(bst->index, 0);
@@ -1433,15 +1558,42 @@ smol_write_sorted_entries(SmolBuildState *bst)
         Page mpage = BufferGetPage(mbuf);
         SmolMetaPageData *meta = (SmolMetaPageData *) PageGetContents(mpage);
         Size avail = BLCKSZ - MAXALIGN(sizeof(PageHeaderData)) - sizeof(SmolMetaPageData);
-        Size need = (Size)dircnt * dir_keylen * 2;
-        if (need <= avail)
+        Size per_entry = (Size)dir_keylen * 2;
+        uint32 max_entries = (per_entry > 0) ? (uint32) (avail / per_entry) : 0;
+        if (max_entries > 0)
         {
+            uint32 groups = (dircnt <= max_entries) ? (uint32) dircnt : max_entries;
+            uint32 group_sz = (uint32) ((dircnt + groups - 1) / groups); /* ceil */
+            /* Compress per-page dir into groups */
+            Size bytes = (Size) groups * dir_keylen;
+            char *cfirst = (char *) palloc(bytes);
+            char *clast  = (char *) palloc(bytes);
+            uint32 g;
+            for (g = 0; g < groups; g++)
+            {
+                uint32 start = g * group_sz;
+                uint32 end = start + group_sz;
+                if (end > (uint32) dircnt)
+                    end = (uint32) dircnt;
+                if (start >= (uint32) dircnt)
+                {
+                    /* shouldn't happen */
+                    start = (uint32) dircnt - 1;
+                    end = (uint32) dircnt;
+                }
+                memcpy(cfirst + g * dir_keylen, dir_first + start * dir_keylen, dir_keylen);
+                memcpy(clast  + g * dir_keylen, dir_last  + (end - 1) * dir_keylen, dir_keylen);
+            }
+
             char *dst = ((char *) meta) + sizeof(SmolMetaPageData);
-            memcpy(dst, dir_first, dircnt * dir_keylen);
-            memcpy(dst + dircnt * dir_keylen, dir_last, dircnt * dir_keylen);
+            memcpy(dst, cfirst, bytes);
+            memcpy(dst + bytes, clast, bytes);
             meta->dir_keylen = dir_keylen;
-            meta->dir_count = (uint32) dircnt;
+            meta->dir_count = groups;
+            meta->dir_group = (uint16) ((group_sz == 0) ? 1 : group_sz);
             MarkBufferDirty(mbuf);
+            pfree(cfirst);
+            pfree(clast);
         }
         UnlockReleaseBuffer(mbuf);
     }
@@ -1517,6 +1669,7 @@ smol_seek_lower_bound(IndexScanDesc scan)
     char *mdir = ((char *) meta) + sizeof(SmolMetaPageData);
     int dkeylen = meta->dir_keylen;
     uint32 dcount = meta->dir_count;
+    uint16 dgroup = (meta->dir_group == 0) ? 1 : meta->dir_group;
     if (dkeylen > 0 && dcount > 0)
     {
         /* use last-key directory to find first page whose last >= bound */
@@ -1552,7 +1705,7 @@ smol_seek_lower_bound(IndexScanDesc scan)
             else
                 hi = mid;      /* lastkey >= bound, keep left */
         }
-        low = (BlockNumber) lo + 1; /* data pages start at 1 */
+        low = (BlockNumber) (lo * dgroup) + 1; /* data pages start at 1 */
         if (low > high) low = high;
     }
     UnlockReleaseBuffer(mbuf);
@@ -1664,6 +1817,7 @@ smol_find_lower_bound_block(IndexScanDesc scan)
     char *mdir = ((char *) meta) + sizeof(SmolMetaPageData);
     int dkeylen = meta->dir_keylen;
     uint32 dcount = meta->dir_count;
+    uint16 dgroup = (meta->dir_group == 0) ? 1 : meta->dir_group;
     if (dkeylen > 0 && dcount > 0)
     {
         const char *mdir_last = mdir + (size_t)dcount * dkeylen;
@@ -1689,7 +1843,7 @@ smol_find_lower_bound_block(IndexScanDesc scan)
             else
                 hi = mid;
         }
-        low = (BlockNumber) lo + 1;
+        low = (BlockNumber) (lo * dgroup) + 1;
         if (low > high) low = high;
     }
     UnlockReleaseBuffer(mbuf);
@@ -1756,3 +1910,164 @@ smol_mark_heapblk0_allvisible(Relation heap)
 }
 /* ---- Parallel scan shared state ---------------------------------------- */
 /* (moved near top with other typedefs) */
+
+/* ---- Directory and bounds helpers ------------------------------------- */
+
+static void
+smol_scan_load_dir(IndexScanDesc scan)
+{
+    SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
+    Relation index = scan->indexRelation;
+    Buffer mbuf;
+    Page mpage;
+    SmolMetaPageData *meta;
+    char *mdir;
+    Size bytes;
+
+    so->dir_keylen = 0;
+    so->dir_count = 0;
+    so->dir_group = 1;
+    if (so->dir_first)
+    {
+        pfree(so->dir_first);
+        so->dir_first = NULL;
+    }
+    if (so->dir_last)
+    {
+        pfree(so->dir_last);
+        so->dir_last = NULL;
+    }
+
+    if (RelationGetNumberOfBlocks(index) == 0)
+        return;
+
+    mbuf = ReadBuffer(index, 0);
+    LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+    mpage = BufferGetPage(mbuf);
+    meta = (SmolMetaPageData *) PageGetContents(mpage);
+    if (meta->magic != SMOL_META_MAGIC)
+    {
+        UnlockReleaseBuffer(mbuf);
+        return;
+    }
+    if (meta->dir_keylen > 0 && meta->dir_count > 0)
+    {
+        so->dir_keylen = meta->dir_keylen;
+        so->dir_count = meta->dir_count;
+        so->dir_group = (meta->dir_group == 0) ? 1 : meta->dir_group;
+        bytes = (Size) so->dir_count * so->dir_keylen;
+        so->dir_first = (char *) palloc(bytes);
+        so->dir_last  = (char *) palloc(bytes);
+        mdir = ((char *) meta) + sizeof(SmolMetaPageData);
+        memcpy(so->dir_first, mdir, bytes);
+        memcpy(so->dir_last,  mdir + bytes, bytes);
+    }
+    UnlockReleaseBuffer(mbuf);
+}
+
+static void
+smol_update_bounds(IndexScanDesc scan)
+{
+    SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
+    TupleDesc tupdesc = RelationGetDescr(scan->indexRelation);
+    Form_pg_attribute a0 = TupleDescAttr(tupdesc, 0);
+    int16 attlen = a0->attlen;
+    int i;
+
+    so->has_lb = so->has_ub = false;
+    so->lb_incl = so->ub_incl = false;
+    so->lb_i64 = so->ub_i64 = 0;
+
+    if (so->nkeys == 0)
+        return;
+
+    if (!(attlen == 2 || attlen == 4 || attlen == 8))
+        return; /* only support pruning for fixed-width integers */
+
+    for (i = 0; i < so->nkeys; i++)
+    {
+        ScanKey key = &so->scankeys[i];
+        int64 v;
+        if (key->sk_attno != 1)
+            continue;
+        if (attlen == 2)
+            v = (int64) DatumGetInt16(key->sk_argument);
+        else if (attlen == 4)
+            v = (int64) DatumGetInt32(key->sk_argument);
+        else
+            v = (int64) DatumGetInt64(key->sk_argument);
+
+        switch (key->sk_strategy)
+        {
+            case 1: /* < */
+                if (!so->has_ub || v < so->ub_i64 || (v == so->ub_i64 && !so->ub_incl))
+                {
+                    so->has_ub = true;
+                    so->ub_incl = false;
+                    so->ub_i64 = v;
+                }
+                break;
+            case 2: /* <= */
+                if (!so->has_ub || v < so->ub_i64 || (v == so->ub_i64 && so->ub_incl == false))
+                {
+                    so->has_ub = true;
+                    so->ub_incl = true;
+                    so->ub_i64 = v;
+                }
+                break;
+            case 3: /* = */
+                so->has_lb = true; so->lb_incl = true; so->lb_i64 = v;
+                so->has_ub = true; so->ub_incl = true; so->ub_i64 = v;
+                break;
+            case 4: /* >= */
+                if (!so->has_lb || v > so->lb_i64 || (v == so->lb_i64 && so->lb_incl == false))
+                {
+                    so->has_lb = true;
+                    so->lb_incl = true;
+                    so->lb_i64 = v;
+                }
+                break;
+            case 5: /* > */
+                if (!so->has_lb || v > so->lb_i64 || (v == so->lb_i64 && so->lb_incl == true))
+                {
+                    so->has_lb = true;
+                    so->lb_incl = false;
+                    so->lb_i64 = v;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+static bool
+smol_dir_get_group_range(SmolScanOpaque so, BlockNumber blk, int64 *out_min, int64 *out_max)
+{
+    if (so->dir_keylen <= 0 || so->dir_count == 0)
+        return false;
+    uint32 gidx = (uint32) ((blk - 1) / Max((uint16)1, so->dir_group));
+    if (gidx >= so->dir_count)
+        gidx = so->dir_count - 1;
+    const char *fptr = so->dir_first + (size_t) gidx * so->dir_keylen;
+    const char *lptr = so->dir_last  + (size_t) gidx * so->dir_keylen;
+    int16 v16; int32 v32; int64 v64;
+    switch (so->dir_keylen)
+    {
+        case 2:
+            memcpy(&v16, fptr, 2); *out_min = (int64) v16;
+            memcpy(&v16, lptr, 2); *out_max = (int64) v16;
+            break;
+        case 4:
+            memcpy(&v32, fptr, 4); *out_min = (int64) v32;
+            memcpy(&v32, lptr, 4); *out_max = (int64) v32;
+            break;
+        case 8:
+            memcpy(&v64, fptr, 8); *out_min = v64;
+            memcpy(&v64, lptr, 8); *out_max = v64;
+            break;
+        default:
+            return false;
+    }
+    return true;
+}

@@ -192,3 +192,5 @@ Notes for restart
   - `sql/smol_desc.sql` / `expected/smol_desc.out` for descending order.
   - `sql/smol_multicol.sql` / `expected/smol_multicol.out` for multi-column ordering and filtering.
 - Updated `Makefile` to include new tests in `REGRESS`.
+ - Build-time sort comparator now includes an int8 fast path for the first key (was int2/int4 only before) to reduce fmgr overhead during `qsort`.
+ - Added prefetch at scan start: when a scan begins (serial forward, backward, or parallel-forward), smol issues up to `smol.prefetch_distance` prefetches to warm the buffer cache before the first `ReadBuffer`.
