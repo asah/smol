@@ -10,6 +10,30 @@ CREATE ACCESS METHOD smol TYPE INDEX HANDLER smol_handler;
 -- Comment on the access method
 COMMENT ON ACCESS METHOD smol IS 'read-only space-efficient index access method optimized for index-only scans';
 
+-- Enforce read-only tables via trigger
+CREATE FUNCTION smol_block_writes()
+RETURNS trigger
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+-- Helper to seal a table from writes using triggers
+-- Note: requires plpgsql to be available (usually preinstalled)
+DO $$ BEGIN PERFORM 1 FROM pg_available_extensions WHERE name='plpgsql' AND installed_version IS NOT NULL; EXCEPTION WHEN others THEN END $$;
+CREATE OR REPLACE FUNCTION smol_seal_table(regclass)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  rel regclass := $1;
+BEGIN
+  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_ins ON %s', rel);
+  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_upd ON %s', rel);
+  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_del ON %s', rel);
+  EXECUTE format('CREATE TRIGGER smol_block_ins BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
+  EXECUTE format('CREATE TRIGGER smol_block_upd BEFORE UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
+  EXECUTE format('CREATE TRIGGER smol_block_del BEFORE DELETE ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
+END $$;
+
 -- Create operator classes for common data types
 CREATE OPERATOR CLASS int4_ops
     DEFAULT FOR TYPE int4 USING smol AS
@@ -20,23 +44,16 @@ CREATE OPERATOR CLASS int4_ops
         OPERATOR        5       >  ,
         FUNCTION        1       btint4cmp(int4,int4);
 
-CREATE OPERATOR CLASS text_ops
-    DEFAULT FOR TYPE text USING smol AS
-        OPERATOR        1       <  ,
-        OPERATOR        2       <= ,
-        OPERATOR        3       =  ,
-        OPERATOR        4       >= ,
-        OPERATOR        5       >  ,
-        FUNCTION        1       bttextcmp(text,text);
+-- Fixed-width only: do not provide varlena opclasses (e.g., text, numeric)
 
-CREATE OPERATOR CLASS numeric_ops
-    DEFAULT FOR TYPE numeric USING smol AS
+CREATE OPERATOR CLASS int8_ops
+    DEFAULT FOR TYPE int8 USING smol AS
         OPERATOR        1       <  ,
         OPERATOR        2       <= ,
         OPERATOR        3       =  ,
         OPERATOR        4       >= ,
         OPERATOR        5       >  ,
-        FUNCTION        1       numeric_cmp(numeric,numeric);
+        FUNCTION        1       btint8cmp(int8,int8);
 
 CREATE OPERATOR CLASS int2_ops
     DEFAULT FOR TYPE int2 USING smol AS
