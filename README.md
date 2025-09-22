@@ -1,145 +1,72 @@
 # smol — Read‑Only, Space‑Efficient PostgreSQL Index AM
 
-This README is the single source of truth for humans and LLMs. It covers goals, architecture, detailed technical behavior, usage, build/run (Docker and local), tests, and benchmarks.
+This document captures the architecture and operational overview of the
+smol index access method. Code‑level notes live in `AGENT_NOTES.md`.
 
-## Overview
+Important
+- One container name: smol. Always use/reuse a single container named
+  `smol` for builds, tests, and benchmarks.
+- Always run in Docker. Host toolchains are unsupported.
 
-`smol` is a custom PostgreSQL index access method optimized for index‑only scans on append‑only data. It omits heap TIDs and stores only fixed‑width key values, yielding smaller indexes and better cache density. It supports ordered scans, backward scans, and parallel scans. Writes are not supported via the access method (read‑only after build).
+Overview
+- Read‑only index AM optimized for index‑only scans on append‑only data.
+- Stores only fixed‑width key values (no heap TIDs), improving density and
+  cache locality.
+- Supports ordered, backward, and parallel scans; no bitmap scans.
 
-Key properties
-- Read‑only AM; drop/recreate to change data
-- Fixed‑width key types only (e.g., int2, int4, int8, date, timestamp)
-- Multi‑column keys supported; no INCLUDE columns
-- No NULL keys (rejected at build)
-- Supports parallel scans; no bitmap scans
-- Always index‑only: executor receives tuples from the index
+Architecture
+- On‑disk
+  - Metapage (blk 0): magic, version, nkeyatts, optional first‑key directory.
+  - Data pages (blk ≥ 1): packed fixed‑width key payloads; one ItemId per tuple;
+    no per‑tuple headers, null bitmaps, or TIDs.
+- Build
+  - Collect keys via `table_index_build_scan`, enforce no‑NULLs and fixed‑width.
+  - Sort using opclass comparator (proc 1) honoring collation.
+  - Initialize metapage and append data pages with `PageAddItem`.
+  - Mark heap block 0 all‑visible and set VM bit; a synthetic TID (0,1) keeps
+    the executor on index‑only paths.
+- Scan
+  - IOS‑only; requires `xs_want_itup`, else ERROR.
+  - Forward/backward and parallel supported. For each match, materialize an
+    index tuple (`xs_itup`) and return with a constant TID `(0,1)`.
 
-## Architecture
+Flags & Capabilities
+- `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`.
+- `amgetbitmap=NULL` (no bitmap scans).
+- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=false`.
+- `amstrategies=5` (<, <=, =, >=, >), `amsupport=1` (comparator proc 1).
+- `aminsert` ERROR (read‑only after build).
 
-On‑disk layout
-- Metapage (block 0): magic, version, `nkeyatts`, optional first/last‑key directory
-- Data pages (block ≥ 1): packed, aligned fixed‑width key values only; no per‑tuple headers, no null bitmap, no TIDs; one standard line pointer per item
+Limitations
+- Read‑only; drop/recreate to change data.
+- Fixed‑width key types only; no varlena (text, bytea, numeric).
+- No NULL keys; no INCLUDE columns; not unique; not clusterable.
+- Prototype: no WAL/FSM crash‑safety yet.
 
-Build path
-1. Lock heap `AccessExclusive` and scan via `table_index_build_scan(..., smol_build_callback, ...)`
-2. Enforce invariants: no NULLs; fixed‑width attributes only
-3. Sort entries using opclass comparator (support proc 1) honoring per‑key collation
-4. Initialize metapage; write data pages with `PageAddItem`
-5. For executor plumbing, mark heap block 0 PD_ALL_VISIBLE and set its VM bit so a synthetic TID on (0,1) never causes heap fetches
+Build & Test (Docker, PostgreSQL 18 from source)
+- Build image: `make dockerbuild` (builds the image used by the `smol` container).
+- Use inside-container targets via a single container named `smol`:
+  - Clean build + install: `docker exec -it smol make insidebuild`
+  - Quick regression (build, start PG, run installcheck, stop PG):
+    - `docker exec -it smol make insidecheck`
+  - Start PostgreSQL (initdb if needed): `docker exec -it smol make insidestart`
+  - Stop PostgreSQL: `docker exec -it smol make insidestop`
+  - Benchmark (leaves PG running): `docker exec -it smol make insidebench-smol-btree-5m`
 
-Scan path
-- IOS‑only: requires `xs_want_itup`; errors if planner tries non‑IOS
-- Forward/backward and parallel scans supported; returns tuples via `index_form_tuple`
-- Provides a synthetic TID `(block 0, off 1)`; heap fetches never occur
+Usage
+- `CREATE EXTENSION smol;`
+- `CREATE INDEX idx_smol ON some_table USING smol (col1, col2);`
+- Planner: favor IOS as usual; SMOL errors on non‑IOS paths; parallel scans
+  are supported on large relations.
 
-AM flags
-- `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`
-- `amgetbitmap=NULL` (no bitmap scans)
-- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=false`
-- `amstrategies=5` (<, <=, =, >=, >), `amsupport=1` comparator
-- `aminsert` ERROR (read‑only)
+Tests & Benchmarks
+- `docker exec -it smol make insidecheck` runs the regression suite and stops PG when done.
+- `sql/` contains correctness/regression tests (kept short).
+- `bench/` contains only benchmarks; stream output live via `docker exec -it smol make insidebench-smol-btree-5m` (use `insidestop` when finished).
 
-Tuple & page sizing
-- BTREE payload header: 6‑byte TID + 2‑byte `t_info` = 8 bytes
-- SMOL payload: key data only (no TID, no per‑tuple header)
-- Before page effects, payload saves ~8–14 bytes/tuple; on page with line pointers/alignment, typical observed savings at 1M rows:
-  - Two int2 keys: ~19 MB vs ~21 MB (≈10–12% smaller)
-  - Two int4 keys: similar ballpark; savings shrink as key width grows
+Operator Classes
+- int2_ops, int4_ops, int8_ops (fixed‑width only).
 
-Performance model
-- SMOL always delivers true index‑only scans (no heap fetches)
-- BTREE can also achieve true IOS when the visibility map (VM) marks heap pages all‑visible; otherwise it may issue heap fetches
-- When both are IOS, SMOL’s advantage is mainly smaller index size and better cache density; otherwise SMOL can avoid BTREE’s heap I/O
-
-## Limitations
-- Read‑only: no insert/update/delete via the AM
-- Fixed‑width key types only; no varlena (`text`, `bytea`, `numeric`)
-- No NULL keys; no INCLUDE columns
-- Not a unique index; not clusterable
-- Prototype: no WAL/FSM crash‑safety yet
-
-## Build & Install
-
-Inside Docker (recommended, clean toolchain)
-- `docker build -t smol-dev .`
-- `docker run --rm -t -v "$PWD":/workspace -w /workspace smol-dev bash -lc 'make clean && make && make install'`
-- Start a reusable container for testing:
-  - `docker run -d --name smol-dev-ctr -v "$PWD":/workspace -w /workspace smol-dev sleep infinity`
-  - `docker exec smol-dev-ctr bash -lc 'pg_ctlcluster 16 main start'`
-  - `docker exec smol-dev-ctr bash -lc "su - postgres -c 'psql -v ON_ERROR_STOP=1 -c \"CREATE EXTENSION smol;\"'"`
-
-Local (requires PostgreSQL 16 server headers)
-- Ensure `pg_config` is on PATH
-- `make && make install`
-
-## Usage
-
-Create index
-```sql
-CREATE EXTENSION smol;
-CREATE INDEX idx_smol ON some_table USING smol (col1, col2);
-```
-
-Planner
-- Favor IOS as usual; SMOL will error if planner attempts non‑IOS
-- Parallel scans are supported and often chosen on large relations
-- Mixed‑type comparisons across int2/int4/int8 are indexable (Index Cond) via SMOL's cross‑type operators.
-- Sealing is explicit: use `smol_seal_table('tbl'::regclass)` / `smol_unseal_table('tbl'::regclass)`; the AM remains read‑only for inserts while any SMOL index exists (no auto‑sealing on CREATE INDEX).
-
-## Tests & Benchmarks
-
-Regression
-- Recommended (reproducible via Docker): `make dockercheck`
-  - Builds the Docker image, installs the extension in a clean PostgreSQL 16 environment, starts the cluster, and runs pg_regress.
-- Local (if you have PG dev headers): `make installcheck`
-  - Runs `sql/smol_basic.sql` plus any additional tests included in `REGRESS`.
-
-Benchmarks (parameterized)
-- Generic: `bench/smol_bench.sql`
-  - Params: `dtype` (int2|int4|int8), `rows`, `par_workers`, `maxval`, `thr`, and optional `nofilter` for full scans.
-  - Example: `psql -v dtype=int2 -v rows=50000000 -v par_workers=6 -v maxval=32767 -v thr=5000 -f bench/smol_bench.sql`
-- Correctness: `bench/smol_correctness.sql` (int2 + int4 sums vs BTREE)
-  - Params: `rows_si`, `rows_i4`.
-
-Convenience (Docker)
-- `make dockercheck` — run regression in a container
-- `make dockerbench-50m-par6` — 50M int2 with 6 workers at `thr=5000` and `thr=30000`
-
-Interpreting results
-- Check `pg_relation_size` for index size; expect SMOL < BTREE
-- In EXPLAIN (ANALYZE), `Heap Fetches: 0` indicates true IOS; SMOL always 0
-- With VM‑assisted BTREE IOS, performance gap narrows; SMOL’s win is primarily better cache density
-
-## Operator Classes
-
-Provided (fixed‑width only)
-- int2_ops, int4_ops, int8_ops (default for int2/int4/int8)
-
-## Implementation Notes (deep dive)
-
-On‑disk
-- Metapage stores counts and optional first/last‑key directory for the first attribute (int2/int4/int8) to seed page‑level lower bounds
-- Data pages store only aligned fixed‑width key payloads; tuples are materialized on demand for executor output
-
-Build
-- Collects key datums in memory, sorts with opclass cmp(1), and writes pages
-- Enforces fixed‑width and no‑NULL constraints; disallows inserts post‑build
-- Marks heap block 0 all‑visible and sets VM bit, enabling synthetic TID usage
-
-Scan
-- Requires `xs_want_itup` (IOS), otherwise ERROR
-- Parallel scans coordinate via a shared atomic page counter
-- Lower‑bound seek uses directory or binary search by last key on pages
-
-Planner/costs
-- Lightly favors SMOL to encourage IOS and parallel plans on large indexes
-- No bitmap scan support
-
-## Roadmap
-- Crash‑safety: WAL for page init/inserts; FSM; proper extension protocol
-- Planner: tuned costs; broader fixed‑width opclass coverage; DESC tests
-- Features: optional compression; columnar variants; Bloom filters
-
-## Troubleshooting
-- “Heap Fetches” in BTREE IOS: run `VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING)` after `CHECKPOINT`, with `vacuum_freeze_* = 0` in a quiet cluster to set VM bits
-- Parallel plans: set `max_parallel_workers_per_gather` and lower `min_parallel_index_scan_size`; ensure `enable_seqscan=off` when exploring IOS
+Roadmap
+- Add WAL/FSM, tune costs, expand opclass coverage, validate DESC/multi‑col
+  behavior, optional compression.

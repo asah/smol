@@ -1,6 +1,15 @@
 # SMOL AM Development Notes
 
-This file summarizes the hard‑won details needed to work on the `smol` PostgreSQL index access method in this repo.
+This file summarizes the hard‑won details needed to work on the `smol`
+PostgreSQL 18 index access method in this repo.
+
+Run Policy (Mandatory)
+- One container name only: `smol`. Always build, test, and benchmark using
+  a single Docker container named `smol`; reuse it across runs.
+- Always run inside Docker. Build the image with `make dockerbuild`, then
+  invoke inside-container targets via `docker exec -it smol make <target>`.
+  Do not attempt host builds/tests; they are unsupported and prone to
+  SDK/PG mismatches.
 
 ## Goals & Constraints
 - Ordered semantics; read‑only index. After CREATE INDEX, table becomes read‑only (enforced via triggers).
@@ -8,7 +17,9 @@ This file summarizes the hard‑won details needed to work on the `smol` Postgre
 - No NULL support at all (CREATE INDEX errors on NULLs).
 - Fixed‑width key types only (no varlena such as `text`, `bytea`, `numeric`).
 - Prototype: no WAL/FSM yet; correctness over crash‑safety for now.
-- PostgreSQL 16; no INCLUDE columns; parallel scans supported; no bitmap scan.
+- PostgreSQL 18; no INCLUDE columns; parallel scans supported; no bitmap scan.
+- we are restarting this project to provide cleaner code, so these notes may contain info from the previous iteration(s). If you spot inconsistencies please propose cleanup to the user.
+
 
 ## Architecture Overview
 - On‑disk
@@ -26,6 +37,8 @@ This file summarizes the hard‑won details needed to work on the `smol` Postgre
   - Require `xs_want_itup` (IOS only) or ERROR.
   - Iterate forward/backward over data pages; support parallel scans; for each match, build `xs_itup = index_form_tuple(...)`.
   - Synthesize a constant TID for executor plumbing: set `xs_heaptid` to `(block 0, off 1)`.
+- Misc
+  - to enforce read-only, AM functions which perform writes throw errors and return, with the assumption that the caller will abort the transaction.
 
 ## AM Flags & Behavior
 - `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amgetbitmap=NULL`.
@@ -34,35 +47,39 @@ This file summarizes the hard‑won details needed to work on the `smol` Postgre
 - `aminsert` ERROR (read‑only after build).
 
 ## Docker & Testing
-- Build image: `docker build -t smol-dev .`
-- Start reusable container: `docker run -d --name smol-dev-ctr -v "$PWD":/workspace -w /workspace smol-dev sleep infinity`
-- Compile/install inside container: `docker exec smol-dev-ctr bash -lc 'make && make install'`
-- Start cluster: `docker exec smol-dev-ctr bash -lc 'pg_ctlcluster 16 main start'`
-- Run tests: `docker exec smol-dev-ctr bash -lc 'su - postgres -c "cd /workspace && make installcheck"'`
-
-Reproducibility policy
-- Always run builds and regression tests inside Docker. Local host toolchains can have SDK or permission issues (e.g., macOS sysroot). Use the `smol-dev` container to ensure consistent PG 16 headers and tools.
-- Quick one-shot: `docker run --rm -t -v "$PWD":/workspace -w /workspace smol-dev bash -lc 'make clean && make && make install && make installcheck'`
-
-Regression suite
-- `sql/smol_basic.sql` and `expected/smol_basic.out` cover: IOS ordering, reject non‑IOS scans, NULL build error, and sealing writes.
-- Note: `DROP TRIGGER IF EXISTS` emits NOTICEs when triggers are absent; expected output should include them or use an alternative to suppress noise.
-
-## TODO / Next Steps
-- Add crash‑safety: Generic WAL for page init/inserts; FSM + proper relation extension protocol.
-- Cost model and planner properties; broader opclass coverage.
-- Optional: auto‑seal helper invocation after CREATE INDEX.
-- Improve tests (more types, multi‑column, DESC ordering) and stabilize outputs.
+- Build image: `make dockerbuild` (image tag: `smol`).
+- Start/reuse container: `make dockerstart` (container name: `smol`).
+- One‑shot regression: `make dockercheck` (build+install, initdb if needed, start PG18, run installcheck, stop PG so container is idle).
+- Ad‑hoc: `docker exec smol bash -lc 'make clean && make && make install'`
+- To init/start PG manually (first time only):
+  - `docker exec smol bash -lc 'su - postgres -c "/usr/local/pgsql/bin/initdb -D /var/lib/postgresql/data"'`
+  - `docker exec smol bash -lc 'su - postgres -c "/usr/local/pgsql/bin/pg_ctl -D /var/lib/postgresql/data -l /tmp/pg.log -w start"'`
+- Stop/quiet: `make dockerstop` (stops PG18); remove: `make dockerrm`.
+- Keep regression fast; correctness lives under `sql/`. `bench/` is for benchmarks only.
+- Server logs: `/tmp/pg.log` (or set a different path) inside the container.
 
 Quick mental checklist
 - Collect → sort (proc 1, collations) → write metapage + data pages.
 - Mark heap blk 0 PD_ALL_VISIBLE then set VM bit with `visibilitymap_set`.
 - IOS only: enforce `xs_want_itup`; set a synthetic `xs_heaptid`.
-- No NULLs; no TIDs; read‑only; ordered.
+- No NULLs; no TIDs; read-only; ordered.
+
+## Logging
+- Runtime GUC: `smol.debug_log` (SUSET). When enabled, SMOL emits concise LOG lines
+  prefixed with `[smol]` covering key lifecycle events (handler init, build start/end,
+  page creation, meta read/write, scan begin/rescan, leaf hops). The hot inner loops
+  (per-tuple return) avoid logging to keep overhead negligible.
+- Macros provide near-zero cost when disabled:
+  - `SMOL_LOG(msg)` and `SMOL_LOGF(fmt, ...)` guard `elog(LOG, ...)` behind the
+    `smol.debug_log` flag; define `SMOL_TRACE=0` at compile time to compile logs out
+    entirely if needed for microbenchmarks.
+  - Default build sets `SMOL_TRACE=1`, but the GUC defaults to off, so production
+    and benchmarks incur no meaningful overhead.
 
 ## Detailed Technical Notes (for future me)
 
 What PG internals I actually read
+- see AGENT_PGIDXAM_NOTES.md
 - AM API and glue
   - `postgres/src/include/access/amapi.h`: `IndexAmRoutine` fields; how handler wires callbacks and flags.
   - `postgres/src/backend/access/index/indexam.c`: backend calls into AM: `index_beginscan`, `index_rescan`, `index_getnext_tid`, `index_fetch_heap`, `index_getnext_slot`, `index_getbitmap`.
@@ -81,7 +98,6 @@ What PG internals I actually read
 Key design choices and why
 - IOS only with no stored TIDs: executor still requires a TID to drive visibility and predicate locking. I synthesize a constant TID `(block 0, off 1)` and ensure VM says block 0 is all-visible, so executor never fetches the heap. Tradeoff: predicate locks always target heap block 0.
 - Ordered semantics: collect all entries during build, sort using opclass comparator proc 1 per key (respect collation), and write pages in order. Scans just iterate pages in order.
-- Read-only: `aminsert` ERROR; after CREATE INDEX we provide `smol_seal_table(regclass)` to install BEFORE triggers that block writes on the table.
 - No NULLs: enforce at build callback; reject early.
 
 Build path details and pitfalls
@@ -103,12 +119,11 @@ Visibility map required sequence (to keep IOS heapless)
   4. `visibilitymap_set(heap, 0, heapBuf, InvalidXLogRecPtr, vmbuf, InvalidTransactionId, VISIBILITYMAP_ALL_VISIBLE);`
   5. Unlock/release both buffers.
 
-Bugs I hit and fixes
-- Segfault during `CREATE INDEX` before sorting: cause was using `repalloc` on a NULL pointer when `cap==0`. Fix: allocate with `palloc` on initial growth.
+Bugs to watch out for:
+- Segfault during `CREATE INDEX` before sorting: `repalloc` on a NULL pointer when `cap==0`. Fix: allocate with `palloc` on initial growth.
 - Segfault inside `visibilitymap_set`: I initially passed `InvalidBuffer` for `heapBuf` and hadn’t set PD_ALL_VISIBLE; `visibilitymap_set` requires `PageIsAllVisible(heapBuf)`. Fix: set PD_ALL_VISIBLE under exclusive lock and pass `heapBuf` into `visibilitymap_set`.
 - INCLUDE columns mismatch: using `itupdesc->natts` caused me to think I had `natts` attrs to store, but I only store key attrs. Fix: set `bst.natts = nkeyatts` and `amcaninclude=false`.
 - Starting scan at block 0 (metapage) was wrong. Fix: start at block 1.
-- Test diffs: `smol_seal_table` drops non-existent triggers first, causing NOTICEs; expected file must include these NOTICEs or avoid dropping when absent.
 
 Flags and opclasses
 - `amstrategies = 5` for (<, <=, =, >=, >); `amsupport = 1` comparator proc. `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amsearcharray=false`, `amsearchnulls=false`, `amgetbitmap=NULL`, `amcaninclude=false`.
@@ -117,80 +132,73 @@ Flags and opclasses
 On-disk tuple and (de)serialization
 - Each tuple is the concatenation of fixed‑width key values in order. Offsets are computed from attribute lengths; advance by `MAXALIGN(attlen)` as needed. Store by‑val types with `store_att_byval`, otherwise `memcpy` fixed‑length by‑ref types. Varlen types are not supported.
 
-Docker/test workflow notes
-- Build: `docker build -t smol-dev .` (Ubuntu 24.04 with PostgreSQL 16 dev packages).
-- Reusable container: `docker run -d --name smol-dev-ctr -v "$PWD":/workspace -w /workspace smol-dev sleep infinity`.
-- Compile/install: `docker exec smol-dev-ctr bash -lc 'make && make install'`.
-- Start cluster: `docker exec smol-dev-ctr bash -lc 'pg_ctlcluster 16 main start'`.
-- Run tests: `docker exec smol-dev-ctr bash -lc 'su - postgres -c "cd /workspace && make installcheck"'`.
-- Server logs live at `/var/log/postgresql/postgresql-16-main.log` inside the container; very helpful to pinpoint segfault sites and emit `elog(LOG, ...)` breadcrumbs.
-
 C warnings and style
 - GCC/Clang in PGXS environment warn on C90 mixed declarations; stylistically, move declarations to top of block when convenient. Keep functions `static` unless part of AM API.
 
-Caveats and future work
-- No WAL/FSM yet: crash-safety is not guaranteed. Add Generic WAL to log metapage/data page initialization and inserts; integrate with FSM and relation extension protocol.
-- Cost model/correlation need work; current estimates are placeholders.
-- Multi-column scans and DESC ordering: verify comparator semantics match planner expectations; add tests.
-- Parallel scans supported; bitmap scans not supported; flags set accordingly.
+Practical guidance
+- If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
+- Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).
 
-## STATE SNAPSHOT (2025-09-21)
 
-What’s implemented (key points)
-- Tight packing of fixed‑width attributes:
-  - Build path writes key values back‑to‑back (no MAXALIGN per attribute; no per‑tuple headers).
-  - Scan path steps by fixed attlen only; byval values are memcpy’d into Datum; byref returns pointer.
-- Per‑scan CPU reductions:
-  - Reuse values/isnull buffers; per‑tuple memory context for xs_itup.
-  - Precompute natts, attlen[], attbyval[], offsets[] per scan.
-- Parallel scan fix and scheduling:
-  - Fixed correctness bug: shared page counters are initialized once; no re‑init by workers.
-  - Chunked page scheduling per worker to reduce atomics; light prefetch in serial scans.
-  - GUC: smol.parallel_chunk_pages (default 8) controls pages per chunk.
+# Notes on read-only indexes
 
-Bench scripts (kept)
-- bench_brc.sql — BRC‑style (two int2), parameter: -v rows=NNN (default 1,000,000).
-- bench_fixed.sql — Combined SMALLINT/INT4 × uni/parallel; parameters:
-  - -v rows_si=NNN (default 1,000,000)
-  - -v rows_i4=NNN (default 1,000,000)
-  - -v par_workers_si=K (default 2)
-  - -v par_workers_i4=K (default 2)
+i want to build a new index am for pg18 that's read-only. is it ok to simply throw/return an error on calls which require writes?  if so, please provide brief notes for my LLM coding agent to use when writing this for me. it wanted to setup triggers and that seems messy - but is that better for some reason?
 
-Correctness
-- correctness_check.sql compares BTREE vs SMOL (serial) for SMALLINT/INT4 sums; confirmed equal after parallel fix.
-- Parallel vs serial SMOL sums validated equal on 1M rows (post‑fix).
+Short answer: yes—make the AM itself fail any write-path entry points. You don’t need triggers, and they won’t attach to indexes anyway. Triggers fire on table DML and add complexity you don’t need unless you’re trying to “pre-empt” errors for UX reasons.
 
-Large‑scale results (high level)
-- SMALLINT 50M: BTREE ~1067 MB, SMOL ~574 MB; uni ~59.5s vs ~5.3s; parallel(2) ~28.2s vs ~5.35s.
-- INT4 25M: BTREE ~536 MB, SMOL ~287 MB; uni ~15.5s vs ~1.36s; parallel(2) ~7.2s vs (SMOL parallel INT4 ~0.46–0.33s with 2–4 workers).
+Here are tight notes for your LLM coding agent:
 
-How to rebuild & run (Docker)
-- Build/install: docker build -t smol-dev . && docker run --rm -t -v "$PWD":/workspace -w /workspace smol-dev bash -lc 'make clean && make && make install'
-- Start DB: docker run -d --name smol-dev-ctr -v "$PWD":/workspace -w /workspace smol-dev sleep infinity && docker exec smol-dev-ctr bash -lc 'pg_ctlcluster 16 main start'
-- Enable extension: docker exec smol-dev-ctr bash -lc "su - postgres -c 'psql -c \"CREATE EXTENSION smol;\"'"
-- Benchmarks:
-  - docker exec … "su - postgres -c 'psql -v rows_si=50000000 -v rows_i4=25000000 -f /workspace/bench_fixed.sql'"
-  - Set workers: -v par_workers_si=4 -v par_workers_i4=3
-  - Tune SMOL chunking: SET smol.parallel_chunk_pages = 128;
-- Correctness:
-  - docker exec … "su - postgres -c 'psql -f /workspace/correctness_check.sql -v rows_si=5000000 -v rows_i4=2500000'"
+* # What “read-only” means for a PostgreSQL index AM
 
-Open TODOs (next iteration targets)
-- Further reduce SMOL per‑tuple CPU: extend fast paths to secondary attrs; consider reusing a preallocated xs_itup where safe.
-- Adaptive parallel chunk size based on relpages; explore larger chunks on big indexes.
-- Planner cost calibration for SMOL; consider track_io_timing to separate CPU vs I/O and tune.
-- Optional: expose a GUC for prefetch distance.
+  * Implement a normal handler that returns an `IndexAmRoutine`, but treat every write/maintenance callback as unsupported at runtime. The AM API **requires** you to provide these callbacks; you can implement them as stubs that `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, ...)`. Required callbacks include `ambuild`, `ambuildempty`, `aminsert`, `ambulkdelete`, `amvacuumcleanup`, the scan suite, etc.
+  * You still need `ambuild` to populate the index during `CREATE INDEX`. Everything after creation (inserts, updates, vacuum maintenance) should error out.
 
-Notes for restart
-- If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context.
+* # Minimum implementation sketch
 
-### Delta Since Snapshot
-- Added GUC `smol.prefetch_distance` (default 1) and wired serial-scan prefetch to read up to N pages ahead; also light prefetch within a parallel chunk.
-- Implemented basic backward scan support in `amgettuple` for serial scans (ORDER BY ... DESC works). Parallel scans continue to operate forward only.
-- Extended integer fast-path comparisons (int2/int4/int8) to apply to any key attribute in `smol_tuple_matches_keys`.
-- Added regression tests:
-  - `sql/smol_desc.sql` / `expected/smol_desc.out` for descending order.
-  - `sql/smol_multicol.sql` / `expected/smol_multicol.out` for multi-column ordering and filtering.
-- Updated `Makefile` to include new tests in `REGRESS`.
- - Build-time sort comparator now includes an int8 fast path for the first key (was int2/int4 only before) to reduce fmgr overhead during `qsort`.
- - Added prefetch at scan start: when a scan begins (serial forward, backward, or parallel-forward), smol issues up to `smol.prefetch_distance` prefetches to warm the buffer cache before the first `ReadBuffer`.
+  * Handler: return an `IndexAmRoutine` with realistic capability flags (e.g., `amcanorder`, `amcaninclude`, etc.) and function pointers. See “Basic API Structure for Indexes.”
+  * `ambuild`: allow normal build from heap (this is DDL; permitted).
+  * `ambuildempty`: implement normally (used for unlogged indexes init fork).
+  * `aminsert`: `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED, "read-only index AM does not support inserts");` (required to exist, but always errors).
+  * `ambulkdelete` and `amvacuumcleanup`: also `ereport(ERROR, ...)` so VACUUM can’t mutate the structure. (They are required entry points; okay to error if the contract of the AM is read-only.)
+  * Scan functions (`ambeginscan`, `amrescan`, `amgettuple`/`amgetbitmap`, `amendscan`): implement normally so SELECTs work. Which of `amgettuple` vs `amgetbitmap` you implement determines plain vs bitmap scan support.
+  * `amcanreturn`: set to `NULL` if you don’t support index-only scans; otherwise implement per column.
+  * `amcostestimate`, `amoptions`, `amvalidate`: supply simple, conservative versions so the planner can cost scans and options parse/validate.
+  * SQL wrapper: `CREATE ACCESS METHOD my_readonly_am TYPE INDEX HANDLER my_readonly_am_handler;` (as documented under the index AM interface).
+
+* # Error behavior vs. triggers
+
+  * With this design, any table `INSERT/UPDATE/DELETE` that would touch the index hits your AM’s `aminsert` and raises a **clean “feature not supported”** error—simple and explicit.
+  * Triggers are table-level and unrelated to index AMs; they can block the DML earlier for nicer UX (avoids failing deep in executor), but they’re “messy” (deployment, permissions, ordering) and don’t belong inside an AM. Prefer AM-level errors unless you must keep mixed-write tables from ever reaching the AM path. (Postgres docs show these AM functions are the proper contract boundary.)
+
+* # Caveats to document
+
+  * Only use this AM on tables you truly treat as read-only at the SQL level, or where you’re comfortable surfacing an error on any write that would touch indexed columns.
+  * Consider setting planner cost high for updates isn’t applicable (planner costs are for scans); just keep scan costs realistic.
+  * Make error messages precise (mention the AM name) to aid ops.
+
+* # Testing checklist
+
+  * `CREATE ACCESS METHOD` + `CREATE INDEX` on a sample table succeeds (build path works).
+  * `INSERT/UPDATE/DELETE` on the indexed table raises your AM’s `FEATURE_NOT_SUPPORTED` error.
+  * `SELECT` that can use the index produces correct results via your scan callbacks.
+  * `VACUUM` should be a no-op on the index relation, since it's read-only.
+Bench and Timeouts
+- All benchmark scripts must wrap every psql invocation in a hard timeout to avoid hangs.
+- Standard: use `timeout -k 5s ${TIMEOUT_SEC:-30}s psql ...` for both `-c` and heredoc invocations.
+- Scripts should exit on timeout and print a clear error; default TIMEOUT_SEC is 30 seconds.
+
+Inside-Container Workflow
+- Run inside-* targets from the host via Docker exec, e.g.:
+  - `docker exec -it smol make insidebuild` — clean build and install
+  - `docker exec -it smol make insidestart` — initdb if needed and start PostgreSQL
+  - `docker exec -it smol make insidecheck` — build, run regression (installcheck), then stop PG
+  - `docker exec -it smol make insidebench-smol-btree-5m` — run the fair 5M-row IOS benchmark (leaves PG running)
+- Use `docker exec -it smol make insidestop` to stop PostgreSQL when finished.
+- Benchmark scripts honor `TIMEOUT_SEC` and `KILL_AFTER` env vars.
+
+Profiling smol_gettuple
+- Set `smol.profile = on` (superuser GUC) to log per-scan counters at endscan:
+  - calls, rows returned, leaf pages visited, bytes copied, binary-search steps.
+- Use these to identify hotspots in amgettuple; typical wins:
+  - Eliminate per-row heap/tuple allocations and lock churn (done via prebuilt tuple + pinned pages).
+  - Reduce small memcpy overhead by favoring constant-size copies (2/4/8 bytes).
