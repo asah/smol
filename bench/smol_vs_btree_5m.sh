@@ -84,7 +84,10 @@ run_bench_phase() {
   echo "# checkpoint + freeze/analyze table (for IOS)" >&2
   if [ "${is_smol}" -eq 0 ]; then
     # For BTREE, ensure the base table is all-visible so IOS is possible
-    ${PSQL_TMO} -c "CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0; VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) ${TBL};"
+    ${PSQL_TMO} -c "CHECKPOINT";
+    ${PSQL_TMO} -c "SET vacuum_freeze_min_age=0";
+    ${PSQL_TMO} -c "SET vacuum_freeze_table_age=0";
+    ${PSQL_TMO} -c "VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) ${TBL}";
   else
     # SMOL does not require VACUUM; analyze already done above
     :
