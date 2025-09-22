@@ -12,10 +12,24 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 # Common Docker utilities for building/testing in a clean PG18 toolchain
-.PHONY: dockerbuild dockercodex
+.PHONY: dockerbuild dockercreate dockercodex
 
 dockerbuild:
 	docker build -t smol .
+
+dockercreate:
+	@set -euo pipefail; \
+	  if ! docker ps -a --format '{{.Names}}' | grep -qx smol; then \
+	    echo "[docker] Creating container 'smol' from image 'smol'"; \
+	    docker run -d --name smol -v "$$PWD":/workspace -w /workspace smol sleep infinity; \
+	  else \
+	    echo "[docker] Reusing existing container 'smol'"; \
+	    if ! docker ps --format '{{.Names}}' | grep -qx smol; then \
+	      echo "[docker] Starting container 'smol'"; \
+	      docker start smol >/dev/null; \
+	    fi; \
+	  fi; \
+	  echo "[docker] Container 'smol' is ready."
 
 dockercodex:
 	docker exec -it smol codex -a never --sandbox danger-full-access
