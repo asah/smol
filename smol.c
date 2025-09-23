@@ -43,6 +43,7 @@ PG_MODULE_MAGIC;
 
 static bool smol_debug_log = false; /* toggled by GUC smol.debug_log */
 static bool smol_profile_log = false; /* toggled by GUC smol.profile */
+static int  smol_progress_log_every = 250000; /* GUC: log progress every N tuples */
 
 #if SMOL_TRACE
 #define SMOL_LOG(msg) \
@@ -76,6 +77,17 @@ _PG_init(void)
                              PGC_SUSET,
                              0,
                              NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.progress_log_every",
+                            "Emit progress logs every N tuples during build",
+                            "When smol.debug_log is on, log progress during scan/sort/build at this interval.",
+                            &smol_progress_log_every,
+                            250000, /* default */
+                            1000, /* min */
+                            100000000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
 }
 
 /* forward decls */
@@ -358,12 +370,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     {
         int16 *keys = NULL;
         BuildCtxI16 cb = { &keys, &nalloc, &nkeys };
+        SMOL_LOG("collect int2 keys via table_index_build_scan");
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i16, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
+        {
+            SMOL_LOGF("sort int2 keys n=%zu", nkeys);
             smol_sort_int16(keys, nkeys);
+        }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int2 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
@@ -374,12 +390,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     {
         int32 *keys = NULL;
         BuildCtxI32 cb = { &keys, &nalloc, &nkeys };
+        SMOL_LOG("collect int4 keys via table_index_build_scan");
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i32, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
+        {
+            SMOL_LOGF("sort int4 keys n=%zu", nkeys);
             smol_sort_int32(keys, nkeys);
+        }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int4 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
@@ -390,12 +410,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     {
         int64 *keys = NULL;
         BuildCtxI64 cb = { &keys, &nalloc, &nkeys };
+        SMOL_LOG("collect int8 keys via table_index_build_scan");
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i64, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
+        {
+            SMOL_LOGF("sort int8 keys n=%zu", nkeys);
             smol_sort_int64(keys, nkeys);
+        }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int8 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
@@ -408,12 +432,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         int64 *k1norm = NULL;
         int64 *k2norm = NULL;
         PairArrCtx ctx = { &k1norm, &k2norm, &cap, &n, atttypid, atttypid2 };
+        SMOL_LOG("collect pairs via table_index_build_scan");
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_pair, (void *) &ctx, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
         if (n > 1)
+        {
+            SMOL_LOGF("sort pairs (k1,k2) n=%zu", n);
             smol_sort_pairs64(k1norm, k2norm, n);
+        }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         smol_build_tree2_from_sorted(index, k1norm, k2norm, n, key_len, key_len2);
         INSTR_TIME_SET_CURRENT(t_write_end);
@@ -1129,7 +1157,16 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
         leaves[nleaves].blk = cur;
         nleaves++;
         prev = cur;
-        SMOL_LOGF("built leaf blk=%u items=%zu", cur, added);
+        if (smol_debug_log)
+        {
+            double pct = (nkeys > 0) ? (100.0 * (double) i / (double) nkeys) : 100.0;
+            SMOL_LOGF("leaf(2col) built blk=%u groups=%u progress=%.1f%%", cur, ng, pct);
+        }
+        if (smol_debug_log)
+        {
+            double pct = (nkeys > 0) ? (100.0 * (double) i / (double) nkeys) : 100.0;
+            SMOL_LOGF("leaf built blk=%u items=%zu progress=%.1f%%", cur, added, pct);
+        }
     }
 
     /* If single leaf, set it as root */
@@ -1685,6 +1722,8 @@ smol_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     }
     (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt16(values[0]);
     (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int2: tuples=%zu", *ctx->pnkeys);
 }
 
 static void
@@ -1704,6 +1743,8 @@ smol_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     }
     (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt32(values[0]);
     (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int4: tuples=%zu", *ctx->pnkeys);
 }
 
 static void
@@ -1723,6 +1764,8 @@ smol_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     }
     (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt64(values[0]);
     (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int8: tuples=%zu", *ctx->pnkeys);
 }
 
 static int cmp_int16(const void *a, const void *b)
@@ -1759,6 +1802,8 @@ smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, b
     (*c->pk1)[*c->pcount] = v1;
     (*c->pk2)[*c->pcount] = v2;
     (*c->pcount)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*c->pcount % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect pair: tuples=%zu", *c->pcount);
 }
 
 /* ---- Radix sort for fixed-width signed integers ------------------------- */

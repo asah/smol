@@ -80,8 +80,8 @@ insidecheck: insidebuild insidestart
 	  $(MAKE) insidestop
 
 insidebench-smol-btree-5m: insidebuild insidestart
-	@echo "[inside] Running SMOL vs BTREE benchmark (5M rows int2,int2)"
+	@echo "[inside] Running SMOL vs BTREE benchmark (default 5M rows int2,int2)"
 	@set -euo pipefail; \
-	  chmod +x bench/smol_vs_btree_5m.sh; \
-	  su - postgres -c "env ROWS=$${ROWS:-5000000} THRESH=$${THRESH:-15000} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} SINGLECOL=$${SINGLECOL:-0} bash /workspace/bench/smol_vs_btree_5m.sh"; \
-	  echo "[inside] Benchmark finished; leaving PostgreSQL running. Use 'make insidestop' when done."
+      chmod +x bench/smol_vs_btree.sh; \
+      su - postgres -c "env ROWS=$${ROWS:-5000000} THRESH=$${THRESH:-15000} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} SINGLECOL=$${SINGLECOL:-0} bash /workspace/bench/smol_vs_btree.sh"; \
+      echo "[inside] Benchmark finished; leaving PostgreSQL running. Use 'make insidestop' when done."

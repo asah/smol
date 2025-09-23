@@ -218,10 +218,16 @@ Profiling smol_gettuple
 - Improve `smol_costestimate` to reflect high tuple density and realistic page counts so the planner chooses SMOL-friendly IOS/parallel plans.
 
 ## Benchmark Snapshot (reference)
-- Environment: Docker "smol", PG18, bench/smol_vs_btree_5m.sh with ROWS=1,000,000, TIMEOUT_SEC=30, BATCH=100000, CHUNK_MIN=20000, PGOPTIONS='-c max_parallel_workers_per_gather=0 -c min_parallel_index_scan_size=0'.
+- Environment: Docker "smol", PG18, bench/smol_vs_btree.sh with ROWS=1,000,000, TIMEOUT_SEC=30, BATCH=100000, CHUNK_MIN=20000, PGOPTIONS='-c max_parallel_workers_per_gather=0 -c min_parallel_index_scan_size=0'.
 - Multi-col (b,a): BTREE build 228 ms, 21.48 MB, query 36.98 ms (actual ~18.99 ms); SMOL build 92 ms, 2.20 MB, query 28.75 ms (actual ~16.44 ms).
 - Single-col (b): BTREE build 205 ms, 7.17 MB, query 27.53 ms (actual ~20.33 ms); SMOL build 40 ms, 1.95 MB, query 27.93 ms (actual ~15.70 ms).
 - Note: For larger ROWS (e.g., 5M), revisit—user observed slower CREATE INDEX for SMOL; 1M snapshot shows SMOL build faster but we need to validate trend at scale.
+
+### 5M rows (multi-col b,a), 30s per-step cap
+- Result (bench/smol_vs_btree.sh default):
+  - BTREE: Build_ms=1165, Size_MB=107.28, Query_ms=263.68
+  - SMOL: Build_ms≈30007 (hit 30s timeout), Size/Query unavailable (canceled)
+- Indicates SMOL build path exceeds 30s at 5M; need profiling to separate collect vs sort vs write phases (enable `smol.debug_log=on`).
 
 ## Testing Checklist
 - Basic IOS: `CREATE EXTENSION smol;` build small tables (int2/int4/int8), build SMOL indexes; `EXPLAIN (ANALYZE, BUFFERS)` selective queries; expect Index Only Scan using smol.
