@@ -54,6 +54,7 @@ PG_MODULE_MAGIC;
 static bool smol_debug_log = false; /* toggled by GUC smol.debug_log */
 static bool smol_profile_log = false; /* toggled by GUC smol.profile */
 static int  smol_progress_log_every = 250000; /* GUC: log progress every N tuples */
+static int  smol_wait_log_ms = 500; /* GUC: log waits longer than this (ms) */
 extern int maintenance_work_mem;
 
 #if SMOL_TRACE
@@ -96,6 +97,17 @@ _PG_init(void)
                             250000, /* default */
                             1000, /* min */
                             100000000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.wait_log_ms",
+                            "Log any single wait > N milliseconds",
+                            "Applies to buffer locks and bgworker waits in build path.",
+                            &smol_wait_log_ms,
+                            500,
+                            0,
+                            60000,
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
@@ -238,6 +250,10 @@ static void smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink);
 static void smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 key_len);
 static void smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                              Size nkeys, uint16 key_len1, uint16 key_len2);
+static void smol_build_internal_levels(Relation idx,
+                                       BlockNumber *child_blks, const int64 *child_high,
+                                       Size nchildren, uint16 key_len,
+                                       BlockNumber *out_root, uint16 *out_levels);
 static BlockNumber smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len);
 static BlockNumber smol_rightmost_leaf(Relation idx);
 static BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
@@ -255,6 +271,9 @@ static char *smol2_k2_base(Page page, uint16 key_len1, uint16 ngroups);
 static char *smol2_k2_ptr(Page page, uint32 idx, uint16 key_len2, uint16 key_len1, uint16 ngroups);
 static char *smol2_last_k1_ptr(Page page, uint16 key_len1);
 static int smol_cmp_k1_group(Page page, uint16 g, uint16 key_len1, Oid atttypid, int64 bound);
+
+/* Page summary (diagnostic) */
+static void smol_log_page_summary(Relation idx);
 
 /* Sorting helpers for build path */
 static void smol_sort_int16(int16 *keys, Size n);
@@ -422,13 +441,26 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         SMOL_LOG("collect int2 -> tuplesort");
         table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i16, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
+        SMOL_LOGF("build phase: collect done tuples=%zu", nkeys);
+        SMOL_LOGF("build phase: sort start n=%zu", nkeys);
         tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_sort_end, t_collect_end);
+            SMOL_LOGF("build phase: sort done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         out = (int16 *) palloc(nkeys * sizeof(int16));
         while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
             out[i++] = DatumGetInt16(val);
+        SMOL_LOGF("build phase: write start n=%zu", nkeys);
         smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_write_end, t_sort_end);
+            SMOL_LOGF("build phase: write done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         pfree(out);
         tuplesort_end(ts);
     }
@@ -444,13 +476,26 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         SMOL_LOG("collect int4 -> tuplesort");
         table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i32, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
+        SMOL_LOGF("build phase: collect done tuples=%zu", nkeys);
+        SMOL_LOGF("build phase: sort start n=%zu", nkeys);
         tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_sort_end, t_collect_end);
+            SMOL_LOGF("build phase: sort done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         out = (int32 *) palloc(nkeys * sizeof(int32));
         while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
             out[i++] = DatumGetInt32(val);
+        SMOL_LOGF("build phase: write start n=%zu", nkeys);
         smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_write_end, t_sort_end);
+            SMOL_LOGF("build phase: write done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         pfree(out);
         tuplesort_end(ts);
     }
@@ -466,13 +511,26 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         SMOL_LOG("collect int8 -> tuplesort");
         table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i64, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
+        SMOL_LOGF("build phase: collect done tuples=%zu", nkeys);
+        SMOL_LOGF("build phase: sort start n=%zu", nkeys);
         tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_sort_end, t_collect_end);
+            SMOL_LOGF("build phase: sort done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         out = (int64 *) palloc(nkeys * sizeof(int64));
         while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
             out[i++] = DatumGetInt64(val);
+        SMOL_LOGF("build phase: write start n=%zu", nkeys);
         smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
+        if (smol_debug_log)
+        {
+            instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_write_end, t_sort_end);
+            SMOL_LOGF("build phase: write done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+        }
         pfree(out);
         tuplesort_end(ts);
     }
@@ -567,6 +625,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 {
                     BgwHandleStatus st;
                     pid_t pid = 0;
+                    /* Wait for startup */
                     for (;;)
                     {
                         st = GetBackgroundWorkerPid(handles[ihandle], &pid);
@@ -577,9 +636,32 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                     SMOL_LOGF("worker %d startup poll status=%d pid=%d", ihandle, (int) st, (int) pid);
                     if (st != BGWH_STARTED)
                         continue;
-                    SMOL_LOGF("waiting for worker %d shutdown", ihandle);
-                    (void) WaitForBackgroundWorkerShutdown(handles[ihandle]);
-                    SMOL_LOGF("worker %d shutdown complete", ihandle);
+                    /* Poll for shutdown with bounded waits and periodic logging */
+                    {
+                        instr_time t0, t1;
+                        int warned = 0;
+                        INSTR_TIME_SET_CURRENT(t0);
+                        for (;;)
+                        {
+                            st = GetBackgroundWorkerPid(handles[ihandle], &pid);
+                            if (st == BGWH_STOPPED || st == BGWH_POSTMASTER_DIED)
+                                break;
+                            if (st != BGWH_STARTED)
+                                break;
+                            pg_usleep(10000L);
+                            if (smol_debug_log && smol_wait_log_ms > 0)
+                            {
+                                INSTR_TIME_SET_CURRENT(t1);
+                                double ms = (INSTR_TIME_GET_DOUBLE(t1) - INSTR_TIME_GET_DOUBLE(t0)) * 1000.0;
+                                if (!warned && ms > smol_wait_log_ms)
+                                {
+                                    SMOL_LOGF("waiting for worker %d shutdown ~%.1f ms", ihandle, ms);
+                                    warned = 1;
+                                }
+                            }
+                        }
+                        SMOL_LOGF("worker %d shutdown complete (status=%d)", ihandle, (int) st);
+                    }
                 }
                 INSTR_TIME_SET_CURRENT(t_sort_end);
                 smol_build_tree2_from_sorted(index, dk1, dk2, n, key_len, key_len2);
@@ -592,10 +674,22 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 /* Fallback: sort in-process without DSM */
                 FlushErrorState();
                 SMOL_LOG("parallel build unavailable; falling back to single-process sort");
+                SMOL_LOGF("build phase: sort(start) pairs n=%zu", n);
                 smol_sort_pairs_rows64(k1arr, k2arr, n);
                 INSTR_TIME_SET_CURRENT(t_sort_end);
+                if (smol_debug_log)
+                {
+                    instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_sort_end, t_collect_end);
+                    SMOL_LOGF("build phase: sort(done) ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+                }
+                SMOL_LOGF("build phase: write start n=%zu", n);
                 smol_build_tree2_from_sorted(index, k1arr, k2arr, n, key_len, key_len2);
                 INSTR_TIME_SET_CURRENT(t_write_end);
+                if (smol_debug_log)
+                {
+                    instr_time d; INSTR_TIME_SET_ZERO(d); INSTR_TIME_ACCUM_DIFF(d, t_write_end, t_sort_end);
+                    SMOL_LOGF("build phase: write done ~%.3f ms", (double) INSTR_TIME_GET_MILLISEC(d));
+                }
             }
             PG_END_TRY();
             if (k1arr) pfree(k1arr);
@@ -1175,8 +1269,18 @@ smol_mark_heap0_allvisible(Relation heapRel)
 static Buffer
 smol_extend(Relation idx)
 {
+    instr_time t0, t1;
     Buffer buf = ReadBufferExtended(idx, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+    INSTR_TIME_SET_CURRENT(t0);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    INSTR_TIME_SET_CURRENT(t1);
+    if (smol_debug_log && smol_wait_log_ms > 0)
+    {
+        double ms = (INSTR_TIME_GET_DOUBLE(t1) - INSTR_TIME_GET_DOUBLE(t0)) * 1000.0;
+        if (ms > smol_wait_log_ms)
+            SMOL_LOGF("slow LockBuffer(new) wait ~%.1f ms on blk=%u",
+                      ms, BufferGetBlockNumber(buf));
+    }
     return buf;
 }
 
@@ -1208,6 +1312,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
     SmolMeta *meta;
     Buffer rbuf;
     Page rpage;
+    SMOL_LOGF("leaf-write(single) start nkeys=%zu", nkeys);
     /* init meta page if new */
     if (RelationGetNumberOfBlocks(idx) == 0)
     {
@@ -1242,6 +1347,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
     BlockNumber prev = InvalidBlockNumber;
     /* Reusable scratch buffer to avoid per-page palloc/free churn */
     char *scratch = (char *) palloc(BLCKSZ);
+    int loop_guard = 0;
     while (i < nkeys)
     {
         Buffer buf;
@@ -1265,6 +1371,8 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             Size sz = header + n_this * key_len;
             if (sz > BLCKSZ)
                 ereport(ERROR, (errmsg("smol: leaf payload exceeds page size")));
+            if (n_this == 0)
+                ereport(ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u avail=%zu)", key_len, (size_t) avail)));
             memcpy(scratch, &n_this, sizeof(uint16));
             memcpy(scratch + header, (const char *) keys + ((size_t)i * key_len), n_this * key_len);
             if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
@@ -1286,22 +1394,45 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 }
                 leaf_high[nleaves] = v;
             }
-            i += n_this;
+            {
+                Size old_i = i;
+                i += n_this;
+                if (i == old_i)
+                {
+                    loop_guard++;
+                    if (loop_guard > 3)
+                        ereport(ERROR, (errmsg("smol: leaf build progress stalled (i not advancing)")));
+                }
+                else
+                    loop_guard = 0;
+            }
         }
-        if (BlockNumberIsValid(prev))
-        {
-            /* link previous leaf to this */
-            pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            p = BufferGetPage(pbuf);
-            pop = smol_page_opaque(p);
-            pop->rightlink = BufferGetBlockNumber(buf);
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
+        /* Finish current page and release before linking prev to avoid nested locks */
         MarkBufferDirty(buf);
         cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
+        if (BlockNumberIsValid(prev))
+        {
+            /* link previous leaf to this (now unlocked current) */
+            instr_time t0, t1;
+            Buffer pbuf2 = ReadBuffer(idx, prev);
+            INSTR_TIME_SET_CURRENT(t0);
+            LockBuffer(pbuf2, BUFFER_LOCK_EXCLUSIVE);
+            INSTR_TIME_SET_CURRENT(t1);
+            if (smol_debug_log && smol_wait_log_ms > 0)
+            {
+                double ms = (INSTR_TIME_GET_DOUBLE(t1) - INSTR_TIME_GET_DOUBLE(t0)) * 1000.0;
+                if (ms > smol_wait_log_ms)
+                    SMOL_LOGF("slow LockBuffer(prev) wait ~%.1f ms on blk=%u", ms, prev);
+            }
+            {
+                Page p2 = BufferGetPage(pbuf2);
+                SmolPageOpaqueData *pop2 = smol_page_opaque(p2);
+                pop2->rightlink = cur;
+                MarkBufferDirty(pbuf2);
+            }
+            UnlockReleaseBuffer(pbuf2);
+        }
 
         /* record leaf */
         if (nleaves == aleaves)
@@ -1334,55 +1465,27 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
         if (leaves) pfree(leaves);
-        SMOL_LOGF("single-leaf tree root=%u", meta->root_blkno);
+        SMOL_LOGF("leaf-write(single) finish nleaves=1 height=1 root=%u", meta->root_blkno);
+        if (smol_debug_log) smol_log_page_summary(idx);
         return;
     }
 
-    /* Build a simple root page (height=2) mapping leaf highkeys to children */
+    /* Build upper levels until a single root remains */
     {
-    Size li;
-    rbuf = smol_extend(idx);
-    smol_init_page(rbuf, false, InvalidBlockNumber);
-    rpage = BufferGetPage(rbuf);
-    {
-        Size item_sz = sizeof(BlockNumber) + key_len;
-        char *item = (char *) palloc(item_sz);
-        for (li = 0; li < nleaves; li++)
-        {
-            memcpy(item, &leaves[li].blk, sizeof(BlockNumber));
-            if (key_len == 2) { int16 t = (int16) leaf_high[li]; memcpy(item + sizeof(BlockNumber), &t, 2); }
-            else if (key_len == 4) { int32 t = (int32) leaf_high[li]; memcpy(item + sizeof(BlockNumber), &t, 4); }
-            else { int64 t = leaf_high[li]; memcpy(item + sizeof(BlockNumber), &t, 8); }
-            if (PageAddItem(rpage, (Item) item, item_sz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-            {
-                UnlockReleaseBuffer(rbuf);
-                meta->root_blkno = leaves[0].blk;
-                meta->height = 1;
-                MarkBufferDirty(mbuf);
-                UnlockReleaseBuffer(mbuf);
-                if (leaves) pfree(leaves);
-                if (leaf_high) pfree(leaf_high);
-                SMOL_LOG("root overflow: fallback to single-level (height=1)");
-                return;
-            }
-        }
-        pfree(item);
+        BlockNumber rootblk = InvalidBlockNumber;
+        uint16 levels = 0;
+        smol_build_internal_levels(idx, &leaves[0].blk, leaf_high, nleaves, key_len, &rootblk, &levels);
+        meta->root_blkno = rootblk;
+        meta->height = (uint16) (1 + levels);
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+        if (leaves) pfree(leaves);
+        if (leaf_high) pfree(leaf_high);
+        pfree(scratch);
+        SMOL_LOGF("leaf-write(single) finish nleaves=%zu height=%u root=%u", nleaves, meta->height, rootblk);
+        if (smol_debug_log) smol_log_page_summary(idx);
+        return;
     }
-    MarkBufferDirty(rbuf);
-    }
-    {
-    BlockNumber rootblk = BufferGetBlockNumber(rbuf);
-    UnlockReleaseBuffer(rbuf);
-
-    meta->root_blkno = rootblk;
-    meta->height = 2;
-    MarkBufferDirty(mbuf);
-    UnlockReleaseBuffer(mbuf);
-    if (leaves) pfree(leaves);
-    if (leaf_high) pfree(leaf_high);
-    SMOL_LOGF("built root blk=%u with %zu children", rootblk, nleaves);
-    }
-    pfree(scratch);
 }
 
 /* Build 2-column tree from sorted pairs (k1,k2) normalized to int64 */
@@ -1404,6 +1507,7 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
     SmolMeta *meta;
     Buffer rbuf;
     Page rpage;
+    SMOL_LOGF("leaf-write(2col) start nkeys=%zu", nkeys);
     /* init meta page if new */
     if (RelationGetNumberOfBlocks(idx) == 0)
     {
@@ -1436,10 +1540,15 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
     char *scratch = (char *) palloc(BLCKSZ);
     while (i < nkeys)
     {
+        Size begin_i = i;
+        SMOL_LOGF("2col: page-loop begin i=%zu prev_blk=%u remaining=%zu", (size_t) i, (unsigned) prev, (size_t) (nkeys - i));
         Buffer buf = smol_extend(idx);
+        SMOL_LOGF("2col: got new buffer blk=%u (after smol_extend)", (unsigned) BufferGetBlockNumber(buf));
         Page page;
         page = BufferGetPage(buf);
+        SMOL_LOG("2col: calling smol_init_page(leaf, rightlink=Invalid) ...");
         smol_init_page(buf, true, InvalidBlockNumber);
+        SMOL_LOG("2col: returned from smol_init_page");
 
         /* Page-local accumulators */
         uint16 ng = 0;
@@ -1448,11 +1557,14 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
         /* Temporary arrays per page */
         /* We’ll accumulate into a scratch buffer at the end to avoid complex incremental packing */
         /* Reserve available space */
+        SMOL_LOG("2col: calling PageGetFreeSpace(page) ...");
         Size avail = PageGetFreeSpace(page);
+        SMOL_LOGF("2col: PageGetFreeSpace done avail=%zu (pre ItemId)", (size_t) avail);
         if (avail > sizeof(ItemIdData))
             avail -= sizeof(ItemIdData);
         else
             avail = 0;
+        SMOL_LOGF("2col: usable avail after ItemId reservation=%zu", (size_t) avail);
 
         /* Vectors to hold group info this page (bounded) */
         #define MAX_GROUPS_PAGE 512
@@ -1465,16 +1577,20 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
         while (i < nkeys)
         {
             /* Determine the extent of the next k1 run */
+            SMOL_LOGF("2col: group-scan i=%zu of %zu", (size_t) i, (size_t) nkeys);
             int64 curk1 = k1v[i];
             Size j = i;
             while (j < nkeys && k1v[j] == curk1)
                 j++;
             Size run_cnt = j - i;
+            SMOL_LOGF("2col: run detected k1=%ld run_cnt=%zu", (long) curk1, (size_t) run_cnt);
 
             /* Check if group fits as a whole */
             Size need_hdr = sizeof(uint16) + (ng + 1) * hdrsz; /* tentative ng+1 groups */
             Size need_k2 = (k2_count + run_cnt) * key_len2;
             Size need_total = need_hdr + need_k2;
+            SMOL_LOGF("2col: fit-check ng=%u k2_count=%zu need_hdr=%zu need_k2=%zu need_total=%zu avail=%zu",
+                      (unsigned) ng, (size_t) k2_count, (size_t) need_hdr, (size_t) need_k2, (size_t) need_total, (size_t) avail);
             if (need_total > avail)
             {
                 /* If nothing yet, split the run to fit page */
@@ -1482,6 +1598,8 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                 {
                     Size max_k2 = (avail > (sizeof(uint16) + hdrsz)) ?
                                   ((avail - (sizeof(uint16) + hdrsz)) / key_len2) : 0;
+                    SMOL_LOGF("2col: ng=0 overflow; max_k2 fitting this page=%zu (hdrsz=%zu key_len2=%u)",
+                              (size_t) max_k2, (size_t) hdrsz, (unsigned) key_len2);
                     if (max_k2 == 0)
                         ereport(ERROR, (errmsg("smol: page too small for 2-col group")));
                     g_k1[ng] = curk1;
@@ -1490,28 +1608,39 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                     ng++;
                     k2_count += max_k2;
                     j = i + max_k2;
+                    SMOL_LOGF("2col: split-run placed partial group k1=%ld cnt=%u; advancing j=%zu",
+                              (long) curk1, (unsigned) g_cnt[ng-1], (size_t) j);
                 }
                 /* flush page */
+                SMOL_LOG("2col: need_total > avail; breaking to flush page");
                 break;
             }
 
             if (ng >= MAX_GROUPS_PAGE)
+            {
+                SMOL_LOGF("2col: MAX_GROUPS_PAGE hit (%u); break to flush", (unsigned) MAX_GROUPS_PAGE);
                 break;
+            }
 
             g_k1[ng] = curk1;
             g_off[ng] = (uint32) k2_count;
             g_cnt[ng] = (uint16) run_cnt;
+            SMOL_LOGF("2col: add-group gi=%u k1=%ld off=%u cnt=%u", (unsigned) ng, (long) g_k1[ng], (unsigned) g_off[ng], (unsigned) g_cnt[ng]);
             ng++;
             k2_count += run_cnt;
             i = j;
+            SMOL_LOGF("2col: after-add ng=%u k2_count=%zu i=%zu", (unsigned) ng, (size_t) k2_count, (size_t) i);
         }
 
         /* Now pack payload */
         Size blob_sz = sizeof(uint16) + (size_t) ng * hdrsz + (size_t) k2_count * key_len2;
+        SMOL_LOGF("2col: packing payload ng=%u k2_count=%zu hdrsz=%zu key_len2=%u blob_sz=%zu",
+                  (unsigned) ng, (size_t) k2_count, (size_t) hdrsz, (unsigned) key_len2, (size_t) blob_sz);
         if (blob_sz > BLCKSZ)
             ereport(ERROR, (errmsg("smol: 2-col leaf payload exceeds page size")));
         memcpy(scratch, &ng, sizeof(uint16));
         char *gd = scratch + sizeof(uint16);
+        SMOL_LOG("2col: writing GroupDir to scratch");
         /* GroupDir */
         for (uint16 gi = 0; gi < ng; gi++)
         {
@@ -1522,12 +1651,15 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
             else { int64 v = (int64) g_k1[gi]; memcpy(ptr, &v, 8); }
             memcpy(ptr + key_len1, &g_off[gi], sizeof(uint32));
             memcpy(ptr + key_len1 + sizeof(uint32), &g_cnt[gi], sizeof(uint16));
+            if ((gi & 0xF) == 0) SMOL_LOGF("2col: GroupDir[gi=%u] k1=%ld off=%u cnt=%u", (unsigned) gi, (long) g_k1[gi], (unsigned) g_off[gi], (unsigned) g_cnt[gi]);
         }
         /* k2 array: contiguous pack; bulk memcpy when 8-byte */
         char *k2b = gd + (size_t) ng * hdrsz;
+        SMOL_LOGF("2col: packing k2 array count=%zu at scratch offset=%zu", (size_t) k2_count, (size_t) (k2b - scratch));
         if (key_len2 == 8)
         {
             Size bytes = (Size) (i - local_start) * 8;
+            SMOL_LOGF("2col: memcpy k2 bulk bytes=%zu", (size_t) bytes);
             memcpy(k2b, (const char *) (k2v + local_start), bytes);
         }
         else
@@ -1538,11 +1670,14 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                 if (key_len2 == 2) { int16 v = (int16) k2v[pidx]; memcpy(k2b + pos*2, &v, 2); }
                 else /* key_len2 == 4 */ { int32 v = (int32) k2v[pidx]; memcpy(k2b + pos*4, &v, 4); }
                 pos++;
+                if ((pos & 0x3FFF) == 0) SMOL_LOGF("2col: packed k2 pos=%zu", (size_t) pos);
             }
         }
 
+        SMOL_LOG("2col: calling PageAddItem for leaf payload ...");
         if (PageAddItem(page, (Item) scratch, blob_sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
             ereport(ERROR, (errmsg("smol: failed to add 2-col leaf payload")));
+        SMOL_LOG("2col: PageAddItem returned OK");
         /* record last k1 for this page */
         {
             int64 v = (ng > 0) ? g_k1[ng - 1] : 0;
@@ -1552,25 +1687,44 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                 leaf_high1 = (leaf_high1 == NULL)
                     ? (int64 *) palloc(ahigh1 * sizeof(int64))
                     : (int64 *) repalloc(leaf_high1, ahigh1 * sizeof(int64));
+                SMOL_LOGF("2col: resized leaf_high1 to %zu", (size_t) ahigh1);
             }
             leaf_high1[nleaves] = v;
+            SMOL_LOGF("2col: leaf_high1[%zu]=%ld", (size_t) nleaves, (long) v);
         }
 
-        /* link right sibling */
-        if (BlockNumberIsValid(prev))
-        {
-            Buffer pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            Page p = BufferGetPage(pbuf);
-            SmolPageOpaqueData *pop = smol_page_opaque(p);
-            pop->rightlink = BufferGetBlockNumber(buf);
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
-
+        /* finish and release current leaf before linking prev to avoid nested locks */
+        SMOL_LOGF("2col: calling MarkBufferDirty on blk=%u", (unsigned) BufferGetBlockNumber(buf));
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
+        SMOL_LOGF("2col: calling UnlockReleaseBuffer on blk=%u", (unsigned) cur);
         UnlockReleaseBuffer(buf);
+        if (BlockNumberIsValid(prev))
+        {
+            instr_time t0, t1;
+            SMOL_LOGF("2col: linking prev leaf %u -> %u (ReadBuffer prev)", (unsigned) prev, (unsigned) cur);
+            Buffer pbuf = ReadBuffer(idx, prev);
+            SMOL_LOG("2col: ReadBuffer(prev) returned; LockBuffer(EXCLUSIVE) ...");
+            INSTR_TIME_SET_CURRENT(t0);
+            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+            INSTR_TIME_SET_CURRENT(t1);
+            if (smol_debug_log && smol_wait_log_ms > 0)
+            {
+                double ms = (INSTR_TIME_GET_DOUBLE(t1) - INSTR_TIME_GET_DOUBLE(t0)) * 1000.0;
+                if (ms > smol_wait_log_ms)
+                    SMOL_LOGF("slow LockBuffer(prev,2col) wait ~%.1f ms on blk=%u", ms, prev);
+            }
+            SMOL_LOG("2col: locked prev; BufferGetPage(prev) ...");
+            Page p = BufferGetPage(pbuf);
+            SMOL_LOG("2col: got page for prev; smol_page_opaque(prev) ...");
+            SmolPageOpaqueData *pop = smol_page_opaque(p);
+            pop->rightlink = cur;
+            SMOL_LOGF("2col: set prev->rightlink=%u; MarkBufferDirty(prev) ...", (unsigned) cur);
+            MarkBufferDirty(pbuf);
+            SMOL_LOG("2col: UnlockReleaseBuffer(prev) ...");
+            UnlockReleaseBuffer(pbuf);
+            SMOL_LOG("2col: prev link done");
+        }
 
         if (nleaves == aleaves)
         {
@@ -1579,10 +1733,15 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
                 leaves = (SmolLeafRef *) palloc(aleaves * sizeof(SmolLeafRef));
             else
                 leaves = (SmolLeafRef *) repalloc(leaves, aleaves * sizeof(SmolLeafRef));
+            SMOL_LOGF("2col: resized leaves array to %zu", (size_t) aleaves);
         }
         leaves[nleaves].blk = cur;
         nleaves++;
         prev = cur;
+        /* stall guard: ensure i advanced this iteration */
+        if (i == begin_i)
+            ereport(ERROR, (errmsg("smol: 2-col leaf build progress stalled (i not advancing)")));
+        SMOL_LOGF("2col: page-loop end; wrote leaf blk=%u, nleaves=%zu, next i=%zu", (unsigned) cur, (size_t) nleaves, (size_t) i);
     }
 
     /* set root */
@@ -1597,52 +1756,26 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
         if (leaves) pfree(leaves);
+        SMOL_LOGF("leaf-write(2col) finish nleaves=1 height=1 root=%u", meta->root_blkno);
+        if (smol_debug_log) smol_log_page_summary(idx);
         return;
     }
 
-    rbuf = smol_extend(idx);
-    smol_init_page(rbuf, false, InvalidBlockNumber);
-    rpage = BufferGetPage(rbuf);
     {
-        Size item_sz = sizeof(BlockNumber) + key_len1;
-        char *item = (char *) palloc(item_sz);
-        for (Size li = 0; li < nleaves; li++)
-        {
-            memcpy(item, &leaves[li].blk, sizeof(BlockNumber));
-            if (key_len1 == 2) { int16 t = (int16) leaf_high1[li]; memcpy(item + sizeof(BlockNumber), &t, 2); }
-            else if (key_len1 == 4) { int32 t = (int32) leaf_high1[li]; memcpy(item + sizeof(BlockNumber), &t, 4); }
-            else { int64 t = leaf_high1[li]; memcpy(item + sizeof(BlockNumber), &t, 8); }
-            if (PageAddItem(rpage, (Item) item, item_sz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
-            {
-                UnlockReleaseBuffer(rbuf);
-                Buffer mbuf2 = ReadBuffer(idx, 0);
-                LockBuffer(mbuf2, BUFFER_LOCK_EXCLUSIVE);
-                Page mpage2 = BufferGetPage(mbuf2);
-                SmolMeta *meta2 = smol_meta_ptr(mpage2);
-                meta2->root_blkno = leaves[0].blk;
-                meta2->height = 1;
-                MarkBufferDirty(mbuf2);
-                UnlockReleaseBuffer(mbuf2);
-                if (leaves) pfree(leaves);
-                if (leaf_high1) pfree(leaf_high1);
-                SMOL_LOG("root overflow (2-col): fallback to height=1");
-                return;
-            }
-        }
-        pfree(item);
-    }
-    MarkBufferDirty(rbuf);
-    {
-        BlockNumber rootblk = BufferGetBlockNumber(rbuf);
-        UnlockReleaseBuffer(rbuf);
+        BlockNumber rootblk = InvalidBlockNumber;
+        uint16 levels = 0;
+        smol_build_internal_levels(idx, &leaves[0].blk, leaf_high1, nleaves, key_len1, &rootblk, &levels);
         meta->root_blkno = rootblk;
-        meta->height = 2;
+        meta->height = (uint16) (1 + levels);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
+        if (leaves) pfree(leaves);
+        if (leaf_high1) pfree(leaf_high1);
+        pfree(scratch);
+        SMOL_LOGF("leaf-write(2col) finish nleaves=%zu height=%u root=%u", nleaves, meta->height, meta->root_blkno);
+        if (smol_debug_log) smol_log_page_summary(idx);
+        return;
     }
-    if (leaves) pfree(leaves);
-    if (leaf_high1) pfree(leaf_high1);
-    pfree(scratch);
 }
 
 static BlockNumber
@@ -1801,6 +1934,115 @@ smol_cmp_k1_group(Page page, uint16 g, uint16 key_len1, Oid atttypid, int64 boun
 {
     char *p = smol2_group_k1_ptr(page, g, key_len1);
     return smol_cmp_keyptr_bound(p, key_len1, atttypid, bound);
+}
+
+/* Build internal levels from a linear list of children (blk, highkey) until a single root remains. */
+static void
+smol_build_internal_levels(Relation idx,
+                           BlockNumber *child_blks, const int64 *child_high,
+                           Size nchildren, uint16 key_len,
+                           BlockNumber *out_root, uint16 *out_levels)
+{
+    BlockNumber *cur_blks = child_blks;
+    const int64 *cur_high = child_high;
+    Size cur_n = nchildren;
+    uint16 levels = 0;
+
+    /* Temporary arrays for next level; allocate conservatively (worst case ~cur_n/2) */
+    while (cur_n > 1)
+    {
+        /* Build a sequence of internal pages from current level */
+        Size cap_next = (cur_n / 2) + 2;
+        BlockNumber *next_blks = (BlockNumber *) palloc(cap_next * sizeof(BlockNumber));
+        int64 *next_high = (int64 *) palloc(cap_next * sizeof(int64));
+        Size next_n = 0;
+
+        Size i = 0;
+        while (i < cur_n)
+        {
+            Buffer ibuf = smol_extend(idx);
+            smol_init_page(ibuf, false, InvalidBlockNumber);
+            Page ipg = BufferGetPage(ibuf);
+            Size item_sz = sizeof(BlockNumber) + key_len;
+            char *item = (char *) palloc(item_sz);
+            Size first_i = i;
+            /* add as many children as fit */
+            for (; i < cur_n; i++)
+            {
+                memcpy(item, &cur_blks[i], sizeof(BlockNumber));
+                if (key_len == 2) { int16 t = (int16) cur_high[i]; memcpy(item + sizeof(BlockNumber), &t, 2); }
+                else if (key_len == 4) { int32 t = (int32) cur_high[i]; memcpy(item + sizeof(BlockNumber), &t, 4); }
+                else { int64 t = cur_high[i]; memcpy(item + sizeof(BlockNumber), &t, 8); }
+                if (PageAddItem(ipg, (Item) item, item_sz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
+                {
+                    /* page full: back out to next page */
+                    break;
+                }
+            }
+            pfree(item);
+            MarkBufferDirty(ibuf);
+            BlockNumber iblk = BufferGetBlockNumber(ibuf);
+            UnlockReleaseBuffer(ibuf);
+            /* record new internal page and its highkey from last child inserted */
+            {
+                Size last = (i > first_i) ? (i - 1) : first_i;
+                if (next_n >= cap_next)
+                {
+                    cap_next = cap_next * 2;
+                    next_blks = (BlockNumber *) repalloc(next_blks, cap_next * sizeof(BlockNumber));
+                    next_high = (int64 *) repalloc(next_high, cap_next * sizeof(int64));
+                }
+                next_blks[next_n] = iblk;
+                next_high[next_n] = cur_high[last];
+                next_n++;
+            }
+        }
+        /* Prepare for next level */
+        if (levels > 0)
+        {
+            /* cur_blks was a palloc we own (not original &leaves[0].blk). Free it. */
+            pfree(cur_blks);
+            pfree((void *) cur_high);
+        }
+        cur_blks = next_blks;
+        cur_high = next_high;
+        cur_n = next_n;
+        levels++;
+    }
+
+    *out_root = cur_blks[0];
+    *out_levels = levels;
+    if (levels > 0)
+    {
+        pfree(cur_blks);
+        pfree((void *) cur_high);
+    }
+}
+
+/* Diagnostic: count page types and log a summary */
+static void
+smol_log_page_summary(Relation idx)
+{
+    BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
+    int nleaf = 0, ninternal = 0, nmeta = 0;
+    for (BlockNumber blk = 0; blk < nblocks; blk++)
+    {
+        Buffer b = ReadBuffer(idx, blk);
+        Page pg = BufferGetPage(b);
+        if (blk == 0)
+        {
+            nmeta++;
+        }
+        else
+        {
+            SmolPageOpaqueData *op = (SmolPageOpaqueData *) PageGetSpecialPointer(pg);
+            if (op->flags & SMOL_F_LEAF) nleaf++;
+            else if (op->flags & SMOL_F_INTERNAL) ninternal++;
+        }
+        ReleaseBuffer(b);
+    }
+    SMOL_LOGF("page summary: blocks=%u meta=%d internal=%d leaf=%d",
+              (unsigned) nblocks, nmeta, ninternal, nleaf);
 }
 
 /* Return rightmost leaf block number */

@@ -208,6 +208,14 @@ Profiling smol_gettuple
 - For fair IOS benchmarking, VACUUM the base table (not the index): `VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) <table>` after index creation (BTREE arm). Keep `enable_seqscan=off`, `enable_bitmapscan=off`, `enable_indexonlyscan=on`.
 - Scale benches under the 30s cap: prefer `ROWS=2e6..3e6` if `TIMEOUT_SEC=30`. If the goal is scaling, raise `TIMEOUT_SEC` only for bench runs; do not change regression timeouts.
 - If `DROP DATABASE` hangs in installcheck: (1) inspect `pg_stat_activity` for lingering `CREATE INDEX` sessions; (2) terminate them; if stuck, (3) `pg_ctl -m immediate stop` then start; (4) rerun installcheck.
+### Troubleshooting: pg_regress DROP DATABASE hangs
+- Symptom: server log repeats "still waiting for backend to accept ProcSignalBarrier" during `DROP DATABASE IF EXISTS "contrib_regression"`.
+- Cause: a lingering backend (e.g., prior `CREATE INDEX`) preventing ProcSignalBarrier; stale socket/lock files can also block restarts.
+- Quick recovery inside container:
+  - Kill stuck backends/postmaster if needed: `ps -ef | grep postgres`, then `kill -9 <backend> <postmaster>`.
+  - Remove stale IPC files: `rm -f /tmp/.s.PGSQL.5432 /tmp/.s.PGSQL.5432.lock`.
+  - Start fresh cluster if wedged: `rm -rf /var/lib/postgresql/data && make insidestart` (Makefile re-runs initdb).
+- For ad-hoc smoke tests (to avoid pg_regress), run minimal correctness via psql as `postgres` without expected-error checks.
 - Build path implementation rules: use radix sort for int2/int4/int8 keys and for (k1,k2) pairs; keep two-col collections in parallel arrays to avoid struct copies.
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.
 - In two-col leaf packing, bulk-memcpy `k2` when key_len2=8; otherwise use tight fixed-width copies (2/4). Reuse a single scratch buffer per page to avoid repeated palloc/free.
@@ -240,6 +248,13 @@ Profiling smol_gettuple
 Note: Attempted switching build to tuplesort to remove the sort bottleneck; first pass hit PG18 API mismatches and backend crashes — reverted to stable radix path for now.
 
 ## Testing Checklist
+
+## Investigation Log (2025-09-23)
+- Reproduced 5M two-col timeout at ~30s; no lock waits observed. Collection logs advance rapidly; many leaf inits; client timeout kills CREATE INDEX.
+- Binary-searched 3s cap for two-col: OK up to ~2.60M; first timeout at ~2.62M. Single-col is fine at these scales. Bottleneck is two-col path.
+- Added detailed build-phase logs. With TIMEOUT_SEC=1 at 3.0M (two-col), sort completes quickly (~80 ms), leaf write completes, and cancellation occurs during root build. The last log before cancel is the root PageAddItem failure fallback:
+  - smol.c:1819 logs PageAddItem ok every 32 children; smol.c:1803 logs "2col-root: PageAddItem failed at li=680; fallback to height=1".
+- Conclusion: at this scale and log level, the create-time cliff is triggered while adding ~680th child to the root; fallback to height=1 is taken but the client timeout aborts mid‑fallback. No evidence of buffer lock contention; compute/log I/O dominates.
 - Basic IOS: `CREATE EXTENSION smol;` build small tables (int2/int4/int8), build SMOL indexes; `EXPLAIN (ANALYZE, BUFFERS)` selective queries; expect Index Only Scan using smol.
 - Non-IOS rejection: disable `enable_indexonlyscan`, enable `enable_indexscan`; queries that would use Index Scan should ERROR with “smol supports index-only scans only”. Re-enable IOS afterward.
 - NULLs rejected at build: table with NULLs in key column must ERROR on `CREATE INDEX ... USING smol`.

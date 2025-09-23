@@ -13,7 +13,7 @@ set -euo pipefail
 #                    [--dbname NAME]
 #
 # Defaults (can also be provided via env):
-#   ROWS=5000000 THRESH=15000 BATCH=250000 CHUNK_MIN=50000 SINGLECOL=0 TIMEOUT_SEC=30 KILL_AFTER=5 DBNAME=postgres
+#   ROWS=5000000 THRESH=15000 BATCH=250000 CHUNK_MIN=50000 SINGLECOL=0 TIMEOUT_SEC=30 KILL_AFTER=5 DBNAME=postgres COLTYPE=int2
 
 ROWS=${ROWS:-5000000}
 THRESH=${THRESH:-15000}
@@ -23,6 +23,15 @@ SINGLECOL=${SINGLECOL:-0}
 TIMEOUT_SEC=${TIMEOUT_SEC:-30}
 KILL_AFTER=${KILL_AFTER:-5}
 DBNAME=${DBNAME:-postgres}
+COLTYPE=${COLTYPE:-int2}
+
+# Choose random range per type (can be overridden via RMAX_A/RMAX_B)
+case "$COLTYPE" in
+  int2) RMAX_A=${RMAX_A:-32767}; RMAX_B=${RMAX_B:-32767};;
+  int4) RMAX_A=${RMAX_A:-1000000000}; RMAX_B=${RMAX_B:-1000000000};;
+  int8) RMAX_A=${RMAX_A:-9000000000000000000}; RMAX_B=${RMAX_B:-9000000000000000000};;
+  *) echo "# ERROR: unsupported COLTYPE=$COLTYPE" >&2; exit 2;;
+esac
 
 print_usage() {
   cat <<USAGE
@@ -66,11 +75,11 @@ TS=$(date +%s)
 RAND=$RANDOM
 TBL=${TBL:-mm_${TS}_${RAND}}
 
-echo "# Preparing schema and data (rows=${ROWS}) using table ${TBL}" >&2
+echo "# Preparing schema and data (rows=${ROWS}, coltype=${COLTYPE}) using table ${TBL}" >&2
 ${PSQL_TMO} <<SQL
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
-CREATE UNLOGGED TABLE ${TBL}(a int2, b int2);
+CREATE UNLOGGED TABLE ${TBL}(a ${COLTYPE}, b ${COLTYPE});
 ALTER TABLE ${TBL} SET (autovacuum_enabled = off);
 SQL
 
@@ -82,7 +91,7 @@ while [ "$cur" -le "$ROWS" ]; do
   chunk=$(( end - cur + 1 ))
   while :; do
     echo "# Loading rows ${cur}..$((cur + chunk - 1)) (chunk=${chunk})" >&2
-    if ${PSQL_TMO} -c "INSERT INTO ${TBL} SELECT (random()*32767)::int2, (random()*32767)::int2 FROM generate_series(${cur}, $((cur + chunk - 1)));"; then
+    if ${PSQL_TMO} -c "INSERT INTO ${TBL} SELECT (random()*${RMAX_A})::${COLTYPE}, (random()*${RMAX_B})::${COLTYPE} FROM generate_series(${cur}, $((cur + chunk - 1)));"; then
       cur=$(( cur + chunk ))
       break
     else
@@ -125,10 +134,13 @@ run_bench_phase() {
 
   echo "# checkpoint + freeze/analyze table (for IOS)" >&2
   if [ "${is_smol}" -eq 0 ]; then
-    ${PSQL_TMO} -c "CHECKPOINT";
+    ${PSQL_TMO} -c "SET statement_timeout=${stmt_ms}; CHECKPOINT";
     ${PSQL_TMO} -c "SET vacuum_freeze_min_age=0";
     ${PSQL_TMO} -c "SET vacuum_freeze_table_age=0";
-    ${PSQL_TMO} -c "VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) ${TBL}";
+    # Split VACUUM and ANALYZE to keep each under statement_timeout
+    # VACUUM must run outside a transaction; do not bundle with SET in one -c
+    ${PSQL_TMO} -c "VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) ${TBL}";
+    ${PSQL_TMO} -c "SET statement_timeout=${stmt_ms}; ANALYZE ${TBL}";
   fi
 
   local t1=$(date +%s%3N)
@@ -174,4 +186,3 @@ echo
 echo "Index,Type,Build_ms,Size_MB,Query_ms,Plan"
 IFS='|' read -r n is b s q p <<<"${bt_row}"; echo "${n},btree,${b},${s},${q},${p}"
 IFS='|' read -r n is b s q p <<<"${sm_row}"; echo "${n},smol,${b},${s},${q},${p}"
-

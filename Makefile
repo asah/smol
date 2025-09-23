@@ -31,11 +31,13 @@ dockerexec:
 
 # jump into the docker and run codex - note long startup time while it reads
 dockercodex:
-	echo "{ \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\" }" > .codex/auth.json
+	echo "{" > .codex/auth.json
+	echo "  \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\"" >> .codex/auth.json
+	echo "}" >> .codex/auth.json
 	docker exec -it smol mkdir -p .codex
 	docker cp .codex/auth.json smol:.codex
 	docker cp .codex/config.toml smol:.codex
-	docker exec -it smol codex -a never --sandbox danger-full-access "read AGENTS.md and do what it says"
+	docker exec -it smol bash -c "codex -a never --sandbox danger-full-access \"read AGENTS.md and do what it says\""
 
 # ---------------------------------------------------------------------------
 # Inside-container targets
