@@ -1,4 +1,5 @@
-# smol — Read‑Only, Space‑Efficient PostgreSQL Index AM
+# smol — Simple Memory-Only Lightweight
+# (a read‑only, space‑efficient PostgreSQL index access method)
 
 This document captures the architecture and operational overview of the
 smol index access method. Code‑level notes live in `AGENT_NOTES.md`.
@@ -58,7 +59,7 @@ Usage
 - `CREATE EXTENSION smol;`
 - `CREATE INDEX idx_smol ON some_table USING smol (col1, col2);`
 - Planner: favor IOS as usual; SMOL errors on non‑IOS paths. Parallel scans
-  are not yet implemented; keep `max_parallel_workers_per_gather=0` for now.
+  are supported, but see notes below on deterministic correctness testing.
 
 Tests & Benchmarks
 - `docker exec -it smol make insidecheck` runs the regression suite and stops PG when done.
@@ -67,6 +68,28 @@ Tests & Benchmarks
 - Bench scripts enforce hard client timeouts (`TIMEOUT_SEC`, `KILL_AFTER`) and
   set a server-side `statement_timeout` slightly below `TIMEOUT_SEC` to avoid
   lingering backends when the client is killed by timeout.
+ - Parallel IOS settings (bench): the script sets `max_parallel_workers_per_gather=5`, lowers
+   `parallel_*` costs, and sets `min_parallel_*_scan_size=0` to consistently prefer up to 5‑way
+   parallel Index Only Scans for both BTREE and SMOL. This makes parallel throughput benefits
+   clear and comparable. For deterministic correctness checks, force single-worker.
+
+Deterministic Correctness Check (Two‑Column)
+- Some workloads (e.g., `GROUP BY a` on an index defined as SMOL(b,a)) can pick SMOL even without
+  a leading‑key qual. To verify correctness deterministically:
+  1. Choose `mode(a)` from a stable slice of the table, e.g., the first 100k rows by `ctid`.
+  2. Compare `SELECT a, count(*) FROM t GROUP BY a` between:
+     - Baseline (seqscan only), and
+     - Forced SMOL IOS (drop the BTREE index, set `enable_seqscan=off`, and set
+       `max_parallel_workers_per_gather=0` for single-worker), using an md5 over ordered results.
+  3. Compare `SELECT count(*) FROM t WHERE a = :mode` under the same toggles.
+- SMOL’s two‑column reader uses a per‑leaf cache and memcpy of both attrs per row, ensuring correctness
+  while remaining allocation‑free per row. Multi‑level descent is supported for height≥2.
+ - Parallel IOS settings (bench): the script sets `max_parallel_workers_per_gather=5`, lowers
+   `parallel_*` costs, and sets `min_parallel_*_scan_size=0` to consistently prefer up to 5‑way
+   parallel Index Only Scans for both BTREE and SMOL plans.
+ - Bench scaling knobs (env): `ROWS`, `COLTYPE` (`int2|int4|int8`), `THRESH`, `BATCH`, `CHUNK_MIN`,
+   and `TIMEOUT_SEC`. For large scales (≥50M), use `TIMEOUT_SEC>=30`. Post‑build maintenance is
+   split into separate `CHECKPOINT`, `VACUUM`, and `ANALYZE` calls to respect statement timeouts.
 
 Operator Classes
 - int2_ops, int4_ops, int8_ops (fixed‑width only).

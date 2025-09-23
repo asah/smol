@@ -23,6 +23,7 @@
 #include "fmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "port/atomics.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/elog.h"
@@ -135,6 +136,8 @@ static void smol_costestimate(struct PlannerInfo *root, struct IndexPath *path, 
                               Cost *indexStartupCost, Cost *indexTotalCost,
                               Selectivity *indexSelectivity, double *indexCorrelation,
                               double *indexPages);
+static struct IndexBulkDeleteResult *smol_vacuumcleanup(struct IndexVacuumInfo *info,
+                                                        struct IndexBulkDeleteResult *stats);
 
 /* --- On-disk structs (prototype, 1- or 2-column fixed-width ints) --- */
 #define SMOL_META_MAGIC   0x534D4F4CUL /* 'SMOL' */
@@ -212,7 +215,11 @@ typedef struct SmolScanOpaqueData
 
     /* optional lower bound on leading key (>=, >, =) */
     bool        have_bound;
+    bool        bound_strict;   /* true when '>' bound (not >=) */
     int64       bound;          /* normalized to int64 for comparisons */
+    /* optional equality filter on second key (attno=2) */
+    bool        have_k2_eq;
+    int64       k2_eq;
 
     /* type/width info (leading key always present; second key optional) */
     Oid         atttypid;       /* INT2OID/INT4OID/INT8OID */
@@ -239,8 +246,23 @@ typedef struct SmolScanOpaqueData
     uint64      prof_pages;     /* leaf pages visited */
     uint64      prof_bytes;     /* bytes copied into tuples */
     uint64      prof_bsteps;    /* binary-search steps */
+
+    /* two-col per-leaf cache to simplify correct emission */
+    int64      *leaf_k1;
+    int64      *leaf_k2;
+    uint32      leaf_n;
+    uint32      leaf_i;
 } SmolScanOpaqueData;
 typedef SmolScanOpaqueData *SmolScanOpaque;
+
+/* Parallel scan shared state (DSM):
+ * curr == 0            => uninitialized; first worker sets to leftmost leaf blkno
+ * curr == InvalidBlockNumber => all leaves claimed
+ * otherwise curr holds the next leaf blkno to claim; workers atomically swap to its rightlink. */
+typedef struct SmolParallelScan
+{
+    pg_atomic_uint32 curr;
+} SmolParallelScan;
 
 /* Utilities */
 static void smol_meta_read(Relation idx, SmolMeta *out);
@@ -271,6 +293,7 @@ static char *smol2_k2_base(Page page, uint16 key_len1, uint16 ngroups);
 static char *smol2_k2_ptr(Page page, uint32 idx, uint16 key_len2, uint16 key_len1, uint16 ngroups);
 static char *smol2_last_k1_ptr(Page page, uint16 key_len1);
 static int smol_cmp_k1_group(Page page, uint16 g, uint16 key_len1, Oid atttypid, int64 bound);
+static void smol2_build_leaf_cache(SmolScanOpaque so, Page page);
 
 /* Page summary (diagnostic) */
 static void smol_log_page_summary(Relation idx);
@@ -365,7 +388,7 @@ smol_handler(PG_FUNCTION_ARGS)
     am->aminsert = smol_insert;
     am->aminsertcleanup = NULL;
     am->ambulkdelete = NULL;
-    am->amvacuumcleanup = NULL;
+    am->amvacuumcleanup = smol_vacuumcleanup;
     am->amcanreturn = smol_canreturn;
     am->amcostestimate = smol_costestimate;
     am->amgettreeheight = NULL;
@@ -776,6 +799,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->cur_buf = InvalidBuffer;
     so->have_pin = false;
     so->have_bound = false;
+    so->bound_strict = false;
     so->atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
     so->atttypid2 = (RelationGetDescr(index)->natts >= 2) ? TupleDescAttr(RelationGetDescr(index), 1)->atttypid : InvalidOid;
     /* read meta */
@@ -841,26 +865,37 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
         so->have_pin = false;
     }
     so->have_bound = false;
+    so->have_k2_eq = false;
     if (keys && nkeys > 0)
     {
-        ScanKey sk = &keys[0];
-        if (sk->sk_attno == 1)
+        for (int i = 0; i < nkeys; i++)
         {
-            if (sk->sk_strategy == BTGreaterEqualStrategyNumber ||
-                sk->sk_strategy == BTGreaterStrategyNumber ||
-                sk->sk_strategy == BTEqualStrategyNumber)
+            ScanKey sk = &keys[i];
+            if (sk->sk_attno == 1)
             {
-                so->have_bound = true;
-                /* normalize to int64 for internal comparisons */
-                if (so->atttypid == INT2OID)
-                    so->bound = (int64) DatumGetInt16(sk->sk_argument);
-                else if (so->atttypid == INT4OID)
-                    so->bound = (int64) DatumGetInt32(sk->sk_argument);
-                else if (so->atttypid == INT8OID)
-                    so->bound = DatumGetInt64(sk->sk_argument);
-                else
-                    so->bound = DatumGetInt64(sk->sk_argument);
-                SMOL_LOGF("rescan bound set=%ld", (long) so->bound);
+                if (sk->sk_strategy == BTGreaterEqualStrategyNumber ||
+                    sk->sk_strategy == BTGreaterStrategyNumber ||
+                    sk->sk_strategy == BTEqualStrategyNumber)
+                {
+                    so->have_bound = true;
+                    so->bound_strict = (sk->sk_strategy == BTGreaterStrategyNumber);
+                    if (so->atttypid == INT2OID)
+                        so->bound = (int64) DatumGetInt16(sk->sk_argument);
+                    else if (so->atttypid == INT4OID)
+                        so->bound = (int64) DatumGetInt32(sk->sk_argument);
+                    else if (so->atttypid == INT8OID)
+                        so->bound = DatumGetInt64(sk->sk_argument);
+                    else
+                        so->bound = DatumGetInt64(sk->sk_argument);
+                }
+            }
+            else if (sk->sk_attno == 2 && sk->sk_strategy == BTEqualStrategyNumber)
+            {
+                so->have_k2_eq = true;
+                Oid t2 = so->atttypid2;
+                if (t2 == INT2OID) so->k2_eq = (int64) DatumGetInt16(sk->sk_argument);
+                else if (t2 == INT4OID) so->k2_eq = (int64) DatumGetInt32(sk->sk_argument);
+                else so->k2_eq = DatumGetInt64(sk->sk_argument);
             }
         }
     }
@@ -930,77 +965,191 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         {
             if (!so->two_col)
             {
-                lb = so->have_bound ? so->bound : PG_INT64_MIN;
-                so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
-                so->cur_off = FirstOffsetNumber;
-                so->initialized = true;
-                SMOL_LOGF("gettuple init cur_blk=%u bound=%ld", so->cur_blk, (long) lb);
-
-                /* seek within leaf to >= bound */
-                if (so->have_bound)
+                if (scan->parallel_scan)
                 {
-                    /* Pin leaf and binary-search to first >= bound */
-                    uint16 n2, lo = FirstOffsetNumber, hi, ans = InvalidOffsetNumber;
-                    buf = ReadBuffer(idx, so->cur_blk);
-                    page = BufferGetPage(buf);
-                    n2 = smol_leaf_nitems(page);
-                    hi = n2;
-                    while (lo <= hi)
+                    SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+                    /* claim first leaf from shared state */
+                    for (;;)
                     {
-                        uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                        char *keyp = smol_leaf_keyptr(page, mid, so->key_len);
-                        int c = smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, so->bound);
-                        if (so->prof_enabled) so->prof_bsteps++;
-                        if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
-                        else lo = (uint16) (mid + 1);
+                        uint32 curv = pg_atomic_read_u32(&ps->curr);
+                        if (curv == 0u)
+                        {
+                            int64 lb = so->have_bound ? so->bound : PG_INT64_MIN;
+                            BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                            /* publish rightlink(left) so others don't also take left */
+                            Buffer lbuf = ReadBuffer(idx, left);
+                            Page lpg = BufferGetPage(lbuf);
+                            BlockNumber rl = smol_page_opaque(lpg)->rightlink;
+                            ReleaseBuffer(lbuf);
+                            uint32 expect = 0u;
+                            uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                            if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
+                            { so->cur_blk = left; break; }
+                            continue;
+                        }
+                        if (curv == (uint32) InvalidBlockNumber)
+                        { so->cur_blk = InvalidBlockNumber; break; }
+                        /* claim current */
+                        Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
+                        Page tpg = BufferGetPage(tbuf);
+                        BlockNumber rl = smol_page_opaque(tpg)->rightlink;
+                        ReleaseBuffer(tbuf);
+                        uint32 expected = curv;
+                        uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                        if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
+                        { so->cur_blk = (BlockNumber) curv; break; }
                     }
-                    so->cur_off = (ans != InvalidOffsetNumber) ? ans : (uint16) (n2 + 1);
-                    so->cur_buf = buf; so->have_pin = true;
-                    SMOL_LOGF("seeked (binsearch) within leaf off=%u", so->cur_off);
+                    so->cur_off = FirstOffsetNumber;
+                    so->initialized = true;
+                    if (BlockNumberIsValid(so->cur_blk))
+                    {
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        so->cur_buf = buf; so->have_pin = true;
+                    }
                 }
                 else
                 {
-                    /* No bound: just pin the first leaf */
-                    buf = ReadBuffer(idx, so->cur_blk);
-                    page = BufferGetPage(buf);
-                    so->cur_buf = buf; so->have_pin = true;
+                    lb = so->have_bound ? so->bound : PG_INT64_MIN;
+                    so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                    so->cur_off = FirstOffsetNumber;
+                    so->initialized = true;
+                    SMOL_LOGF("gettuple init cur_blk=%u bound=%ld", so->cur_blk, (long) lb);
+
+                    /* seek within leaf to >= bound */
+                    if (so->have_bound)
+                    {
+                        /* Pin leaf and binary-search to first >= or > bound */
+                        uint16 n2, lo = FirstOffsetNumber, hi, ans = InvalidOffsetNumber;
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        n2 = smol_leaf_nitems(page);
+                        hi = n2;
+                        while (lo <= hi)
+                        {
+                            uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+                            char *keyp = smol_leaf_keyptr(page, mid, so->key_len);
+                            int c = smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, so->bound);
+                            if (so->prof_enabled) so->prof_bsteps++;
+                            if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
+                            else lo = (uint16) (mid + 1);
+                        }
+                        so->cur_off = (ans != InvalidOffsetNumber) ? ans : (uint16) (n2 + 1);
+                        so->cur_buf = buf; so->have_pin = true;
+                        SMOL_LOGF("seeked (binsearch) within leaf off=%u", so->cur_off);
+                    }
+                    else
+                    {
+                        /* No bound: just pin the first leaf */
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        so->cur_buf = buf; so->have_pin = true;
+                    }
                 }
             }
             else
             {
-                lb = so->have_bound ? so->bound : PG_INT64_MIN;
-                so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
-                so->cur_group = 0;
-                so->pos_in_group = 0;
-                so->initialized = true;
-                if (so->have_bound)
+                if (scan->parallel_scan)
                 {
-                    /* Pin leaf and binary-search group directory on k1 */
-                    uint16 ng, lo = 0, hi, ans = 0;
-                    buf = ReadBuffer(idx, so->cur_blk);
-                    page = BufferGetPage(buf);
-                    ng = smol2_leaf_ngroups(page);
-                    if (ng > 0)
+                    SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+                    for (;;)
                     {
-                        hi = (uint16) (ng - 1);
-                        ans = ng;
-                        while (lo <= hi)
+                        uint32 curv = pg_atomic_read_u32(&ps->curr);
+                        if (curv == 0u)
                         {
-                            uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            int c = smol_cmp_k1_group(page, mid, so->key_len, so->atttypid, so->bound);
-                            if (so->prof_enabled) so->prof_bsteps++;
-                            if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
-                            else lo = (uint16) (mid + 1);
+                            int64 lb = so->have_bound ? so->bound : PG_INT64_MIN;
+                            BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                            Buffer lbuf = ReadBuffer(idx, left);
+                            Page lpg = BufferGetPage(lbuf);
+                            BlockNumber rl = smol_page_opaque(lpg)->rightlink;
+                            ReleaseBuffer(lbuf);
+                            uint32 expect = 0u;
+                            uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                            if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
+                            { so->cur_blk = left; break; }
+                            continue;
                         }
-                        so->cur_group = ans;
+                        if (curv == (uint32) InvalidBlockNumber)
+                        { so->cur_blk = InvalidBlockNumber; break; }
+                        Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
+                        Page tpg = BufferGetPage(tbuf);
+                        BlockNumber rl = smol_page_opaque(tpg)->rightlink;
+                        ReleaseBuffer(tbuf);
+                        uint32 expected = curv;
+                        uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                        if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
+                        { so->cur_blk = (BlockNumber) curv; break; }
                     }
-                    so->cur_buf = buf; so->have_pin = true;
+                    so->cur_group = 0;
+                    so->pos_in_group = 0;
+                    so->initialized = true;
+                    if (BlockNumberIsValid(so->cur_blk))
+                    {
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        so->cur_buf = buf; so->have_pin = true;
+                        so->leaf_n = 0; so->leaf_i = 0;
+                        if (so->have_bound)
+                        {
+                            uint16 ng = smol2_leaf_ngroups(page);
+                            uint16 lo = 0, hi = (ng > 0) ? (uint16) (ng - 1) : 0, ans = ng;
+                            while (lo <= hi)
+                            {
+                                uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+                                int c = smol_cmp_k1_group(page, mid, so->key_len, so->atttypid, so->bound);
+                                if (so->prof_enabled) so->prof_bsteps++;
+                                if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
+                                else lo = (uint16) (mid + 1);
+                            }
+                            so->cur_group = ans;
+                        }
+                        else
+                        {
+                            so->cur_group = 0;
+                        }
+                        smol2_build_leaf_cache(so, page);
+                    }
                 }
                 else
                 {
-                    buf = ReadBuffer(idx, so->cur_blk);
-                    page = BufferGetPage(buf);
-                    so->cur_buf = buf; so->have_pin = true;
+                    lb = so->have_bound ? so->bound : PG_INT64_MIN;
+                    so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                    so->cur_group = 0;
+                    so->pos_in_group = 0;
+                    so->initialized = true;
+                    if (so->have_bound)
+                    {
+                        /* Pin leaf and binary-search group directory on k1 (>= or > bound) */
+                        uint16 ng, lo = 0, hi, ans = 0;
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        ng = smol2_leaf_ngroups(page);
+                        if (ng > 0)
+                        {
+                            hi = (uint16) (ng - 1);
+                            ans = ng;
+                            while (lo <= hi)
+                            {
+                                uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+                                int c = smol_cmp_k1_group(page, mid, so->key_len, so->atttypid, so->bound);
+                                if (so->prof_enabled) so->prof_bsteps++;
+                                if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
+                                else lo = (uint16) (mid + 1);
+                            }
+                            so->cur_group = ans;
+                        }
+                        so->cur_buf = buf; so->have_pin = true;
+                        so->leaf_n = 0; so->leaf_i = 0;
+                        smol2_build_leaf_cache(so, page);
+                    }
+                    else
+                    {
+                        buf = ReadBuffer(idx, so->cur_blk);
+                        page = BufferGetPage(buf);
+                        so->cur_buf = buf; so->have_pin = true;
+                        so->leaf_n = 0; so->leaf_i = 0;
+                        smol2_build_leaf_cache(so, page);
+                    }
                 }
             }
         }
@@ -1020,65 +1169,19 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         page = BufferGetPage(buf);
         if (so->two_col)
         {
-            uint16 ng = smol2_leaf_ngroups(page);
-            if (dir == BackwardScanDirection)
+            if (so->leaf_i < so->leaf_n)
             {
-                while (so->cur_group < ng)
-                {
-                    uint32 off; uint16 cnt; smol2_group_offcnt(page, so->cur_group, so->key_len, &off, &cnt);
-                    char *k2b = smol2_k2_base(page, so->key_len, ng);
-                    /* Pre-copy k1 once per group */
-                    char *gk1 = smol2_group_k1_ptr(page, so->cur_group, so->key_len);
-                    if (so->key_len == 2) memcpy(so->itup_data, gk1, 2);
-                    else if (so->key_len == 4) memcpy(so->itup_data, gk1, 4);
-                    else memcpy(so->itup_data, gk1, 8);
-                    if (so->prof_enabled) so->prof_bytes += (uint64) so->key_len;
-                    while (so->pos_in_group < (uint32) cnt)
-                    {
-                        /* Copy only k2 per row */
-                        char *k2p = k2b + ((size_t)(off + so->pos_in_group) * so->key_len2);
-                        if (so->key_len2 == 2) memcpy(so->itup_data + so->itup_off2, k2p, 2);
-                        else if (so->key_len2 == 4) memcpy(so->itup_data + so->itup_off2, k2p, 4);
-                        else memcpy(so->itup_data + so->itup_off2, k2p, 8);
-                        if (so->prof_enabled) so->prof_bytes += (uint64) so->key_len2;
-                        scan->xs_itup = so->itup;
-                        ItemPointerSet(&(scan->xs_heaptid), 0, 1);
-                        so->pos_in_group++;
-                        if (so->prof_enabled) so->prof_rows++;
-                        return true;
-                    }
-                    so->cur_group++;
-                    so->pos_in_group = 0;
-                }
-            }
-            else
-            {
-                while (so->cur_group < ng)
-                {
-                    uint32 off; uint16 cnt; smol2_group_offcnt(page, so->cur_group, so->key_len, &off, &cnt);
-                    char *k2b = smol2_k2_base(page, so->key_len, ng);
-                    /* Pre-copy k1 once per group */
-                    char *gk1 = smol2_group_k1_ptr(page, so->cur_group, so->key_len);
-                    if (so->key_len == 2) memcpy(so->itup_data, gk1, 2);
-                    else if (so->key_len == 4) memcpy(so->itup_data, gk1, 4);
-                    else memcpy(so->itup_data, gk1, 8);
-                    if (so->prof_enabled) so->prof_bytes += (uint64) so->key_len;
-                    while (so->pos_in_group < (uint32) cnt)
-                    {
-                        char *k2p = k2b + ((size_t)(off + so->pos_in_group) * so->key_len2);
-                        if (so->key_len2 == 2) memcpy(so->itup_data + so->itup_off2, k2p, 2);
-                        else if (so->key_len2 == 4) memcpy(so->itup_data + so->itup_off2, k2p, 4);
-                        else memcpy(so->itup_data + so->itup_off2, k2p, 8);
-                        if (so->prof_enabled) so->prof_bytes += (uint64) so->key_len2;
-                        scan->xs_itup = so->itup;
-                        ItemPointerSet(&(scan->xs_heaptid), 0, 1);
-                        so->pos_in_group++;
-                        if (so->prof_enabled) so->prof_rows++;
-                        return true;
-                    }
-                    so->cur_group++;
-                    so->pos_in_group = 0;
-                }
+                int64 v1 = so->leaf_k1[so->leaf_i];
+                int64 v2 = so->leaf_k2[so->leaf_i];
+                if (so->have_k2_eq && v2 != so->k2_eq)
+                { so->leaf_i++; continue; }
+                if (so->key_len == 2) { int16 t=(int16)v1; memcpy(so->itup_data,&t,2);} else if (so->key_len==4){int32 t=(int32)v1; memcpy(so->itup_data,&t,4);} else { memcpy(so->itup_data,&v1,8);} 
+                if (so->key_len2 == 2) { int16 t=(int16)v2; memcpy(so->itup_data+so->itup_off2,&t,2);} else if (so->key_len2==4){int32 t=(int32)v2; memcpy(so->itup_data+so->itup_off2,&t,4);} else { memcpy(so->itup_data+so->itup_off2,&v2,8);} 
+                scan->xs_itup = so->itup;
+                ItemPointerSet(&(scan->xs_heaptid), 0, 1);
+                so->leaf_i++;
+                if (so->prof_enabled) { so->prof_rows++; so->prof_bytes += (uint64)(so->key_len + so->key_len2); }
+                return true;
             }
         }
         else
@@ -1121,9 +1224,48 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             }
         }
 
-        /* advance to right sibling leaf */
-        op = smol_page_opaque(page);
-        next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
+        /* advance to next leaf */
+        if (scan->parallel_scan && dir != BackwardScanDirection)
+            {
+            SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+            for (;;)
+            {
+                uint32 curv = pg_atomic_read_u32(&ps->curr);
+                if (curv == 0u)
+                {
+                    int64 lb = so->have_bound ? so->bound : PG_INT64_MIN;
+                    BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                    Buffer lbuf = ReadBuffer(idx, left);
+                    Page lpg = BufferGetPage(lbuf);
+                    BlockNumber rl = smol_page_opaque(lpg)->rightlink;
+                    ReleaseBuffer(lbuf);
+                    uint32 expect = 0u;
+                    uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                    if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
+                    {
+                        next = left;
+                        break;
+                    }
+                    continue;
+                }
+                if (curv == (uint32) InvalidBlockNumber)
+                { next = InvalidBlockNumber; break; }
+                /* Read rightlink to publish next */
+                Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
+                Page tpg = BufferGetPage(tbuf);
+                BlockNumber rl = smol_page_opaque(tpg)->rightlink;
+                ReleaseBuffer(tbuf);
+                uint32 expected = curv;
+                uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
+                { next = (BlockNumber) curv; break; }
+            }
+        }
+        else
+        {
+            op = smol_page_opaque(page);
+            next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
+        }
         if (so->have_pin && BufferIsValid(buf))
         {
             ReleaseBuffer(buf);
@@ -1136,6 +1278,40 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         so->cur_off = (dir == BackwardScanDirection) ? InvalidOffsetNumber : FirstOffsetNumber;
         so->cur_group = 0;
         so->pos_in_group = 0;
+        so->leaf_n = 0; so->leaf_i = 0;
+        if (BlockNumberIsValid(so->cur_blk))
+        {
+            if (scan->parallel_scan && dir != BackwardScanDirection)
+                so->cur_blk = next;
+            /* Pre-pin next leaf and rebuild cache for two-col */
+            Buffer nbuf = ReadBuffer(idx, so->cur_blk);
+            Page np = BufferGetPage(nbuf);
+            if (so->two_col)
+            {
+                if (so->have_bound)
+                {
+                    uint16 ng = smol2_leaf_ngroups(np);
+                    uint16 lo = 0, hi = (ng > 0) ? (uint16) (ng - 1) : 0, ans = ng;
+                    while (lo <= hi)
+                    {
+                        uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+                        int c = smol_cmp_k1_group(np, mid, so->key_len, so->atttypid, so->bound);
+                        if (so->prof_enabled) so->prof_bsteps++;
+                        if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
+                        else lo = (uint16) (mid + 1);
+                    }
+                    so->cur_group = ans;
+                }
+                else
+                {
+                    so->cur_group = 0;
+                }
+                smol2_build_leaf_cache(so, np);
+            }
+            so->cur_buf = nbuf; so->have_pin = true;
+            page = np;
+            continue;
+        }
         SMOL_LOGF("advance to %s leaf blk=%u", (dir == BackwardScanDirection ? "left" : "right"), next);
     }
 
@@ -1151,6 +1327,8 @@ smol_endscan(IndexScanDesc scan)
         SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
         if (so->have_pin && BufferIsValid(so->cur_buf))
             ReleaseBuffer(so->cur_buf);
+        if (so->leaf_k1) pfree(so->leaf_k1);
+        if (so->leaf_k2) pfree(so->leaf_k2);
         if (so->itup)
             pfree(so->itup);
         if (so->prof_enabled)
@@ -1174,17 +1352,24 @@ smol_canreturn(Relation index, int attno)
 static Size
 smol_estimateparallelscan(Relation index, int nkeys, int norderbys)
 {
-    return 0; /* no shared state yet */
+    return (Size) sizeof(SmolParallelScan);
 }
 
 static void
 smol_initparallelscan(void *target)
 {
+    SmolParallelScan *ps = (SmolParallelScan *) target;
+    pg_atomic_init_u32(&ps->curr, 0u);
 }
 
 static void
 smol_parallelrescan(IndexScanDesc scan)
 {
+    if (scan->parallel_scan)
+    {
+        SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+        pg_atomic_write_u32(&ps->curr, 0u);
+    }
 }
 
 /* Options and validation stubs */
@@ -1221,6 +1406,34 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     /* Default selectivity: half the table */
     *indexSelectivity = 0.5;
     *indexCorrelation = 0.0;
+
+    /* Heuristics: if there is no clause on leading key (indexcol 0), discourage SMOL */
+    {
+        bool have_leading = false;
+        ListCell *lc;
+        foreach(lc, path->indexclauses)
+        {
+            IndexClause *ic = (IndexClause *) lfirst(lc);
+            if (ic && ic->indexcol == 0)
+            {
+                have_leading = true;
+                break;
+            }
+        }
+        if (!have_leading)
+        {
+            *indexTotalCost += 1e6; /* steer planner away when scanning without leading-key quals */
+        }
+    }
+}
+
+/* VACUUM/cleanup stub: SMOL is read-only; nothing to reclaim. */
+static IndexBulkDeleteResult *
+smol_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+    (void) info;
+    (void) stats;
+    return NULL;
 }
 
 static void
@@ -1782,44 +1995,36 @@ static BlockNumber
 smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len)
 {
     SmolMeta meta;
-    Buffer rbuf;
-    Page rpage;
-    OffsetNumber maxoff;
-    BlockNumber child;
-    /*
-     * Height is at most 2 in this prototype. If height<=1, the metapage
-     * root points at a leaf and we return it. Otherwise scan the simple root
-     * to choose the first child whose highkey >= lower_bound (or rightmost).
-     */
     smol_meta_read(idx, &meta);
-    if (meta.height <= 1)
+    BlockNumber cur = meta.root_blkno;
+    uint16 levels = meta.height;
+    while (levels > 1)
     {
-        SMOL_LOGF("find_first_leaf: height=%u root=%u (leaf)", meta.height, meta.root_blkno);
-        return meta.root_blkno;
+        Buffer buf = ReadBuffer(idx, cur);
+        Page page = BufferGetPage(buf);
+        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        BlockNumber child = InvalidBlockNumber;
+        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+        {
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+            BlockNumber c;
+            memcpy(&c, itp, sizeof(BlockNumber));
+            char *keyp = itp + sizeof(BlockNumber);
+            if (smol_cmp_keyptr_bound(keyp, key_len, atttypid, lower_bound) >= 0)
+            { child = c; break; }
+        }
+        if (!BlockNumberIsValid(child))
+        {
+            /* choose rightmost child */
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, maxoff));
+            memcpy(&child, itp, sizeof(BlockNumber));
+        }
+        ReleaseBuffer(buf);
+        cur = child;
+        levels--;
     }
-    /* scan simple root */
-    rbuf = ReadBuffer(idx, meta.root_blkno);
-    rpage = BufferGetPage(rbuf);
-    maxoff = PageGetMaxOffsetNumber(rpage);
-    child = InvalidBlockNumber;
-    for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-    {
-        char *itp = (char *) PageGetItem(rpage, PageGetItemId(rpage, off));
-        BlockNumber c;
-        memcpy(&c, itp, sizeof(BlockNumber));
-        char *keyp = itp + sizeof(BlockNumber);
-        if (smol_cmp_keyptr_bound(keyp, key_len, atttypid, lower_bound) >= 0)
-        { child = c; break; }
-    }
-    if (!BlockNumberIsValid(child))
-    {
-        /* larger than any highkey: go to rightmost leaf */
-        char *itp = (char *) PageGetItem(rpage, PageGetItemId(rpage, maxoff));
-        memcpy(&child, itp, sizeof(BlockNumber));
-    }
-    ReleaseBuffer(rbuf);
-    SMOL_LOGF("find_first_leaf: chose child=%u for bound=%ld", child, (long) lower_bound);
-    return child;
+    SMOL_LOGF("find_first_leaf: leaf=%u for bound=%ld height=%u", cur, (long) lower_bound, meta.height);
+    return cur;
 }
 
 static Datum
@@ -1936,6 +2141,53 @@ smol_cmp_k1_group(Page page, uint16 g, uint16 key_len1, Oid atttypid, int64 boun
     return smol_cmp_keyptr_bound(p, key_len1, atttypid, bound);
 }
 
+static void
+smol2_build_leaf_cache(SmolScanOpaque so, Page page)
+{
+    uint16 ng = smol2_leaf_ngroups(page);
+    uint16 start_g = 0;
+    /* Honor leading-key lower bound by starting from cur_group when set */
+    if (so->have_bound && so->cur_group < ng)
+        start_g = so->cur_group;
+    size_t hdrsz = (size_t) so->key_len + sizeof(uint32) + sizeof(uint16);
+    uint32 total = 0;
+    /* First pass: compute total rows */
+    for (uint16 gi = start_g; gi < ng; gi++)
+    {
+        uint32 off; uint16 cnt;
+        smol2_group_offcnt(page, gi, so->key_len, &off, &cnt);
+        total += cnt;
+    }
+    if (so->leaf_k1) pfree(so->leaf_k1);
+    if (so->leaf_k2) pfree(so->leaf_k2);
+    so->leaf_k1 = (int64 *) palloc(total * sizeof(int64));
+    so->leaf_k2 = (int64 *) palloc(total * sizeof(int64));
+    so->leaf_n = total;
+    so->leaf_i = 0;
+    char *k2b = smol2_k2_base(page, so->key_len, ng);
+    uint32 idx = 0;
+    for (uint16 gi = start_g; gi < ng; gi++)
+    {
+        char *gk1 = smol2_group_k1_ptr(page, gi, so->key_len);
+        int64 v1;
+        if (so->key_len == 2) { int16 t; memcpy(&t, gk1, 2); v1 = (int64) t; }
+        else if (so->key_len == 4) { int32 t; memcpy(&t, gk1, 4); v1 = (int64) t; }
+        else { int64 t; memcpy(&t, gk1, 8); v1 = t; }
+        uint32 off; uint16 cnt; smol2_group_offcnt(page, gi, so->key_len, &off, &cnt);
+        for (uint32 j = 0; j < cnt; j++)
+        {
+            char *k2p = k2b + ((size_t)(off + j) * so->key_len2);
+            int64 v2;
+            if (so->key_len2 == 2) { int16 t; memcpy(&t, k2p, 2); v2 = (int64) t; }
+            else if (so->key_len2 == 4) { int32 t; memcpy(&t, k2p, 4); v2 = (int64) t; }
+            else { int64 t; memcpy(&t, k2p, 8); v2 = t; }
+            so->leaf_k1[idx] = v1;
+            so->leaf_k2[idx] = v2;
+            idx++;
+        }
+    }
+}
+
 /* Build internal levels from a linear list of children (blk, highkey) until a single root remains. */
 static void
 smol_build_internal_levels(Relation idx,
@@ -2050,23 +2302,22 @@ static BlockNumber
 smol_rightmost_leaf(Relation idx)
 {
     SmolMeta meta;
-    Buffer rbuf;
-    Page rpage;
-    OffsetNumber maxoff;
-    BlockNumber child;
     smol_meta_read(idx, &meta);
-    if (meta.height <= 1)
-        return meta.root_blkno;
-    rbuf = ReadBuffer(idx, meta.root_blkno);
-    rpage = BufferGetPage(rbuf);
-    maxoff = PageGetMaxOffsetNumber(rpage);
-    child = InvalidBlockNumber;
+    BlockNumber cur = meta.root_blkno;
+    uint16 levels = meta.height;
+    while (levels > 1)
     {
-        char *itp = (char *) PageGetItem(rpage, PageGetItemId(rpage, maxoff));
+        Buffer buf = ReadBuffer(idx, cur);
+        Page page = BufferGetPage(buf);
+        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        BlockNumber child;
+        char *itp = (char *) PageGetItem(page, PageGetItemId(page, maxoff));
         memcpy(&child, itp, sizeof(BlockNumber));
+        ReleaseBuffer(buf);
+        cur = child;
+        levels--;
     }
-    ReleaseBuffer(rbuf);
-    return child;
+    return cur;
 }
 
 /* Return previous leaf sibling by scanning root (height<=2 prototype) */

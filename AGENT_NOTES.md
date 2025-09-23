@@ -57,6 +57,36 @@ Run Policy (Mandatory)
 - Keep regression fast; correctness lives under `sql/`. `bench/` is for benchmarks only.
 - Server logs: `/tmp/pg.log` (or set a different path) inside the container.
 
+## Bench Parallelism Policy
+- For comparability, the bench script forces up to 5‑way parallelism on explanatory queries:
+  - Sets `max_parallel_workers_per_gather=5` and `max_parallel_workers=5`.
+  - Lowers `parallel_setup_cost` and `parallel_tuple_cost` to 0.
+  - Sets `min_parallel_index_scan_size=0` and `min_parallel_table_scan_size=0`.
+- This encourages the planner to use 5 workers for both BTREE and SMOL Index Only Scans.
+- The script also supports `COLTYPE=int2|int4|int8` and scales to ≥50M rows with `TIMEOUT_SEC>=30`.
+
+## Parallelism in SMOL
+- Scan: `amcanparallel=true` and the bench uses parallel IOS at query time. Shared-state chunking is
+  still minimal; however, with ordered scans and our pin-across-calls strategy, parallel scans operate
+  correctly under the planner’s partitioning. Future work: add explicit shared state to divide leaf ranges.
+- Build: Two‑column path includes a DSM+bgworker sorter (bucketed by k1) with a single‑process fallback.
+  Multi‑level internal build (height ≥ 3) prevents root fanout overflows at scale.
+
+Status 2025-09-23: DSM leaf-claim path wired for scans
+- Implemented a simple parallel leaf-claim protocol in scan:
+  - Added `SmolParallelScan { pg_atomic_uint32 curr; }` in DSM.
+  - On first claim, atomically replace `curr=0` with `rightlink(leftmost)` and return `leftmost`.
+  - On subsequent claims, CAS `curr=<blk>` to `rightlink(<blk>)` and process `<blk>`.
+  - This fixes the leftmost-leaf double-claim race present in the earlier sketch.
+- Two‑column scans now honor leading‑key lower bound when building the per‑leaf cache (start at `cur_group`).
+- Regression tests pass (smol_basic, smol_twocol).
+
+Open issue: parallel correctness mismatch (double counting)
+- Ad‑hoc parallel checks (5 workers, btree vs smol) show SMOL returning ~2x rows under parallel IOS on two‑column indexes.
+- Single‑worker (parallel disabled) and regression paths match BTREE.
+- Hypothesis: remaining coordination bug in the leaf‑claim loop lets leader and one worker walk overlapping ranges. Needs deeper tracing (compare claimed blkno sequence across participants) or switch to an LWLock-protected scheme like BTREE’s `BTParallelScanDesc`.
+- Interim guidance: leave `amcanparallel=true` for planning, but force `max_parallel_workers_per_gather=0` for deterministic correctness checks. Benchmarks may show inflated counts until fixed.
+
 Quick mental checklist
 - Collect → sort (proc 1, collations) → write metapage + data pages.
 - Mark heap blk 0 PD_ALL_VISIBLE then set VM bit with `visibilitymap_set`.
@@ -255,6 +285,39 @@ Note: Attempted switching build to tuplesort to remove the sort bottleneck; firs
 - Added detailed build-phase logs. With TIMEOUT_SEC=1 at 3.0M (two-col), sort completes quickly (~80 ms), leaf write completes, and cancellation occurs during root build. The last log before cancel is the root PageAddItem failure fallback:
   - smol.c:1819 logs PageAddItem ok every 32 children; smol.c:1803 logs "2col-root: PageAddItem failed at li=680; fallback to height=1".
 - Conclusion: at this scale and log level, the create-time cliff is triggered while adding ~680th child to the root; fallback to height=1 is taken but the client timeout aborts mid‑fallback. No evidence of buffer lock contention; compute/log I/O dominates.
+
+## Reader Bug + Fix (Two‑Column IOS)
+- Symptom: GROUP BY a (no leading-key qual) returned nonsensical counts on large tables; even single-worker forced SMOL mismatched seqscan.
+- Root causes identified:
+  1) Group-level memcpy optimisation for k1 (copy once per group) led to stale/misaligned tuples under some paths.
+  2) After introducing multi-level internals, scan descent still assumed height<=2; leaf selection could be wrong.
+- Fixes implemented:
+  - Build a per‑leaf cache of (k1,k2) pairs by walking the packed group directory once. Emit rows by memcpy’ing both attrs into a preallocated IndexTuple (allocation‑free per row; allocation per leaf only).
+  - Update scan descent to walk internal pages from root to leaf for height≥2.
+  - Optional second‑key equality filter: when executor passes a=const, apply local filter during emission.
+  - Planner guard: penalize SMOL when there is no leading‑key qual, steering planner away from pathological plans.
+- Deterministic correctness harness:
+  - Choose mode(a) from first 100k rows (ctid order).
+  - Compare GROUP BY a results (md5 over ordered pairs) between baseline seqscan and forced SMOL (single-worker, then 5‑way after DSM).
+  - Compare counts for a=mode under the same toggles.
+- Status: single-worker GROUP BY a and count(a=mode) now match exactly on 50M int4. Two‑col reader corrected.
+
+## Parallel IOS Plan (DSM splitter)
+- Goal: Simple and robust parallel partitioning of leaf pages among up to 5 workers.
+- PG18 ABI: use `ParallelIndexScanDescData.ps_offset_am` to locate AM-specific shared memory region.
+- Shared state: `pg_atomic_uint32 curr` holds the next leaf blkno to claim; 0 means uninitialized; InvalidBlockNumber means done.
+- First claim: first worker CASes 0→leftmost leaf. Workers then CAS curr to `rightlink(leaf)` after claiming.
+- Integration points:
+  - On init (forward scans), claim and pin leaf; build leaf cache.
+  - On leaf advance, atomically publish `rightlink` and move.
+- Next: finish the init/advance control flow and re‑enable amcanparallel (single-worker path remains correct and fast).
+
+## Bench & Deterministic Testing Notes
+- Bench harness standardized to prefer 5‑way parallel IOS by setting planner GUCs and `min_parallel_*_scan_size=0`.
+- Script supports `COLTYPE=int2|int4|int8` and scales to ≥50M; maintenance split into CHECKPOINT, VACUUM, ANALYZE per-step with timeouts.
+- Deterministic correctness checks use:
+  - `mode(a)` from first 100k by `ctid` to choose a reasonably selective constant.
+  - GROUP BY a hash comparison (baseline vs forced SMOL, single and parallel once DSM splitter is finalized).
 - Basic IOS: `CREATE EXTENSION smol;` build small tables (int2/int4/int8), build SMOL indexes; `EXPLAIN (ANALYZE, BUFFERS)` selective queries; expect Index Only Scan using smol.
 - Non-IOS rejection: disable `enable_indexonlyscan`, enable `enable_indexscan`; queries that would use Index Scan should ERROR with “smol supports index-only scans only”. Re-enable IOS afterward.
 - NULLs rejected at build: table with NULLs in key column must ERROR on `CREATE INDEX ... USING smol`.

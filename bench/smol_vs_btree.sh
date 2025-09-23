@@ -147,7 +147,10 @@ run_bench_phase() {
   local build_ms=$((t1 - t0))
   local size_mb=$(${PSQL_TMO} -c "SELECT round(pg_relation_size('${idxname}')/1024.0/1024.0,2)")
 
-  ${PSQL_TMO} -c "SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;"
+  ${PSQL_TMO} -c "SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; \
+                    SET max_parallel_workers_per_gather=5; SET max_parallel_workers=5; \
+                    SET parallel_setup_cost=0; SET parallel_tuple_cost=0; \
+                    SET min_parallel_index_scan_size=0; SET min_parallel_table_scan_size=0;"
   local query
   if [ "${SINGLECOL:-0}" -eq 1 ]; then
     query="SELECT sum(b::bigint) FROM ${TBL} WHERE b > ${THRESH};"
@@ -180,6 +183,8 @@ else
   ${PSQL_TMO} -c "DROP INDEX IF EXISTS ${TBL}_ba_btree;"
   echo "# Phase 2: SMOL (${TBL}_ba_smol on (b,a))" >&2
   sm_row=$(run_bench_phase ${TBL}_ba_smol "CREATE INDEX ${TBL}_ba_smol ON ${TBL} USING smol(b,a);" 1)
+  # Stats for SMOL as well for fair selectivity
+  ${PSQL_TMO} -c "ANALYZE ${TBL};"
 fi
 
 echo
