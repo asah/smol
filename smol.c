@@ -32,6 +32,8 @@
 #include "nodes/pathnodes.h"
 #include "utils/lsyscache.h"
 #include "access/tupmacs.h"
+#include "utils/tuplesort.h"
+#include "utils/typcache.h"
 #include "portability/instr_time.h"
 
 PG_MODULE_MAGIC;
@@ -44,6 +46,7 @@ PG_MODULE_MAGIC;
 static bool smol_debug_log = false; /* toggled by GUC smol.debug_log */
 static bool smol_profile_log = false; /* toggled by GUC smol.profile */
 static int  smol_progress_log_every = 250000; /* GUC: log progress every N tuples */
+extern int maintenance_work_mem;
 
 #if SMOL_TRACE
 #define SMOL_LOG(msg) \
@@ -262,6 +265,13 @@ static void smol_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool
 static int cmp_int16(const void *a, const void *b);
 static int cmp_int32(const void *a, const void *b);
 static int cmp_int64(const void *a, const void *b);
+/* tuplesort-based single-col contexts */
+typedef struct TsBuildCtxI16 { Tuplesortstate *ts; Size *pnkeys; } TsBuildCtxI16;
+typedef struct TsBuildCtxI32 { Tuplesortstate *ts; Size *pnkeys; } TsBuildCtxI32;
+typedef struct TsBuildCtxI64 { Tuplesortstate *ts; Size *pnkeys; } TsBuildCtxI64;
+static void ts_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
+static void ts_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
+static void ts_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 /* 2-col builder */
 typedef struct { int64 **pk1; int64 **pk2; Size *pcap; Size *pcount; Oid t1; Oid t2; } PairArrCtx;
 static void smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
@@ -368,63 +378,71 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
     if (nkeyatts == 1 && atttypid == INT2OID)
     {
-        int16 *keys = NULL;
-        BuildCtxI16 cb = { &keys, &nalloc, &nkeys };
-        SMOL_LOG("collect int2 keys via table_index_build_scan");
-        table_index_build_scan(heap, index, indexInfo,
-                               true /* allow_sync */, true /* progress */,
-                               smol_build_cb_i16, (void *) &cb, NULL);
+        Oid ltOp;
+        Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+        TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
+        Tuplesortstate *ts;
+        TsBuildCtxI16 cb; bool isnull; Datum val; Size i = 0; int16 *out;
+        if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
+        ltOp = tce->lt_opr;
+        ts = tuplesort_begin_datum(atttypid, ltOp, coll, false, maintenance_work_mem, NULL, false);
+        cb.ts = ts; cb.pnkeys = &nkeys;
+        SMOL_LOG("collect int2 -> tuplesort");
+        table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i16, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
-        if (nkeys > 1)
-        {
-            SMOL_LOGF("sort int2 keys n=%zu", nkeys);
-            smol_sort_int16(keys, nkeys);
-        }
+        tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
-        SMOL_LOGF("build collected %zu int2 keys", nkeys);
-        smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        out = (int16 *) palloc(nkeys * sizeof(int16));
+        while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
+            out[i++] = DatumGetInt16(val);
+        smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
-        if (keys) pfree(keys);
+        pfree(out);
+        tuplesort_end(ts);
     }
     else if (nkeyatts == 1 && atttypid == INT4OID)
     {
-        int32 *keys = NULL;
-        BuildCtxI32 cb = { &keys, &nalloc, &nkeys };
-        SMOL_LOG("collect int4 keys via table_index_build_scan");
-        table_index_build_scan(heap, index, indexInfo,
-                               true /* allow_sync */, true /* progress */,
-                               smol_build_cb_i32, (void *) &cb, NULL);
+        Oid ltOp; Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+        TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
+        Tuplesortstate *ts; TsBuildCtxI32 cb; bool isnull; Datum val; Size i = 0; int32 *out;
+        if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
+        ltOp = tce->lt_opr;
+        ts = tuplesort_begin_datum(atttypid, ltOp, coll, false, maintenance_work_mem, NULL, false);
+        cb.ts = ts; cb.pnkeys = &nkeys;
+        SMOL_LOG("collect int4 -> tuplesort");
+        table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i32, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
-        if (nkeys > 1)
-        {
-            SMOL_LOGF("sort int4 keys n=%zu", nkeys);
-            smol_sort_int32(keys, nkeys);
-        }
+        tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
-        SMOL_LOGF("build collected %zu int4 keys", nkeys);
-        smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        out = (int32 *) palloc(nkeys * sizeof(int32));
+        while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
+            out[i++] = DatumGetInt32(val);
+        smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
-        if (keys) pfree(keys);
+        pfree(out);
+        tuplesort_end(ts);
     }
     else if (nkeyatts == 1) /* INT8OID */
     {
-        int64 *keys = NULL;
-        BuildCtxI64 cb = { &keys, &nalloc, &nkeys };
-        SMOL_LOG("collect int8 keys via table_index_build_scan");
-        table_index_build_scan(heap, index, indexInfo,
-                               true /* allow_sync */, true /* progress */,
-                               smol_build_cb_i64, (void *) &cb, NULL);
+        Oid ltOp; Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+        TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
+        Tuplesortstate *ts; TsBuildCtxI64 cb; bool isnull; Datum val; Size i = 0; int64 *out;
+        if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
+        ltOp = tce->lt_opr;
+        ts = tuplesort_begin_datum(atttypid, ltOp, coll, false, maintenance_work_mem, NULL, false);
+        cb.ts = ts; cb.pnkeys = &nkeys;
+        SMOL_LOG("collect int8 -> tuplesort");
+        table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_i64, (void *) &cb, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
-        if (nkeys > 1)
-        {
-            SMOL_LOGF("sort int8 keys n=%zu", nkeys);
-            smol_sort_int64(keys, nkeys);
-        }
+        tuplesort_performsort(ts);
         INSTR_TIME_SET_CURRENT(t_sort_end);
-        SMOL_LOGF("build collected %zu int8 keys", nkeys);
-        smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        out = (int64 *) palloc(nkeys * sizeof(int64));
+        while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
+            out[i++] = DatumGetInt64(val);
+        smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
         INSTR_TIME_SET_CURRENT(t_write_end);
-        if (keys) pfree(keys);
+        pfree(out);
+        tuplesort_end(ts);
     }
     else /* 2-column: collect pairs as int64 */
     {
@@ -1160,11 +1178,6 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
         if (smol_debug_log)
         {
             double pct = (nkeys > 0) ? (100.0 * (double) i / (double) nkeys) : 100.0;
-            SMOL_LOGF("leaf(2col) built blk=%u groups=%u progress=%.1f%%", cur, ng, pct);
-        }
-        if (smol_debug_log)
-        {
-            double pct = (nkeys > 0) ? (100.0 * (double) i / (double) nkeys) : 100.0;
             SMOL_LOGF("leaf built blk=%u items=%zu progress=%.1f%%", cur, added, pct);
         }
     }
@@ -1706,21 +1719,48 @@ smol_prev_leaf(Relation idx, BlockNumber cur)
 
 /* Build callbacks and comparators */
 static void
-smol_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
+ts_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    BuildCtxI16 *ctx = (BuildCtxI16 *) state;
+    TsBuildCtxI16 *ctx = (TsBuildCtxI16 *) state;
     (void) rel; (void) tid; (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
-    if (*ctx->pnkeys == *ctx->pnalloc)
-    {
-        Size newcap = (*ctx->pnalloc == 0 ? 1024 : *ctx->pnalloc * 2);
-        int16 *newptr = (*ctx->pnalloc == 0)
-            ? (int16 *) palloc(newcap * sizeof(int16))
-            : (int16 *) repalloc(*ctx->pkeys, newcap * sizeof(int16));
-        *ctx->pnalloc = newcap;
-        *ctx->pkeys = newptr;
-    }
-    (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt16(values[0]);
+    tuplesort_putdatum(ctx->ts, values[0], false);
+    (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int2: tuples=%zu", *ctx->pnkeys);
+}
+
+static void
+ts_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
+{
+    TsBuildCtxI32 *ctx = (TsBuildCtxI32 *) state;
+    (void) rel; (void) tid; (void) tupleIsAlive;
+    if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
+    tuplesort_putdatum(ctx->ts, values[0], false);
+    (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int4: tuples=%zu", *ctx->pnkeys);
+}
+
+static void
+ts_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
+{
+    TsBuildCtxI64 *ctx = (TsBuildCtxI64 *) state;
+    (void) rel; (void) tid; (void) tupleIsAlive;
+    if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
+    tuplesort_putdatum(ctx->ts, values[0], false);
+    (*ctx->pnkeys)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect int8: tuples=%zu", *ctx->pnkeys);
+}
+
+static void
+smol_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
+{
+    TsBuildCtxI16 *ctx = (TsBuildCtxI16 *) state;
+    (void) rel; (void) tid; (void) tupleIsAlive;
+    if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
+    tuplesort_putdatum(ctx->ts, values[0], false);
     (*ctx->pnkeys)++;
     if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
         SMOL_LOGF("collect int2: tuples=%zu", *ctx->pnkeys);
@@ -1729,19 +1769,10 @@ smol_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
 static void
 smol_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    BuildCtxI32 *ctx = (BuildCtxI32 *) state;
+    TsBuildCtxI32 *ctx = (TsBuildCtxI32 *) state;
     (void) rel; (void) tid; (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
-    if (*ctx->pnkeys == *ctx->pnalloc)
-    {
-        Size newcap = (*ctx->pnalloc == 0 ? 1024 : *ctx->pnalloc * 2);
-        int32 *newptr = (*ctx->pnalloc == 0)
-            ? (int32 *) palloc(newcap * sizeof(int32))
-            : (int32 *) repalloc(*ctx->pkeys, newcap * sizeof(int32));
-        *ctx->pnalloc = newcap;
-        *ctx->pkeys = newptr;
-    }
-    (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt32(values[0]);
+    tuplesort_putdatum(ctx->ts, values[0], false);
     (*ctx->pnkeys)++;
     if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
         SMOL_LOGF("collect int4: tuples=%zu", *ctx->pnkeys);
@@ -1750,19 +1781,10 @@ smol_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
 static void
 smol_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    BuildCtxI64 *ctx = (BuildCtxI64 *) state;
+    TsBuildCtxI64 *ctx = (TsBuildCtxI64 *) state;
     (void) rel; (void) tid; (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
-    if (*ctx->pnkeys == *ctx->pnalloc)
-    {
-        Size newcap = (*ctx->pnalloc == 0 ? 1024 : *ctx->pnalloc * 2);
-        int64 *newptr = (*ctx->pnalloc == 0)
-            ? (int64 *) palloc(newcap * sizeof(int64))
-            : (int64 *) repalloc(*ctx->pkeys, newcap * sizeof(int64));
-        *ctx->pnalloc = newcap;
-        *ctx->pkeys = newptr;
-    }
-    (*ctx->pkeys)[*ctx->pnkeys] = DatumGetInt64(values[0]);
+    tuplesort_putdatum(ctx->ts, values[0], false);
     (*ctx->pnkeys)++;
     if (smol_debug_log && smol_progress_log_every > 0 && (*ctx->pnkeys % (Size) smol_progress_log_every) == 0)
         SMOL_LOGF("collect int8: tuples=%zu", *ctx->pnkeys);

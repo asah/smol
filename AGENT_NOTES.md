@@ -217,6 +217,14 @@ Profiling smol_gettuple
 - When optimizing the scan hot path, specialize per type (int2/int4/int8) to eliminate key_len branches; hoist per-page/group invariants; prefetch next leaf via rightlink near page end.
 - Improve `smol_costestimate` to reflect high tuple density and realistic page counts so the planner chooses SMOL-friendly IOS/parallel plans.
 
+### Build-time diagnostics
+- GUCs:
+  - `smol.debug_log` (bool): enables verbose LOG messages.
+  - `smol.progress_log_every` (int, default 250000): log progress every N tuples during build; used by scan callbacks, radix sort passes, and leaf writes.
+- Sort logs: `radix16/32/64: pass P/N n=...` and `radix64(idx,16bit)` for pair-index secondary sort.
+- Collection logs: `collect int2/int4/int8/pair: tuples=...` emitted every `smol.progress_log_every` tuples during `table_index_build_scan`.
+- Page-build logs: `leaf built ... progress=..%` (1-col) and `leaf(2col) built ... progress=..%`.
+
 ## Benchmark Snapshot (reference)
 - Environment: Docker "smol", PG18, bench/smol_vs_btree.sh with ROWS=1,000,000, TIMEOUT_SEC=30, BATCH=100000, CHUNK_MIN=20000, PGOPTIONS='-c max_parallel_workers_per_gather=0 -c min_parallel_index_scan_size=0'.
 - Multi-col (b,a): BTREE build 228 ms, 21.48 MB, query 36.98 ms (actual ~18.99 ms); SMOL build 92 ms, 2.20 MB, query 28.75 ms (actual ~16.44 ms).
@@ -228,6 +236,8 @@ Profiling smol_gettuple
   - BTREE: Build_ms=1165, Size_MB=107.28, Query_ms=263.68
   - SMOL: Build_ms≈30007 (hit 30s timeout), Size/Query unavailable (canceled)
 - Indicates SMOL build path exceeds 30s at 5M; need profiling to separate collect vs sort vs write phases (enable `smol.debug_log=on`).
+
+Note: Attempted switching build to tuplesort to remove the sort bottleneck; first pass hit PG18 API mismatches and backend crashes — reverted to stable radix path for now.
 
 ## Testing Checklist
 - Basic IOS: `CREATE EXTENSION smol;` build small tables (int2/int4/int8), build SMOL indexes; `EXPLAIN (ANALYZE, BUFFERS)` selective queries; expect Index Only Scan using smol.
