@@ -32,6 +32,7 @@
 #include "nodes/pathnodes.h"
 #include "utils/lsyscache.h"
 #include "access/tupmacs.h"
+#include "portability/instr_time.h"
 
 PG_MODULE_MAGIC;
 
@@ -329,6 +330,12 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     uint16 key_len, key_len2 = 0;
     int nkeyatts = index->rd_index->indnkeyatts;
     SMOL_LOGF("build start rel=%u idx=%u", RelationGetRelid(heap), RelationGetRelid(index));
+    /* Phase timers */
+    instr_time t_start, t_collect_end, t_sort_end, t_write_end;
+    INSTR_TIME_SET_CURRENT(t_start);
+    INSTR_TIME_SET_CURRENT(t_collect_end);
+    INSTR_TIME_SET_CURRENT(t_sort_end);
+    INSTR_TIME_SET_CURRENT(t_write_end);
 
     /* Enforce 1 or 2 fixed-width integer keys for this prototype */
     if (nkeyatts != 1 && nkeyatts != 2)
@@ -354,10 +361,13 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i16, (void *) &cb, NULL);
+        INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
             smol_sort_int16(keys, nkeys);
+        INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int2 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        INSTR_TIME_SET_CURRENT(t_write_end);
         if (keys) pfree(keys);
     }
     else if (nkeyatts == 1 && atttypid == INT4OID)
@@ -367,10 +377,13 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i32, (void *) &cb, NULL);
+        INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
             smol_sort_int32(keys, nkeys);
+        INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int4 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        INSTR_TIME_SET_CURRENT(t_write_end);
         if (keys) pfree(keys);
     }
     else if (nkeyatts == 1) /* INT8OID */
@@ -380,10 +393,13 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_i64, (void *) &cb, NULL);
+        INSTR_TIME_SET_CURRENT(t_collect_end);
         if (nkeys > 1)
             smol_sort_int64(keys, nkeys);
+        INSTR_TIME_SET_CURRENT(t_sort_end);
         SMOL_LOGF("build collected %zu int8 keys", nkeys);
         smol_build_tree_from_sorted(index, (const void *) keys, nkeys, key_len);
+        INSTR_TIME_SET_CURRENT(t_write_end);
         if (keys) pfree(keys);
     }
     else /* 2-column: collect pairs as int64 */
@@ -395,9 +411,12 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         table_index_build_scan(heap, index, indexInfo,
                                true /* allow_sync */, true /* progress */,
                                smol_build_cb_pair, (void *) &ctx, NULL);
+        INSTR_TIME_SET_CURRENT(t_collect_end);
         if (n > 1)
             smol_sort_pairs64(k1norm, k2norm, n);
+        INSTR_TIME_SET_CURRENT(t_sort_end);
         smol_build_tree2_from_sorted(index, k1norm, k2norm, n, key_len, key_len2);
+        INSTR_TIME_SET_CURRENT(t_write_end);
         if (k1norm) pfree(k1norm);
         if (k2norm) pfree(k2norm);
     }
@@ -407,7 +426,25 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
     res->heap_tuples = (double) nkeys;
     res->index_tuples = (double) nkeys;
-    SMOL_LOGF("build finish tuples=%zu", nkeys);
+    /* Log a simple build profile when debug logging is enabled */
+    {
+        instr_time d_collect, d_sort, d_write, d_total;
+        double ms_collect, ms_sort, ms_write, ms_total;
+        INSTR_TIME_SET_ZERO(d_collect);
+        INSTR_TIME_SET_ZERO(d_sort);
+        INSTR_TIME_SET_ZERO(d_write);
+        INSTR_TIME_SET_ZERO(d_total);
+        INSTR_TIME_ACCUM_DIFF(d_collect, t_collect_end, t_start);
+        INSTR_TIME_ACCUM_DIFF(d_sort, t_sort_end, t_collect_end);
+        INSTR_TIME_ACCUM_DIFF(d_write, t_write_end, t_sort_end);
+        INSTR_TIME_ACCUM_DIFF(d_total, t_write_end, t_start);
+        ms_collect = (double) INSTR_TIME_GET_MILLISEC(d_collect);
+        ms_sort = (double) INSTR_TIME_GET_MILLISEC(d_sort);
+        ms_write = (double) INSTR_TIME_GET_MILLISEC(d_write);
+        ms_total = (double) INSTR_TIME_GET_MILLISEC(d_total);
+        SMOL_LOGF("build finish tuples=%zu profile: collect=%.3f ms sort=%.3f ms write=%.3f ms total~%.3f ms",
+                  nkeys, ms_collect, ms_sort, ms_write, ms_total);
+    }
     return res;
 }
 

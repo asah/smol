@@ -7,17 +7,19 @@ Run Policy (Mandatory)
 - One container name only: `smol`. Always build, test, and benchmark using
   a single Docker container named `smol`; reuse it across runs.
 - Always run inside Docker. Build the image with `make dockerbuild`, then
-  invoke inside-container targets via `docker exec -it smol make <target>`.
-  Do not attempt host builds/tests; they are unsupported and prone to
-  SDK/PG mismatches.
+  run inside-container targets directly as `make <target>` (this agent runs
+  inside the `smol` container via `make dockercodex`). Do not attempt host
+  builds/tests; they are unsupported and prone to SDK/PG mismatches.
 
 ## Goals & Constraints
-- Ordered semantics; read‑only index. After CREATE INDEX, table becomes read‑only (enforced via triggers).
+- Ordered semantics; read‑only index. Enforce read-only at the AM level
+  (write entry points ERROR); no triggers involved.
 - Index‑only scans only. Do NOT store TIDs; reject non‑IOS access (`amgettuple` errors if `!xs_want_itup`).
 - No NULL support at all (CREATE INDEX errors on NULLs).
 - Fixed‑width key types only (no varlena such as `text`, `bytea`, `numeric`).
 - Prototype: no WAL/FSM yet; correctness over crash‑safety for now.
-- PostgreSQL 18; no INCLUDE columns; parallel scans supported; no bitmap scan.
+- PostgreSQL 18; no INCLUDE columns; parallel scans stubbed (flag set; no
+  DSM/chunking yet); no bitmap scan.
 - we are restarting this project to provide cleaner code, so these notes may contain info from the previous iteration(s). If you spot inconsistencies please propose cleanup to the user.
 
 
@@ -48,13 +50,10 @@ Run Policy (Mandatory)
 
 ## Docker & Testing
 - Build image: `make dockerbuild` (image tag: `smol`).
-- Start/reuse container: `make dockerstart` (container name: `smol`).
-- One‑shot regression: `make dockercheck` (build+install, initdb if needed, start PG18, run installcheck, stop PG so container is idle).
-- Ad‑hoc: `docker exec smol bash -lc 'make clean && make && make install'`
-- To init/start PG manually (first time only):
-  - `docker exec smol bash -lc 'su - postgres -c "/usr/local/pgsql/bin/initdb -D /var/lib/postgresql/data"'`
-  - `docker exec smol bash -lc 'su - postgres -c "/usr/local/pgsql/bin/pg_ctl -D /var/lib/postgresql/data -l /tmp/pg.log -w start"'`
-- Stop/quiet: `make dockerstop` (stops PG18); remove: `make dockerrm`.
+- Build+install extension: `make insidebuild`.
+- Quick regression (build, start PG, run installcheck, stop PG): `make insidecheck`.
+- Start/stop PostgreSQL in the container: `make insidestart` / `make insidestop`.
+- Run benchmark (leaves PG running): `make insidebench-smol-btree-5m`.
 - Keep regression fast; correctness lives under `sql/`. `bench/` is for benchmarks only.
 - Server logs: `/tmp/pg.log` (or set a different path) inside the container.
 
@@ -188,12 +187,12 @@ Bench and Timeouts
 - Scripts should exit on timeout and print a clear error; default TIMEOUT_SEC is 30 seconds.
 
 Inside-Container Workflow
-- Run inside-* targets from the host via Docker exec, e.g.:
-  - `docker exec -it smol make insidebuild` — clean build and install
-  - `docker exec -it smol make insidestart` — initdb if needed and start PostgreSQL
-  - `docker exec -it smol make insidecheck` — build, run regression (installcheck), then stop PG
-  - `docker exec -it smol make insidebench-smol-btree-5m` — run the fair 5M-row IOS benchmark (leaves PG running)
-- Use `docker exec -it smol make insidestop` to stop PostgreSQL when finished.
+- Run inside-* targets directly (this agent runs inside the `smol` container):
+  - `make insidebuild` — clean build and install
+  - `make insidestart` — initdb if needed and start PostgreSQL
+  - `make insidecheck` — build, run regression (installcheck), then stop PG
+  - `make insidebench-smol-btree-5m` — run the fair 5M-row IOS benchmark (leaves PG running)
+- Use `make insidestop` to stop PostgreSQL when finished.
 - Benchmark scripts honor `TIMEOUT_SEC` and `KILL_AFTER` env vars.
 
 Profiling smol_gettuple
@@ -213,6 +212,21 @@ Profiling smol_gettuple
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.
 - In two-col leaf packing, bulk-memcpy `k2` when key_len2=8; otherwise use tight fixed-width copies (2/4). Reuse a single scratch buffer per page to avoid repeated palloc/free.
 - Link leaf right-siblings by keeping the previous leaf pinned: set its rightlink once the next leaf is allocated, then release; avoid reopen/lock of the previous leaf.
-- To demonstrate multiplicative query speedups, make the workload I/O‑bound or enable parallel IOS: set `min_parallel_index_scan_size=0` and `max_parallel_workers_per_gather` to a modest value (e.g., 4) for both arms.
+- To demonstrate multiplicative query speedups, make the workload I/O‑bound; keep
+  parallel disabled for now (shared-state scan not yet implemented).
 - When optimizing the scan hot path, specialize per type (int2/int4/int8) to eliminate key_len branches; hoist per-page/group invariants; prefetch next leaf via rightlink near page end.
 - Improve `smol_costestimate` to reflect high tuple density and realistic page counts so the planner chooses SMOL-friendly IOS/parallel plans.
+
+## Benchmark Snapshot (reference)
+- Environment: Docker "smol", PG18, bench/smol_vs_btree_5m.sh with ROWS=1,000,000, TIMEOUT_SEC=30, BATCH=100000, CHUNK_MIN=20000, PGOPTIONS='-c max_parallel_workers_per_gather=0 -c min_parallel_index_scan_size=0'.
+- Multi-col (b,a): BTREE build 228 ms, 21.48 MB, query 36.98 ms (actual ~18.99 ms); SMOL build 92 ms, 2.20 MB, query 28.75 ms (actual ~16.44 ms).
+- Single-col (b): BTREE build 205 ms, 7.17 MB, query 27.53 ms (actual ~20.33 ms); SMOL build 40 ms, 1.95 MB, query 27.93 ms (actual ~15.70 ms).
+- Note: For larger ROWS (e.g., 5M), revisit—user observed slower CREATE INDEX for SMOL; 1M snapshot shows SMOL build faster but we need to validate trend at scale.
+
+## Testing Checklist
+- Basic IOS: `CREATE EXTENSION smol;` build small tables (int2/int4/int8), build SMOL indexes; `EXPLAIN (ANALYZE, BUFFERS)` selective queries; expect Index Only Scan using smol.
+- Non-IOS rejection: disable `enable_indexonlyscan`, enable `enable_indexscan`; queries that would use Index Scan should ERROR with “smol supports index-only scans only”. Re-enable IOS afterward.
+- NULLs rejected at build: table with NULLs in key column must ERROR on `CREATE INDEX ... USING smol`.
+- DESC/backward: ensure backward scans produce correct order when requested by executor (dir=BackwardScanDirection).
+- Multi-column ordering: for small datasets, compare ordered results/sums vs btree on equivalent definitions (btree(b) INCLUDE (a) vs smol(b,a)).
+- Parallel scans: not implemented yet; keep `max_parallel_workers_per_gather=0` during correctness runs.

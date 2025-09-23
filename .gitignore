@@ -4,6 +4,9 @@ postgres/
 # temp dirs
 results/
 
+# auth
+.codex/auth.json
+
 # Prerequisites
 *.d
 

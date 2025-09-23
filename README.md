@@ -12,7 +12,8 @@ Overview
 - Read‑only index AM optimized for index‑only scans on append‑only data.
 - Stores only fixed‑width key values (no heap TIDs), improving density and
   cache locality.
-- Supports ordered, backward, and parallel scans; no bitmap scans.
+ - Supports ordered and backward scans; no bitmap scans. Parallel planned
+   (flag exposed; shared-state chunking not implemented yet).
 
 Architecture
 - On‑disk
@@ -27,7 +28,7 @@ Architecture
     the executor on index‑only paths.
 - Scan
   - IOS‑only; requires `xs_want_itup`, else ERROR.
-  - Forward/backward and parallel supported. For each match, materialize an
+  - Forward/backward supported (serial scans). For each match, materialize an
     index tuple (`xs_itup`) and return with a constant TID `(0,1)`.
 
 Flags & Capabilities
@@ -56,13 +57,16 @@ Build & Test (Docker, PostgreSQL 18 from source)
 Usage
 - `CREATE EXTENSION smol;`
 - `CREATE INDEX idx_smol ON some_table USING smol (col1, col2);`
-- Planner: favor IOS as usual; SMOL errors on non‑IOS paths; parallel scans
-  are supported on large relations.
+- Planner: favor IOS as usual; SMOL errors on non‑IOS paths. Parallel scans
+  are not yet implemented; keep `max_parallel_workers_per_gather=0` for now.
 
 Tests & Benchmarks
 - `docker exec -it smol make insidecheck` runs the regression suite and stops PG when done.
 - `sql/` contains correctness/regression tests (kept short).
 - `bench/` contains only benchmarks; stream output live via `docker exec -it smol make insidebench-smol-btree-5m` (use `insidestop` when finished).
+- Bench scripts enforce hard client timeouts (`TIMEOUT_SEC`, `KILL_AFTER`) and
+  set a server-side `statement_timeout` slightly below `TIMEOUT_SEC` to avoid
+  lingering backends when the client is killed by timeout.
 
 Operator Classes
 - int2_ops, int4_ops, int8_ops (fixed‑width only).

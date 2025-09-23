@@ -8,7 +8,7 @@ REGRESS = smol_basic smol_twocol
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
-PGXS := $(shell $(PG_CONFIG) --pgxs)
+PGXS := $(shell if [ -x $(PG_CONFIG) ]; then $(PG_CONFIG) --pgxs; fi)
 include $(PGXS)
 
 # Common Docker utilities for building/testing in a clean PG18 toolchain
@@ -17,22 +17,21 @@ include $(PGXS)
 dockerbuild:
 	docker build -t smol .
 
-dockercreate:
-	@set -euo pipefail; \
-	  if ! docker ps -a --format '{{.Names}}' | grep -qx smol; then \
-	    echo "[docker] Creating container 'smol' from image 'smol'"; \
-	    docker run -d --name smol -v "$$PWD":/workspace -w /workspace smol sleep infinity; \
-	  else \
-	    echo "[docker] Reusing existing container 'smol'"; \
-	    if ! docker ps --format '{{.Names}}' | grep -qx smol; then \
-	      echo "[docker] Starting container 'smol'"; \
-	      docker start smol >/dev/null; \
-	    fi; \
-	  fi; \
-	  echo "[docker] Container 'smol' is ready."
+dockerrestart:
+	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
+	echo "[docker] Creating docker instance 'smol' from image 'smol'"
+	docker run -d --name smol -v "$$PWD":/workspace -w /workspace smol sleep infinity
+	echo "[docker] Container 'smol' is ready."
+
+dockerexec:
+	docker exec -it smol bash
 
 dockercodex:
-	docker exec -it smol codex -a never --sandbox danger-full-access
+	echo "{ \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\" }" > .codex/auth.json
+	docker exec -it smol mkdir -p .codex
+	docker cp .codex/auth.json smol:.codex
+	docker cp .codex/config.toml smol:.codex
+	docker exec -it smol codex -a never --sandbox danger-full-access "read AGENTS.md and do what it says"
 
 # ---------------------------------------------------------------------------
 # Inside-container targets

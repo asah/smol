@@ -323,7 +323,7 @@ Notes
 - For WAL and crash-safety, pair AM sources with their xlog headers (e.g., nbtxlog.h, ginxlog.h) and docs on generic WAL.
 
 SMOL Implementation Notes (LLM‑oriented, dense)
-- AM shape: read‑only, ordered, IOS‑only. No NULLs. Fixed‑width keys only. No TIDs on disk. Parallel scans supported. No bitmap scans. No INCLUDE columns in v1. Planner should still build multi‑col indexes; smol will only ever return key attrs.
+- AM shape: read‑only, ordered, IOS‑only. No NULLs. Fixed‑width keys only. No TIDs on disk. Parallel scans planned (flag set; shared-state/chunking not implemented yet). No bitmap scans. No INCLUDE columns in v1. Planner should still build multi‑col indexes; smol will only ever return key attrs.
 - IndexAmRoutine wiring (required fields):
   - amstrategies=5 (<, <=, =, >=, >); amsupport=1 (comparator proc=1); amoptsprocnum=0.
   - amcanorder=true; amcanorderbyop=false; amcanhash=false; amconsistentequality=true; amconsistentordering=true.
@@ -362,7 +362,7 @@ SMOL Implementation Notes (LLM‑oriented, dense)
   - Initialize metapage only in the init fork for unlogged or empty index creation. Similar to btree’s btbuildempty: allocate metapage, set magic/version/nkeyatts=0, MarkBufferDirty, UnlockRelease.
 
 - Read‑only enforcement:
-  - aminsert returns ereport(ERROR, "smol is read‑only"). Optionally: enforce at SQL level via triggers (extension SQL creates trigger to seal table after CREATE INDEX). Disallow ambulkdelete/amvacuumcleanup effects; return NULL/no‑op.
+  - aminsert returns ereport(ERROR, "smol is read‑only"). No triggers needed; AM-level write entry points ERROR. Disallow ambulkdelete/amvacuumcleanup effects; return NULL/no‑op.
 
 - Scan path (ambeginscan/rescan/amgettuple/amendscan):
   - ambeginscan(rel, nkeys, norderbys): allocate SmolScanOpaque in scan->opaque with:
