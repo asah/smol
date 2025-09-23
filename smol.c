@@ -1292,16 +1292,22 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
             memcpy(ptr + key_len1, &g_off[gi], sizeof(uint32));
             memcpy(ptr + key_len1 + sizeof(uint32), &g_cnt[gi], sizeof(uint16));
         }
-        /* k2 array */
+        /* k2 array: contiguous pack; bulk memcpy when 8-byte */
         char *k2b = gd + (size_t) ng * hdrsz;
-        Size pos = 0;
-        /* Copy k2 in group order from local_start to i */
-        for (Size pidx = local_start; pidx < i; pidx++)
+        if (key_len2 == 8)
         {
-            if (key_len2 == 2) { int16 v = (int16) k2v[pidx]; memcpy(k2b + pos*2, &v, 2); }
-            else if (key_len2 == 4) { int32 v = (int32) k2v[pidx]; memcpy(k2b + pos*4, &v, 4); }
-            else { int64 v = (int64) k2v[pidx]; memcpy(k2b + pos*8, &v, 8); }
-            pos++;
+            Size bytes = (Size) (i - local_start) * 8;
+            memcpy(k2b, (const char *) (k2v + local_start), bytes);
+        }
+        else
+        {
+            Size pos = 0;
+            for (Size pidx = local_start; pidx < i; pidx++)
+            {
+                if (key_len2 == 2) { int16 v = (int16) k2v[pidx]; memcpy(k2b + pos*2, &v, 2); }
+                else /* key_len2 == 4 */ { int32 v = (int32) k2v[pidx]; memcpy(k2b + pos*4, &v, 4); }
+                pos++;
+            }
         }
 
         if (PageAddItem(page, (Item) blob, blob_sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
@@ -1784,15 +1790,25 @@ static void smol_sort_int16(int16 *keys, Size n)
 /* Stable radix sort pairs (k1,k2) by ascending k1 then k2 */
 /* Helper: sort idx by 64-bit unsigned key via 8 byte-wise stable passes */
 static void
-smol_radix_sort_idx_u64(const uint64 *key, uint32 *idx, uint32 *tmp, Size n)
+smol_radix_sort_idx_u64_16(const uint64 *key, uint32 *idx, uint32 *tmp, Size n)
 {
-    uint32 count[256];
-    for (int p = 0; p < 8; p++)
+    /* 16-bit digits: 4 stable passes per 64-bit key */
+    enum { RAD = 65536 };
+    static uint32 *count = NULL;
+    static Size count_sz = 0;
+    if (count_sz < RAD)
     {
-        memset(count, 0, sizeof(count));
-        for (Size i = 0; i < n; i++) { uint64 v = key[idx[i]]; count[(v >> (p * 8)) & 0xFF]++; }
-        uint32 sum = 0; for (int b = 0; b < 256; b++) { uint32 c = count[b]; count[b] = sum; sum += c; }
-        for (Size i = 0; i < n; i++) { uint64 v = key[idx[i]]; tmp[count[(v >> (p * 8)) & 0xFF]++] = idx[i]; }
+        if (count) pfree(count);
+        count = (uint32 *) palloc(RAD * sizeof(uint32));
+        count_sz = RAD;
+    }
+    for (int p = 0; p < 4; p++)
+    {
+        memset(count, 0, RAD * sizeof(uint32));
+        int shift = p * 16;
+        for (Size i = 0; i < n; i++) { uint64 v = key[idx[i]]; count[(v >> shift) & 0xFFFF]++; }
+        uint32 sum = 0; for (int b = 0; b < RAD; b++) { uint32 c = count[b]; count[b] = sum; sum += c; }
+        for (Size i = 0; i < n; i++) { uint64 v = key[idx[i]]; tmp[count[(v >> shift) & 0xFFFF]++] = idx[i]; }
         uint32 *swap = idx; idx = tmp; tmp = swap;
     }
 }
@@ -1807,9 +1823,9 @@ smol_sort_pairs64(int64 *k1, int64 *k2, Size n)
     uint32 *idx = (uint32 *) palloc(n * sizeof(uint32));
     uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
     for (uint32 i = 0; i < (uint32) n; i++) idx[i] = i;
-    /* Sort by k2, then by k1 (stable) */
-    smol_radix_sort_idx_u64(k2u, idx, tmp, n);
-    smol_radix_sort_idx_u64(k1u, idx, tmp, n);
+    /* Sort by k2, then by k1 (stable) using 16-bit digits */
+    smol_radix_sort_idx_u64_16(k2u, idx, tmp, n);
+    smol_radix_sort_idx_u64_16(k1u, idx, tmp, n);
     /* Apply permutation to k1/k2 in place */
     int64 *out1 = (int64 *) palloc(n * sizeof(int64));
     int64 *out2 = (int64 *) palloc(n * sizeof(int64));

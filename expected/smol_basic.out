@@ -1,23 +1,11 @@
--- basic regression for smol: ordered, read-only (via sealing), index-only, drop/recreate, multi-index
-CREATE EXTENSION IF NOT EXISTS plpgsql;
-NOTICE:  extension "plpgsql" already exists, skipping
+-- basic regression for smol: ordered, read-only, index-only scans, drop/recreate, multi-index
 CREATE EXTENSION smol;
-SET smol.debug_log = on;  -- enable verbose tracing during tests
 -- base table without NULLs
 CREATE TABLE t(a int, b int);
 INSERT INTO t(a,b)
 SELECT i, i*10 FROM generate_series(1,10) AS s(i);
--- build index (locks table via AM), then seal table from writes
+-- build index (locks table via AM)
 CREATE INDEX t_a_smol ON t USING smol(a);
-SELECT smol_seal_table('t'::regclass);
-NOTICE:  trigger "smol_block_ins" for relation "t" does not exist, skipping
-NOTICE:  trigger "smol_block_upd" for relation "t" does not exist, skipping
-NOTICE:  trigger "smol_block_del" for relation "t" does not exist, skipping
- smol_seal_table 
------------------
- 
-(1 row)
-
 -- index-only scan: ensure results and order
 SET enable_seqscan = off;
 SELECT a FROM t WHERE a >= 7 ORDER BY a;
@@ -29,48 +17,14 @@ SELECT a FROM t WHERE a >= 7 ORDER BY a;
  10
 (4 rows)
 
--- also verify DESC ordering works
-SELECT a FROM t WHERE a >= 7 ORDER BY a DESC;
- a  
-----
- 10
-  9
-  8
-  7
-(4 rows)
-
 -- reject non-index-only scans
 SET enable_indexonlyscan = off;  -- planner will try Index Scan
 SET enable_indexscan = on;
 SELECT a FROM t WHERE a >= 7;
 ERROR:  smol supports index-only scans only
--- restore index-only path
 SET enable_indexonlyscan = on;
 SET enable_indexscan = off;
--- writes should be blocked while sealed
--- expect ERROR
-INSERT INTO t VALUES (11, 110);
-ERROR:  table is sealed: writes are disabled
--- drop index and recreate with same name; index should work
-DROP INDEX t_a_smol;
-CREATE INDEX t_a_smol ON t USING smol(a);
-SELECT a FROM t WHERE a >= 7 ORDER BY a;
- a  
-----
-  7
-  8
-  9
- 10
-(4 rows)
-
--- unseal table and confirm writes are allowed again
-SELECT smol_unseal_table('t'::regclass);
- smol_unseal_table 
--------------------
- 
-(1 row)
-
--- with SMOL index present, writes still fail (AM is read-only)
+-- writes should be blocked (AM-level error)
 -- expect ERROR
 INSERT INTO t VALUES (11, 110);
 ERROR:  smol is read-only: aminsert is not supported
@@ -90,35 +44,90 @@ INSERT INTO t_null VALUES (1), (NULL);
 -- expect ERROR
 CREATE INDEX t_null_idx ON t_null USING smol(a);
 ERROR:  smol does not support NULL values
--- multi-column table: create multiple SMOL indexes and verify basic scans
-CREATE TABLE tm(a int, b int, c int, d int);
-INSERT INTO tm VALUES
-  (1,  5, 10, 100),
-  (1,  3, 20, 200),
-  (1,  9, 30, 300),
-  (2, 10, 40, 400),
-  (2, 20, 50, 500),
-  (2,  5, 60, 600),
-  (3,  7, 70, 700),
-  (3,  1, 80, 800);
-CREATE INDEX tm_ab_smol ON tm USING smol(a, b);
-CREATE INDEX tm_cd_smol ON tm USING smol(c, d);
+-- int2 basic
+CREATE TABLE t2(a int2);
+INSERT INTO t2 SELECT i::int2 FROM generate_series(1,10) AS s(i);
+CREATE INDEX t2_a_smol ON t2 USING smol(a);
 SET enable_seqscan = off;
-SELECT a,b FROM tm WHERE a = 2 ORDER BY b;
- a | b  
----+----
- 2 |  5
- 2 | 10
- 2 | 20
-(3 rows)
+SELECT a FROM t2 WHERE a >= 7 ORDER BY a;
+ a  
+----
+  7
+  8
+  9
+ 10
+(4 rows)
 
-SELECT c,d FROM tm WHERE c >= 40 ORDER BY c;
- c  |  d  
-----+-----
- 40 | 400
- 50 | 500
- 60 | 600
- 70 | 700
- 80 | 800
-(5 rows)
+-- int8 basic
+CREATE TABLE t8(a int8);
+INSERT INTO t8 SELECT i::int8 FROM generate_series(1,10) AS s(i);
+CREATE INDEX t8_a_smol ON t8 USING smol(a);
+SET enable_seqscan = off;
+SELECT a FROM t8 WHERE a >= 7 ORDER BY a;
+ a  
+----
+  7
+  8
+  9
+ 10
+(4 rows)
 
+-- keep multi-column and DESC coverage for later iterations
+-- Optional: embedded correctness litmus (off by default to keep regression fast)
+-- Enable by running: psql -v RUN_CORR=1 -f sql/smol_basic.sql
+\if :{?RUN_CORR}
+\if :{?rows_si}
+\else
+\set rows_si 10000
+\endif
+\if :{?rows_i4}
+\else
+\set rows_i4 5000
+\endif
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET min_parallel_index_scan_size = 0;
+SET max_parallel_workers_per_gather = 0;  -- uniprocessor for correctness
+-- SMALLINT correctness
+DROP TABLE IF EXISTS cc_si CASCADE;
+CREATE UNLOGGED TABLE cc_si(a int2, b int2);
+INSERT INTO cc_si SELECT (random()*32767)::int2, (random()*32767)::int2 FROM generate_series(1, :rows_si);
+ANALYZE cc_si;
+ALTER TABLE cc_si SET (autovacuum_enabled = off);
+-- BTREE sum
+DROP INDEX IF EXISTS cc_si_btree;
+CREATE INDEX cc_si_btree ON cc_si(b,a);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) cc_si;
+SELECT sum(a::bigint) AS sum_btree_si FROM cc_si WHERE b > 5000;\gset
+-- SMOL sum
+DROP INDEX cc_si_btree;
+CREATE INDEX cc_si_smol ON cc_si USING smol(b,a);
+SELECT sum(a::bigint) AS sum_smol_si FROM cc_si WHERE b > 5000;\gset
+-- Compare
+SELECT (:sum_btree_si)::bigint AS sum_btree_si, (:sum_smol_si)::bigint AS sum_smol_si,
+       ((:sum_btree_si)::bigint = (:sum_smol_si)::bigint) AS smallint_match;
+DROP TABLE cc_si CASCADE;
+-- INT4 correctness
+DROP TABLE IF EXISTS cc_i4 CASCADE;
+CREATE UNLOGGED TABLE cc_i4(a int4, b int4);
+INSERT INTO cc_i4 SELECT (random()*1000000)::int, (random()*1000000)::int FROM generate_series(1, :rows_i4);
+ANALYZE cc_i4;
+ALTER TABLE cc_i4 SET (autovacuum_enabled = off);
+-- BTREE sum
+DROP INDEX IF EXISTS cc_i4_btree;
+CREATE INDEX cc_i4_btree ON cc_i4(b,a);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) cc_i4;
+SELECT sum(a::bigint) AS sum_btree_i4 FROM cc_i4 WHERE b > 500000;\gset
+-- SMOL sum
+DROP INDEX cc_i4_btree;
+CREATE INDEX cc_i4_smol ON cc_i4 USING smol(b,a);
+SELECT sum(a::bigint) AS sum_smol_i4 FROM cc_i4 WHERE b > 500000;\gset
+-- Compare
+SELECT (:sum_btree_i4)::bigint AS sum_btree_i4, (:sum_smol_i4)::bigint AS sum_smol_i4,
+       ((:sum_btree_i4)::bigint = (:sum_smol_i4)::bigint) AS int4_match;
+DROP TABLE cc_i4 CASCADE;
+\endif

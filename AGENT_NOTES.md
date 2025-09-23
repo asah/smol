@@ -202,3 +202,17 @@ Profiling smol_gettuple
 - Use these to identify hotspots in amgettuple; typical wins:
   - Eliminate per-row heap/tuple allocations and lock churn (done via prebuilt tuple + pinned pages).
   - Reduce small memcpy overhead by favoring constant-size copies (2/4/8 bytes).
+
+## Session Playbook (Learn-and-Do)
+- Never run regression and benchmarks at the same time. Before `make insidecheck`, ensure no bench run is active; if uncertain, stop PG (`make insidestop`), then `make insidestart` and rerun.
+- Always set a server-side `statement_timeout` in benches for long statements (CREATE INDEX) to be <= client `TIMEOUT_SEC - 2s`. This prevents orphan backends when the client times out.
+- For fair IOS benchmarking, VACUUM the base table (not the index): `VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) <table>` after index creation (BTREE arm). Keep `enable_seqscan=off`, `enable_bitmapscan=off`, `enable_indexonlyscan=on`.
+- Scale benches under the 30s cap: prefer `ROWS=2e6..3e6` if `TIMEOUT_SEC=30`. If the goal is scaling, raise `TIMEOUT_SEC` only for bench runs; do not change regression timeouts.
+- If `DROP DATABASE` hangs in installcheck: (1) inspect `pg_stat_activity` for lingering `CREATE INDEX` sessions; (2) terminate them; if stuck, (3) `pg_ctl -m immediate stop` then start; (4) rerun installcheck.
+- Build path implementation rules: use radix sort for int2/int4/int8 keys and for (k1,k2) pairs; keep two-col collections in parallel arrays to avoid struct copies.
+- While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.
+- In two-col leaf packing, bulk-memcpy `k2` when key_len2=8; otherwise use tight fixed-width copies (2/4). Reuse a single scratch buffer per page to avoid repeated palloc/free.
+- Link leaf right-siblings by keeping the previous leaf pinned: set its rightlink once the next leaf is allocated, then release; avoid reopen/lock of the previous leaf.
+- To demonstrate multiplicative query speedups, make the workload I/O‑bound or enable parallel IOS: set `min_parallel_index_scan_size=0` and `max_parallel_workers_per_gather` to a modest value (e.g., 4) for both arms.
+- When optimizing the scan hot path, specialize per type (int2/int4/int8) to eliminate key_len branches; hoist per-page/group invariants; prefetch next leaf via rightlink near page end.
+- Improve `smol_costestimate` to reflect high tuple density and realistic page counts so the planner chooses SMOL-friendly IOS/parallel plans.

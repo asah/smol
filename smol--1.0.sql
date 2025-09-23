@@ -8,44 +8,7 @@ LANGUAGE C;
 CREATE ACCESS METHOD smol TYPE INDEX HANDLER smol_handler;
 
 -- Comment on the access method
-COMMENT ON ACCESS METHOD smol IS 'read-only space-efficient index access method optimized for index-only scans';
-
--- Enforce read-only tables via trigger
-CREATE FUNCTION smol_block_writes()
-RETURNS trigger
-AS 'MODULE_PATHNAME'
-LANGUAGE C;
-
--- Helper to seal a table from writes using triggers
--- Note: requires plpgsql to be available (usually preinstalled)
-DO $$ BEGIN PERFORM 1 FROM pg_available_extensions WHERE name='plpgsql' AND installed_version IS NOT NULL; EXCEPTION WHEN others THEN END $$;
-CREATE OR REPLACE FUNCTION smol_seal_table(regclass)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  rel regclass := $1;
-BEGIN
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_ins ON %s', rel);
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_upd ON %s', rel);
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_del ON %s', rel);
-  EXECUTE format('CREATE TRIGGER smol_block_ins BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
-  EXECUTE format('CREATE TRIGGER smol_block_upd BEFORE UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
-  EXECUTE format('CREATE TRIGGER smol_block_del BEFORE DELETE ON %s FOR EACH ROW EXECUTE FUNCTION smol_block_writes()', rel);
-END $$;
-
--- Helper to unseal a table from writes by dropping SMOL triggers
-CREATE OR REPLACE FUNCTION smol_unseal_table(regclass)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  rel regclass := $1;
-BEGIN
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_ins ON %s', rel);
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_upd ON %s', rel);
-  EXECUTE format('DROP TRIGGER IF EXISTS smol_block_del ON %s', rel);
-END $$;
+COMMENT ON ACCESS METHOD smol IS 'space-efficient index access method optimized for index-only scans';
 
 -- Create operator classes for common data types
 CREATE OPERATOR CLASS int4_ops
