@@ -14,18 +14,22 @@ include $(PGXS)
 # Common Docker utilities for building/testing in a clean PG18 toolchain
 .PHONY: dockerbuild dockercreate dockercodex
 
+# compile the extension and create the docker image
 dockerbuild:
 	docker build -t smol .
 
+# start the docker instance, killing any old one
 dockerrestart:
 	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
 	echo "[docker] Creating docker instance 'smol' from image 'smol'"
 	docker run -d --name smol -v "$$PWD":/workspace -w /workspace smol sleep infinity
 	echo "[docker] Container 'smol' is ready."
 
+# jump into the docker instance e.g. to run top
 dockerexec:
 	docker exec -it smol bash
 
+# jump into the docker and run codex - note long startup time while it reads
 dockercodex:
 	echo "{ \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\" }" > .codex/auth.json
 	docker exec -it smol mkdir -p .codex
