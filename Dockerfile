@@ -43,6 +43,8 @@ RUN ./configure \
   && make -j $(nproc) \
   && make install
 
+RUN /usr/local/pgsql/bin/pg_config
+
 # provide codex for inside-docker use
 RUN apt update && apt install nodejs npm -y \
   && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

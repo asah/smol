@@ -35,6 +35,14 @@
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "portability/instr_time.h"
+/* Parallel build support */
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
+#include "storage/ipc.h"
+#include "miscadmin.h"
+#include "tcop/tcopprot.h"
 
 PG_MODULE_MAGIC;
 
@@ -253,6 +261,28 @@ static void smol_sort_int16(int16 *keys, Size n);
 static void smol_sort_int32(int32 *keys, Size n);
 static void smol_sort_int64(int64 *keys, Size n);
 static void smol_sort_pairs64(int64 *k1, int64 *k2, Size n);
+static void smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n);
+static void smol_sort_pairs16_16_packed(int64 *k1v, int64 *k2v, Size n);
+PGDLLEXPORT void smol_parallel_sort_worker(Datum arg);
+
+/* DSM layout for parallel two-column sort */
+typedef struct SmolParallelHdr
+{
+    uint32      magic;
+    uint32      nbuckets;      /* number of k1 high-bit buckets */
+    uint64      total_n;       /* total rows */
+    uint64      off_bucket;    /* byte offset of bucket_offsets (nbuckets+1) */
+    uint64      off_k1;        /* byte offset of k1 array (int64[total_n]) */
+    uint64      off_k2;        /* byte offset of k2 array (int64[total_n]) */
+} SmolParallelHdr;
+
+typedef struct SmolWorkerExtra
+{
+    dsm_handle  handle;
+    uint32      first_bucket;
+    uint32      nbuckets;
+    uint32      total_buckets;
+} SmolWorkerExtra;
 static void smol_radix_sort_idx_u64(const uint64 *key, uint32 *idx, uint32 *tmp, Size n);
 
 /* Build callback context and helpers */
@@ -272,9 +302,11 @@ typedef struct TsBuildCtxI64 { Tuplesortstate *ts; Size *pnkeys; } TsBuildCtxI64
 static void ts_build_cb_i16(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 static void ts_build_cb_i32(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 static void ts_build_cb_i64(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
-/* 2-col builder */
+/* 2-col builders */
 typedef struct { int64 **pk1; int64 **pk2; Size *pcap; Size *pcount; Oid t1; Oid t2; } PairArrCtx;
+typedef struct { Tuplesortstate *ts; TupleDesc tdesc; Size *pcount; Oid t1; Oid t2; } TsPairCtx;
 static void smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
+static void ts_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 
 /* --- Handler: wire a minimal IndexAmRoutine --- */
 Datum
@@ -444,27 +476,133 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         pfree(out);
         tuplesort_end(ts);
     }
-    else /* 2-column: collect pairs as int64 */
+    else /* 2-column: collect pairs as int64 (parallel rows-LSD) */
     {
+        /* 1) Leader collects raw arrays into DSM, partitioned by k1 high bits */
+        const int BITS = 8; /* 256 buckets: reduces per-bucket overhead */
+        const uint32 NB = (1u << BITS);
         Size cap = 0, n = 0;
-        int64 *k1norm = NULL;
-        int64 *k2norm = NULL;
-        PairArrCtx ctx = { &k1norm, &k2norm, &cap, &n, atttypid, atttypid2 };
-        SMOL_LOG("collect pairs via table_index_build_scan");
-        table_index_build_scan(heap, index, indexInfo,
-                               true /* allow_sync */, true /* progress */,
-                               smol_build_cb_pair, (void *) &ctx, NULL);
+        int64 *k1arr = NULL, *k2arr = NULL;
+        PairArrCtx cctx = { &k1arr, &k2arr, &cap, &n, atttypid, atttypid2 };
+        table_index_build_scan(heap, index, indexInfo, true, true, smol_build_cb_pair, (void *) &cctx, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
-        if (n > 1)
+        if (n == 0)
         {
-            SMOL_LOGF("sort pairs (k1,k2) n=%zu", n);
-            smol_sort_pairs64(k1norm, k2norm, n);
+            INSTR_TIME_SET_CURRENT(t_sort_end);
+            smol_build_tree2_from_sorted(index, k1arr, k2arr, n, key_len, key_len2);
+            INSTR_TIME_SET_CURRENT(t_write_end);
+            if (k1arr) pfree(k1arr); if (k2arr) pfree(k2arr);
         }
-        INSTR_TIME_SET_CURRENT(t_sort_end);
-        smol_build_tree2_from_sorted(index, k1norm, k2norm, n, key_len, key_len2);
-        INSTR_TIME_SET_CURRENT(t_write_end);
-        if (k1norm) pfree(k1norm);
-        if (k2norm) pfree(k2norm);
+        else
+        {
+            /* Try DSM + workers; on failure, fall back to single-process sort */
+            bool used_parallel = false;
+            uint64 *count = (uint64 *) palloc0(NB * sizeof(uint64));
+            uint64 *off = (uint64 *) palloc0((NB + 1) * sizeof(uint64));
+            for (Size i = 0; i < n; i++)
+            {
+                uint64 u = (uint64) k1arr[i] ^ UINT64_C(0x8000000000000000);
+                uint32 b = (uint32) (u >> (64 - BITS));
+                count[b]++;
+            }
+            for (uint32 b = 0; b < NB; b++) off[b + 1] = off[b] + count[b];
+            PG_TRY();
+            {
+                Size hdr_bytes = sizeof(SmolParallelHdr) + (NB + 1) * sizeof(uint64);
+                Size bytes_k1 = n * sizeof(int64), bytes_k2 = n * sizeof(int64);
+                Size total = hdr_bytes + bytes_k1 + bytes_k2;
+                dsm_segment *seg = dsm_create(total, 0);
+                char *base = (char *) dsm_segment_address(seg);
+                SmolParallelHdr *hdr = (SmolParallelHdr *) base;
+                hdr->magic = SMOL_META_MAGIC; hdr->nbuckets = NB; hdr->total_n = n;
+                hdr->off_bucket = sizeof(SmolParallelHdr);
+                hdr->off_k1 = hdr->off_bucket + (NB + 1) * sizeof(uint64);
+                hdr->off_k2 = hdr->off_k1 + bytes_k1;
+                uint64 *d_off = (uint64 *) (base + hdr->off_bucket);
+                memcpy(d_off, off, (NB + 1) * sizeof(uint64));
+                int64 *dk1 = (int64 *) (base + hdr->off_k1);
+                int64 *dk2 = (int64 *) (base + hdr->off_k2);
+                /* Place rows into DSM by bucket */
+                memcpy(count, off, NB * sizeof(uint64));
+                for (Size i = 0; i < n; i++)
+                {
+                    uint64 u = (uint64) k1arr[i] ^ UINT64_C(0x8000000000000000);
+                    uint32 b = (uint32) (u >> (64 - BITS));
+                    uint64 pos = count[b]++;
+                    dk1[pos] = k1arr[i];
+                    dk2[pos] = k2arr[i];
+                }
+                /* Launch workers to sort each bucket in place */
+                int nworkers = 4; /* simple cap */
+                BackgroundWorkerHandle *handles[16];
+                if (nworkers > 16) nworkers = 16;
+                uint32 buckets_per = (NB + nworkers - 1) / nworkers;
+                int launched = 0;
+                for (int w = 0; w < nworkers; w++)
+                {
+                    uint32 first = (uint32) (w * buckets_per);
+                    if (first >= NB) break;
+                    uint32 nb = (uint32) ((first + buckets_per <= NB) ? buckets_per : (NB - first));
+                    BackgroundWorker bw;
+                    memset(&bw, 0, sizeof(bw));
+                    bw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+                    bw.bgw_start_time = BgWorkerStart_ConsistentState;
+                    bw.bgw_restart_time = BGW_NEVER_RESTART;
+                    snprintf(bw.bgw_name, BGW_MAXLEN, "smol parallel sort %d", w);
+                    snprintf(bw.bgw_library_name, BGW_MAXLEN, "smol");
+                    snprintf(bw.bgw_function_name, BGW_MAXLEN, "smol_parallel_sort_worker");
+                    SmolWorkerExtra extra;
+                    extra.handle = dsm_segment_handle(seg);
+                    extra.first_bucket = first;
+                    extra.nbuckets = nb;
+                    extra.total_buckets = NB;
+                    memcpy(bw.bgw_extra, &extra, sizeof(extra));
+                    bw.bgw_main_arg = (Datum) 0;
+                    bw.bgw_notify_pid = MyProcPid;
+                    if (RegisterDynamicBackgroundWorker(&bw, &handles[launched]))
+                        launched++;
+                }
+                SMOL_LOGF("launched bgworkers=%d (requested=%d) buckets=%u per_worker=%u", launched, nworkers, NB, buckets_per);
+                for (int ihandle = 0; ihandle < launched; ihandle++)
+                {
+                    BgwHandleStatus st;
+                    pid_t pid = 0;
+                    for (;;)
+                    {
+                        st = GetBackgroundWorkerPid(handles[ihandle], &pid);
+                        if (st == BGWH_STARTED || st == BGWH_STOPPED || st == BGWH_POSTMASTER_DIED)
+                            break;
+                        pg_usleep(10000L);
+                    }
+                    SMOL_LOGF("worker %d startup poll status=%d pid=%d", ihandle, (int) st, (int) pid);
+                    if (st != BGWH_STARTED)
+                        continue;
+                    SMOL_LOGF("waiting for worker %d shutdown", ihandle);
+                    (void) WaitForBackgroundWorkerShutdown(handles[ihandle]);
+                    SMOL_LOGF("worker %d shutdown complete", ihandle);
+                }
+                INSTR_TIME_SET_CURRENT(t_sort_end);
+                smol_build_tree2_from_sorted(index, dk1, dk2, n, key_len, key_len2);
+                INSTR_TIME_SET_CURRENT(t_write_end);
+                dsm_detach(seg);
+                used_parallel = true;
+            }
+            PG_CATCH();
+            {
+                /* Fallback: sort in-process without DSM */
+                FlushErrorState();
+                SMOL_LOG("parallel build unavailable; falling back to single-process sort");
+                smol_sort_pairs_rows64(k1arr, k2arr, n);
+                INSTR_TIME_SET_CURRENT(t_sort_end);
+                smol_build_tree2_from_sorted(index, k1arr, k2arr, n, key_len, key_len2);
+                INSTR_TIME_SET_CURRENT(t_write_end);
+            }
+            PG_END_TRY();
+            if (k1arr) pfree(k1arr);
+            if (k2arr) pfree(k2arr);
+            pfree(count);
+            pfree(off);
+        }
     }
 
     /* Mark heap block 0 all-visible so synthetic TID (0,1) will be IOS */
@@ -1102,6 +1240,8 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
     int64 *leaf_high = NULL; Size ahigh = 0;
     Size i = 0;
     BlockNumber prev = InvalidBlockNumber;
+    /* Reusable scratch buffer to avoid per-page palloc/free churn */
+    char *scratch = (char *) palloc(BLCKSZ);
     while (i < nkeys)
     {
         Buffer buf;
@@ -1123,12 +1263,12 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             Size remaining = nkeys - i;
             Size n_this = (remaining < max_n) ? remaining : max_n;
             Size sz = header + n_this * key_len;
-            char *blob = palloc(sz);
-            memcpy(blob, &n_this, sizeof(uint16));
-            memcpy(blob + header, (const char *) keys + ((size_t)i * key_len), n_this * key_len);
-            if (PageAddItem(page, (Item) blob, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+            if (sz > BLCKSZ)
+                ereport(ERROR, (errmsg("smol: leaf payload exceeds page size")));
+            memcpy(scratch, &n_this, sizeof(uint16));
+            memcpy(scratch + header, (const char *) keys + ((size_t)i * key_len), n_this * key_len);
+            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
                 ereport(ERROR, (errmsg("smol: failed to add leaf payload")));
-            pfree(blob);
             added = n_this;
             /* Record leaf highkey from the source array (last key on this page) */
             {
@@ -1242,6 +1382,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
     if (leaf_high) pfree(leaf_high);
     SMOL_LOGF("built root blk=%u with %zu children", rootblk, nleaves);
     }
+    pfree(scratch);
 }
 
 /* Build 2-column tree from sorted pairs (k1,k2) normalized to int64 */
@@ -1291,6 +1432,8 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
     Size i = 0;
     BlockNumber prev = InvalidBlockNumber;
 
+    /* Reusable scratch buffer to avoid per-page palloc/free churn */
+    char *scratch = (char *) palloc(BLCKSZ);
     while (i < nkeys)
     {
         Buffer buf = smol_extend(idx);
@@ -1365,9 +1508,10 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
 
         /* Now pack payload */
         Size blob_sz = sizeof(uint16) + (size_t) ng * hdrsz + (size_t) k2_count * key_len2;
-        char *blob = palloc(blob_sz);
-        memcpy(blob, &ng, sizeof(uint16));
-        char *gd = blob + sizeof(uint16);
+        if (blob_sz > BLCKSZ)
+            ereport(ERROR, (errmsg("smol: 2-col leaf payload exceeds page size")));
+        memcpy(scratch, &ng, sizeof(uint16));
+        char *gd = scratch + sizeof(uint16);
         /* GroupDir */
         for (uint16 gi = 0; gi < ng; gi++)
         {
@@ -1397,9 +1541,8 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
             }
         }
 
-        if (PageAddItem(page, (Item) blob, blob_sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+        if (PageAddItem(page, (Item) scratch, blob_sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
             ereport(ERROR, (errmsg("smol: failed to add 2-col leaf payload")));
-        pfree(blob);
         /* record last k1 for this page */
         {
             int64 v = (ng > 0) ? g_k1[ng - 1] : 0;
@@ -1499,6 +1642,7 @@ smol_build_tree2_from_sorted(Relation idx, const int64 *k1v, const int64 *k2v,
     }
     if (leaves) pfree(leaves);
     if (leaf_high1) pfree(leaf_high1);
+    pfree(scratch);
 }
 
 static BlockNumber
@@ -1828,6 +1972,26 @@ smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, b
         SMOL_LOGF("collect pair: tuples=%zu", *c->pcount);
 }
 
+static void
+ts_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
+{
+    TsPairCtx *c = (TsPairCtx *) state;
+    (void) rel; (void) tid; (void) tupleIsAlive;
+    if (isnull[0] || isnull[1]) ereport(ERROR, (errmsg("smol does not support NULL values")));
+    /* Feed via a virtual slot to avoid per-call heap_form_tuple overhead */
+    {
+        TupleTableSlot *vslot = MakeSingleTupleTableSlot(c->tdesc, &TTSOpsVirtual);
+        vslot->tts_values[0] = values[0]; vslot->tts_isnull[0] = false;
+        vslot->tts_values[1] = values[1]; vslot->tts_isnull[1] = false;
+        ExecStoreVirtualTuple(vslot);
+        tuplesort_puttupleslot(c->ts, vslot);
+        ExecDropSingleTupleTableSlot(vslot);
+    }
+    (*c->pcount)++;
+    if (smol_debug_log && smol_progress_log_every > 0 && (*c->pcount % (Size) smol_progress_log_every) == 0)
+        SMOL_LOGF("collect pair(ts): tuples=%zu", *c->pcount);
+}
+
 /* ---- Radix sort for fixed-width signed integers ------------------------- */
 static inline uint64 smol_norm64(int64 v) { return (uint64) v ^ UINT64_C(0x8000000000000000); }
 static inline uint32 smol_norm32(int32 v) { return (uint32) v ^ UINT32_C(0x80000000); }
@@ -1938,4 +2102,166 @@ smol_sort_pairs64(int64 *k1, int64 *k2, Size n)
     memcpy(k2, out2, n * sizeof(int64));
     pfree(out1); pfree(out2);
     pfree(idx); pfree(tmp); pfree(k1u); pfree(k2u);
+}
+
+/* LSD radix sort on (k1,k2) pairs operating on the rows directly (no index array).
+ * Stable and linear-time: 4 passes on k2 (low to high 16-bit digits), then 4 passes on k1. */
+static void
+smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n)
+{
+    if (n < 2) return;
+    int64 *t1 = (int64 *) palloc(n * sizeof(int64));
+    int64 *t2 = (int64 *) palloc(n * sizeof(int64));
+    uint32 *count = (uint32 *) palloc0(65536 * sizeof(uint32));
+
+    /* 4 passes on k2 (low to high) */
+    for (int pass = 0; pass < 4; pass++)
+    {
+        memset(count, 0, 65536 * sizeof(uint32));
+        for (Size i = 0; i < n; i++)
+        {
+            uint64 u = (uint64) k2[i] ^ UINT64_C(0x8000000000000000);
+            uint16 d = (uint16) ((u >> (pass * 16)) & 0xFFFF);
+            count[d]++;
+        }
+        uint32 sum = 0; for (int d = 0; d < 65536; d++) { uint32 c = count[d]; count[d] = sum; sum += c; }
+        for (Size i = 0; i < n; i++)
+        {
+            uint64 u = (uint64) k2[i] ^ UINT64_C(0x8000000000000000);
+            uint16 d = (uint16) ((u >> (pass * 16)) & 0xFFFF);
+            uint32 pos = count[d]++;
+            t1[pos] = k1[i];
+            t2[pos] = k2[i];
+        }
+        /* swap */
+        int64 *sw1 = k1; k1 = t1; t1 = sw1;
+        int64 *sw2 = k2; k2 = t2; t2 = sw2;
+    }
+
+    /* 4 passes on k1 */
+    for (int pass = 0; pass < 4; pass++)
+    {
+        memset(count, 0, 65536 * sizeof(uint32));
+        for (Size i = 0; i < n; i++)
+        {
+            uint64 u = (uint64) k1[i] ^ UINT64_C(0x8000000000000000);
+            uint16 d = (uint16) ((u >> (pass * 16)) & 0xFFFF);
+            count[d]++;
+        }
+        uint32 sum = 0; for (int d = 0; d < 65536; d++) { uint32 c = count[d]; count[d] = sum; sum += c; }
+        for (Size i = 0; i < n; i++)
+        {
+            uint64 u = (uint64) k1[i] ^ UINT64_C(0x8000000000000000);
+            uint16 d = (uint16) ((u >> (pass * 16)) & 0xFFFF);
+            uint32 pos = count[d]++;
+            t1[pos] = k1[i];
+            t2[pos] = k2[i];
+        }
+        /* swap */
+        int64 *sw1 = k1; k1 = t1; t1 = sw1;
+        int64 *sw2 = k2; k2 = t2; t2 = sw2;
+    }
+
+    /* if result currently in temp, copy back */
+    /* After even number of swaps (8), data is back in original arrays; but keep safe. */
+    pfree(t1);
+    pfree(t2);
+    pfree(count);
+}
+
+/* Fast path: radix sort packed (int16,int16) pairs as 32-bit keys */
+static void
+smol_sort_pairs16_16_packed(int64 *k1v, int64 *k2v, Size n)
+{
+    if (n < 2) return;
+    uint32 *keys = (uint32 *) palloc(n * sizeof(uint32));
+    uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
+    for (Size i = 0; i < n; i++)
+    {
+        uint16 a = smol_norm16((int16) k1v[i]);
+        uint16 b = smol_norm16((int16) k2v[i]);
+        keys[i] = ((uint32) a << 16) | (uint32) b;
+    }
+    enum { RAD = 65536 };
+    uint32 *count = (uint32 *) palloc0(RAD * sizeof(uint32));
+    /* low 16 */
+    for (Size i = 0; i < n; i++) count[keys[i] & 0xFFFF]++;
+    {
+        uint32 sum = 0; for (int b = 0; b < RAD; b++) { uint32 c = count[b]; count[b] = sum; sum += c; }
+    }
+    for (Size i = 0; i < n; i++) tmp[count[keys[i] & 0xFFFF]++] = keys[i];
+    /* high 16 */
+    memset(count, 0, RAD * sizeof(uint32));
+    for (Size i = 0; i < n; i++) count[(tmp[i] >> 16) & 0xFFFF]++;
+    {
+        uint32 sum = 0; for (int b = 0; b < RAD; b++) { uint32 c = count[b]; count[b] = sum; sum += c; }
+    }
+    for (Size i = 0; i < n; i++) keys[count[(tmp[i] >> 16) & 0xFFFF]++] = tmp[i];
+    for (Size i = 0; i < n; i++)
+    {
+        uint32 w = keys[i];
+        int16 a = (int16) ((w >> 16) ^ UINT16_C(0x8000));
+        int16 b = (int16) ((w & 0xFFFF) ^ UINT16_C(0x8000));
+        k1v[i] = (int64) a;
+        k2v[i] = (int64) b;
+    }
+    pfree(count); pfree(tmp); pfree(keys);
+}
+
+/* Background worker: sort assigned bucket ranges in-place inside DSM arrays */
+void
+smol_parallel_sort_worker(Datum arg)
+{
+    SmolWorkerExtra extra;
+    dsm_segment *seg;
+    char *base;
+    SmolParallelHdr *hdr;
+    uint64 *bucket_off;
+    int64 *dk1;
+    int64 *dk2;
+
+    (void) arg;
+
+    /* Install basic signal handlers and unblock signals */
+    pqsignal(SIGHUP, SIG_IGN);
+    pqsignal(SIGTERM, die);
+    BackgroundWorkerUnblockSignals();
+
+    if (MyBgworkerEntry == NULL)
+        ereport(ERROR, (errmsg("smol worker: MyBgworkerEntry is NULL")));
+    memcpy(&extra, MyBgworkerEntry->bgw_extra, sizeof(SmolWorkerExtra));
+
+    /* Announce readiness (no DB connection needed) to release the leader */
+    BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+
+    elog(LOG, "[smol] worker start: first_bucket=%u nbuckets=%u dsm=%u", extra.first_bucket, extra.nbuckets, (unsigned) extra.handle);
+    seg = dsm_attach(extra.handle);
+    if (seg == NULL)
+        ereport(ERROR, (errmsg("smol worker: failed to attach DSM handle %u", (unsigned) extra.handle)));
+    base = (char *) dsm_segment_address(seg);
+    hdr = (SmolParallelHdr *) base;
+    if (hdr->magic != SMOL_META_MAGIC)
+    {
+        /* Workers use the same magic as metapage for convenience */
+        ereport(ERROR, (errmsg("smol worker: bad DSM magic: 0x%x", hdr->magic)));
+    }
+
+    bucket_off = (uint64 *) (base + hdr->off_bucket);
+    dk1 = (int64 *) (base + hdr->off_k1);
+    dk2 = (int64 *) (base + hdr->off_k2);
+
+    for (uint32 b = extra.first_bucket; b < extra.first_bucket + extra.nbuckets && b < hdr->nbuckets; b++)
+    {
+        uint64 start = bucket_off[b];
+        uint64 end = bucket_off[b + 1];
+        Size len = (Size) (end - start);
+        if (len <= 1)
+            continue;
+        /* Row-wise stable radix sort by (k1,k2) for this slice */
+        smol_sort_pairs_rows64(dk1 + start, dk2 + start, len);
+    }
+
+    elog(LOG, "[smol] worker done: first_bucket=%u nbuckets=%u", extra.first_bucket, extra.nbuckets);
+    dsm_detach(seg);
+    proc_exit(0);
 }

@@ -55,11 +55,16 @@ insidebuild:
 	  $(MAKE) clean && $(MAKE) && $(MAKE) install
 
 insidestart:
+	@# chmod to fix perms for the postgres user - stupid hack
+	chmod 777 /workspace;
 	@echo "[inside] Starting PostgreSQL in container (initdb if needed)"
 	@set -euo pipefail; \
 	  if [ ! -s $(PGDATA)/PG_VERSION ]; then \
 	    su - postgres -c "$(PG_BIN)initdb -D $(PGDATA)"; \
 	  fi; \
+          echo "tuning postgresql.conf for the current env"; \
+	  ./tune_pg.sh $(PGDATA)/postgresql.conf; \
+	  chown postgres $(PGDATA)/postgresql.conf $(PGDATA)/postgresql.conf.bak*; \
 	  if su - postgres -c "$(PG_BIN)pg_ctl -D $(PGDATA) status" >/dev/null 2>&1; then \
 	    echo "[inside] PostgreSQL already running"; \
 	  else \
