@@ -79,7 +79,10 @@ run_bench_phase() {
 
   echo "# Building index ${idxname}" >&2
   local t0=$(date +%s%3N)
-  ${PSQL_TMO} -c "${create_stmt}"
+  # Protect server from lingering backends when client timeout kills psql.
+  # Use server-side statement_timeout slightly below TIMEOUT_SEC.
+  local stmt_ms=$(( (TIMEOUT_SEC>2 ? TIMEOUT_SEC-2 : TIMEOUT_SEC) * 1000 ))
+  ${PSQL_TMO} -c "SET statement_timeout=${stmt_ms}; ${create_stmt}"
   # For BTREE, force all-visible so IOS is possible; harmless for SMOL
   echo "# checkpoint + freeze/analyze table (for IOS)" >&2
   if [ "${is_smol}" -eq 0 ]; then
