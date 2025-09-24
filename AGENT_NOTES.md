@@ -453,6 +453,59 @@ Implementation notes for benches
 - Rescans: smol_rescan rebinds keys without leaking old state.
 
 All of the above are designed to be either small and fast or optional heavies, respecting our regression speed policy while raising coverage and confidence.
+
+
+## Performance Optimizations (Ideas and Next Steps)
+
+Hot path goals
+- Minimize per-tuple overhead in amgettuple, maximize sequential reads across rightlinked leaves, and exploit fixed-width keys for branchless copies.
+
+Low-level tuple materialization
+- Specialize memcpy by key widths (2/4/8 bytes); inline unrolled copies for common widths to avoid size branches in the inner loop.
+- Batch-copy: when emitting runs from the same page, copy N consecutive fixed-size elements into a small stack buffer feeding the prebuilt tuple to reduce function-call overhead.
+- Consider 16-byte loads/stores where safe (guard by platform) to move two int4s or one int8 with padding.
+
+Buffer and page access
+- Prefetch rightlink pages before finishing the current leaf (PrefetchBuffer or equivalent) to overlap I/O latency for forward scans.
+- Keep pages pinned across calls (already in place); only release on leaf transitions. Avoid PageGetItemId per row by computing payload base pointers and indexing directly.
+- On leaf transition, binary-search within the new leaf to the first match for the current bound (already added for 1-col), minimize linear scans.
+
+Two-column emission improvements
+- For leading-key equality, only read groups whose k1 == bound (now implemented). Extend to also narrow within-group for k2 equality by binary-searching the group’s contiguous k2 array (assumes (k1,k2) sort at build).
+- Add tiny per-group summaries (e.g., min/max k2 or a small bitmap sample) to skip groups quickly when have_k2_eq eliminates most rows; optional and off by default.
+- Reuse the per-leaf cache buffers across leaves instead of pfree/palloc per leaf; keep a growable context to avoid churn.
+
+Parallel scan scaling
+- Batch-claim multiple leaves per CAS in DSM (advance the shared cursor by N and process locally), reducing contention and cacheline bouncing.
+- Optional work stealing: when a worker exhausts its batch, attempt to steal half of the remaining range in one CAS.
+- Record leaf-claim stats under smol.profile to validate fairness and coverage.
+
+Build-time sorting and write path
+- Single-column: use radix sort (u16/u32/u64 normalized keys) for large inputs instead of tuplesort; switch by threshold. This avoids comparator overhead and is stable for equal keys.
+- Two-column: radix sort packed (k1,k2) for int2/int4; for int8, use MSD partition followed by in-bucket comparison sort. Write leaves directly from the sorted arrays.
+- External merge for very large inputs: spill sorted runs and merge while writing leaves to bound memory.
+- Pre-size leaf payloads and avoid per-page scratch reallocation; reserve a reusable scratch buffer sized to BLCKSZ once.
+
+Layout and compression
+- Densify group headers; consider delta-encoding highkeys for internal nodes if height grows.
+- Optional RLE for k2 within groups when duplicates dominate; reloption-controlled and off by default.
+
+Planner and costing
+- Use pg_stats for the leading key to estimate selectivity (eq vs range) and set indexSelectivity and indexTotalCost more accurately.
+- For two-column scans with a = const, lower startup/total costs to reflect contiguous group emission and better IOS locality.
+
+Lock avoidance and page ops
+- Confirm all read paths avoid buffer locks (already true) and ReadBuffer modes are appropriate.
+- Prefer RBM_NORMAL_NO_LOG for prefetch/reads that do not need WAL interactions; ensure correctness in read-only context.
+
+Instrumentation
+- Extend smol.profile counters: add groups skipped, groups visited, prefetches issued, leaves claimed per worker. Emit at endscan for targeted tuning.
+
+Action items (incremental)
+- Implement k2-equality binary-search within groups to reduce per-leaf scanning cost.
+- Add rightlink prefetch on forward scans and verify win via smol.profile.
+- Switch 1-col build to radix sort past a size threshold; keep tuplesort for small N.
+- Prototype batch leaf-claims for parallel scans and validate no double-emit/gaps using the parallel correctness tests.
 - In two-col leaf packing, bulk-memcpy `k2` when key_len2=8; otherwise use tight fixed-width copies (2/4). Reuse a single scratch buffer per page to avoid repeated palloc/free.
 - Link leaf right-siblings by keeping the previous leaf pinned: set its rightlink once the next leaf is allocated, then release; avoid reopen/lock of the previous leaf.
 - To demonstrate multiplicative query speedups, make the workload I/O‑bound; keep
