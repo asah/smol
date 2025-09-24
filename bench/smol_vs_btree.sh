@@ -11,9 +11,11 @@ set -euo pipefail
 #                    [--thresh N|-t N] [--batch N|-B N]
 #                    [--timeout SEC] [--kill-after SEC]
 #                    [--dbname NAME]
+#                    [--equal-on-a VAL] [--sweep PCTS] [--workers LIST]
 #
 # Defaults (can also be provided via env):
 #   ROWS=5000000 THRESH=15000 BATCH=250000 CHUNK_MIN=50000 SINGLECOL=0 TIMEOUT_SEC=30 KILL_AFTER=5 DBNAME=postgres COLTYPE=int2
+#   EQUAL_ON_A="" (unset) SWEEP="" (e.g., 10,50,90,99) WORKERS="5" (comma-list)
 
 ROWS=${ROWS:-5000000}
 THRESH=${THRESH:-15000}
@@ -24,6 +26,9 @@ TIMEOUT_SEC=${TIMEOUT_SEC:-30}
 KILL_AFTER=${KILL_AFTER:-5}
 DBNAME=${DBNAME:-postgres}
 COLTYPE=${COLTYPE:-int2}
+EQUAL_ON_A=${EQUAL_ON_A:-}
+SWEEP=${SWEEP:-}
+WORKERS=${WORKERS:-5}
 
 # Choose random range per type (can be overridden via RMAX_A/RMAX_B)
 case "$COLTYPE" in
@@ -43,6 +48,9 @@ Usage: $0 [options]
       --timeout SEC    Per-psql timeout cap (<=30) (default: ${TIMEOUT_SEC})
       --kill-after SEC Grace before SIGKILL on timeout (<=5) (default: ${KILL_AFTER})
       --dbname NAME    Database name (default: ${DBNAME})
+      --equal-on-a VAL Add "AND a = VAL" to two-column queries
+      --sweep PCTS     Comma list of percentiles of b (e.g., 10,50,90,99) to run query sweeps
+      --workers LIST   Comma list of worker counts (e.g., 0,1,2,3,5) for scaling
   -h, --help           Show this help
 USAGE
 }
@@ -57,6 +65,9 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT_SEC="$2"; shift 2;;
     --kill-after) KILL_AFTER="$2"; shift 2;;
     -d|--dbname|--db) DBNAME="$2"; shift 2;;
+    --equal-on-a) EQUAL_ON_A="$2"; shift 2;;
+    --sweep) SWEEP="$2"; shift 2;;
+    --workers) WORKERS="$2"; shift 2;;
     -h|--help) print_usage; exit 0;;
     *) echo "# ERROR: Unknown option: $1" >&2; print_usage; exit 2;;
   esac
@@ -155,7 +166,11 @@ run_bench_phase() {
   if [ "${SINGLECOL:-0}" -eq 1 ]; then
     query="SELECT sum(b::bigint) FROM ${TBL} WHERE b > ${THRESH};"
   else
-    query="SELECT sum(a::bigint) FROM ${TBL} WHERE b > ${THRESH};"
+    query="SELECT sum(a::bigint) FROM ${TBL} WHERE b > ${THRESH}"
+    if [ -n "${EQUAL_ON_A}" ]; then
+      query+=" AND a = ${EQUAL_ON_A}"
+    fi
+    query+=";"
   fi
 
   ${PSQL_TMO} -c "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) ${query}" >/dev/null || true
@@ -169,22 +184,94 @@ run_bench_phase() {
   echo "${idxname}|${is_smol}|${build_ms}|${size_mb}|${exec_ms}|${pline}"
 }
 
+# Compute percentile threshold of b using percentile_disc(pct)
+percentile_thresh() {
+  local pct=$1
+  # Normalize to fraction in [0,1]
+  local frac
+  frac=$(awk -v p="${pct}" 'BEGIN{printf "%.6f", p/100.0}')
+  ${PSQL_TMO} -c "SELECT percentile_disc(${frac}) WITHIN GROUP (ORDER BY b) FROM ${TBL};"
+}
+
+# Run a sweep of thresholds and worker counts for the current index
+run_sweep() {
+  local idx_type=$1   # btree|smol
+  local wlist=$2      # comma-separated workers
+  local plist=$3      # comma-separated percentiles
+  local size_mb=$4    # index size to include in output (optional)
+  local header_printed=${5:-0}
+  if [ "${header_printed}" -eq 0 ]; then
+    echo
+    echo "SweepIndex,Type,Workers,Threshold,EqualOnA,Query_ms,Plan"
+  fi
+  IFS=',' read -ra WARR <<<"${wlist}"
+  IFS=',' read -ra PARR <<<"${plist}"
+  for w in "${WARR[@]}"; do
+    ${PSQL_TMO} -c "SET max_parallel_workers_per_gather=${w}; SET max_parallel_workers=${w}; \
+                     SET parallel_setup_cost=0; SET parallel_tuple_cost=0; \
+                     SET min_parallel_index_scan_size=0; SET min_parallel_table_scan_size=0;"
+    for p in "${PARR[@]}"; do
+      thr=$(percentile_thresh "$p")
+      # Build the query with the new threshold
+      local q
+      if [ "${SINGLECOL:-0}" -eq 1 ]; then
+        q="SELECT sum(b::bigint) FROM ${TBL} WHERE b > ${thr};"
+      else
+        q="SELECT sum(a::bigint) FROM ${TBL} WHERE b > ${thr}"
+        if [ -n "${EQUAL_ON_A}" ]; then q+=" AND a = ${EQUAL_ON_A}"; fi
+        q+=";"
+      fi
+      # Capture plan line and execution time
+      local pline exec_ms
+      pline=$(${PSQL_TMO} -c "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) ${q}" | grep -E 'Index (Only )?Scan' | head -n1 | sed 's/^\s\+//')
+      exec_ms=$(${PSQL_TMO} -c "EXPLAIN (ANALYZE, BUFFERS, TIMING ON) ${q}" | grep -E 'Execution Time:' | awk '{print $(NF-1)}')
+      echo "${idx_type},${idx_type},${w},${thr},${EQUAL_ON_A},${exec_ms},${pline}"
+    done
+  done
+}
+
 if [ "${SINGLECOL:-0}" -eq 1 ]; then
   echo "# Phase 1: BTREE (${TBL}_b_btree on (b))" >&2
   bt_row=$(run_bench_phase ${TBL}_b_btree "CREATE INDEX ${TBL}_b_btree ON ${TBL}(b);" 0)
+  if [ -n "${SWEEP}" ]; then
+    # Parse BTREE size for later reference
+    bt_size=$(echo "${bt_row}" | awk -F'|' '{print $4}')
+    run_sweep btree "${WORKERS}" "${SWEEP}" "${bt_size}" 1
+  fi
   echo "# Cleaning up BTREE index" >&2
   ${PSQL_TMO} -c "DROP INDEX IF EXISTS ${TBL}_b_btree;"
   echo "# Phase 2: SMOL (${TBL}_b_smol on (b))" >&2
   sm_row=$(run_bench_phase ${TBL}_b_smol "CREATE INDEX ${TBL}_b_smol ON ${TBL} USING smol(b);" 1)
+  if [ -n "${SWEEP}" ]; then
+    sm_size=$(echo "${sm_row}" | awk -F'|' '{print $4}')
+    run_sweep smol "${WORKERS}" "${SWEEP}" "${sm_size}" 1
+  fi
 else
   echo "# Phase 1: BTREE (${TBL}_ba_btree on (b) INCLUDE (a))" >&2
   bt_row=$(run_bench_phase ${TBL}_ba_btree "CREATE INDEX ${TBL}_ba_btree ON ${TBL} USING btree(b) INCLUDE (a);" 0)
+  # Capture baseline sum/count for correctness before dropping BTREE
+  base_sum=$(${PSQL_TMO} -c "SELECT sum(a::bigint) FROM ${TBL} WHERE b > ${THRESH}")
+  base_cnt=$(${PSQL_TMO} -c "SELECT count(*)::bigint FROM ${TBL} WHERE b > ${THRESH}")
+  if [ -n "${SWEEP}" ]; then
+    bt_size=$(echo "${bt_row}" | awk -F'|' '{print $4}')
+    run_sweep btree "${WORKERS}" "${SWEEP}" "${bt_size}" 1
+  fi
   echo "# Cleaning up BTREE index" >&2
   ${PSQL_TMO} -c "DROP INDEX IF EXISTS ${TBL}_ba_btree;"
   echo "# Phase 2: SMOL (${TBL}_ba_smol on (b,a))" >&2
   sm_row=$(run_bench_phase ${TBL}_ba_smol "CREATE INDEX ${TBL}_ba_smol ON ${TBL} USING smol(b,a);" 1)
   # Stats for SMOL as well for fair selectivity
   ${PSQL_TMO} -c "ANALYZE ${TBL};"
+  # Compute SMOL sum/count for correctness and print a line
+  sm_sum=$(${PSQL_TMO} -c "SELECT sum(a::bigint) FROM ${TBL} WHERE b > ${THRESH}")
+  sm_cnt=$(${PSQL_TMO} -c "SELECT count(*)::bigint FROM ${TBL} WHERE b > ${THRESH}")
+  correct=false
+  if [ "${base_sum}" = "${sm_sum}" ] && [ "${base_cnt}" = "${sm_cnt}" ]; then correct=true; fi
+  echo "Correct,${correct},sum_bt=${base_sum},sum_smol=${sm_sum},cnt_bt=${base_cnt},cnt_smol=${sm_cnt}"
+  if [ -n "${SWEEP}" ]; then
+    sm_size=$(echo "${sm_row}" | awk -F'|' '{print $4}')
+    run_sweep smol "${WORKERS}" "${SWEEP}" "${sm_size}" 1
+  fi
 fi
 
 echo

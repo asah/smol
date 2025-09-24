@@ -1,2 +1,3 @@
 model = "gpt-5"
 model_reasoning_effort = "high"
+notify = ["python3", ".codex/notify.py"]

@@ -4,7 +4,7 @@ DATA = smol--1.0.sql
 MODULES = smol
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_twocol
+REGRESS = smol_basic smol_twocol smol_parallel
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config

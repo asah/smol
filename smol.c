@@ -217,6 +217,7 @@ typedef struct SmolScanOpaqueData
     bool        have_bound;
     bool        bound_strict;   /* true when '>' bound (not >=) */
     int64       bound;          /* normalized to int64 for comparisons */
+    bool        have_k1_eq;     /* true when leading key equality present */
     /* optional equality filter on second key (attno=2) */
     bool        have_k2_eq;
     int64       k2_eq;
@@ -799,6 +800,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->cur_buf = InvalidBuffer;
     so->have_pin = false;
     so->have_bound = false;
+    so->have_k1_eq = false;
     so->bound_strict = false;
     so->atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
     so->atttypid2 = (RelationGetDescr(index)->natts >= 2) ? TupleDescAttr(RelationGetDescr(index), 1)->atttypid : InvalidOid;
@@ -865,6 +867,7 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
         so->have_pin = false;
     }
     so->have_bound = false;
+    so->have_k1_eq = false;
     so->have_k2_eq = false;
     if (keys && nkeys > 0)
     {
@@ -879,6 +882,7 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
                 {
                     so->have_bound = true;
                     so->bound_strict = (sk->sk_strategy == BTGreaterStrategyNumber);
+                    so->have_k1_eq = (sk->sk_strategy == BTEqualStrategyNumber);
                     if (so->atttypid == INT2OID)
                         so->bound = (int64) DatumGetInt16(sk->sk_argument);
                     else if (so->atttypid == INT4OID)
@@ -1193,6 +1197,23 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     /* Copy fixed-width value directly into prebuilt tuple (no Datum calls) */
                     char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
+                    if (so->have_k1_eq)
+                    {
+                        int c = smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, so->bound);
+                        if (c < 0)
+                        {
+                            /* Past the equality run when scanning backward: terminate overall */
+                            so->cur_blk = InvalidBlockNumber;
+                            break;
+                        }
+                        else if (c > 0)
+                        {
+                            /* Should not happen; skip defensively */
+                            so->cur_off--;
+                            continue;
+                        }
+                        /* c == 0: emit normally */
+                    }
                     if (so->key_len == 2) memcpy(so->itup_data, keyp, 2);
                     else if (so->key_len == 4) memcpy(so->itup_data, keyp, 4);
                     else memcpy(so->itup_data, keyp, 8);
@@ -1210,6 +1231,22 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 while (so->cur_off <= n)
                 {
                     char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
+                    if (so->have_k1_eq)
+                    {
+                        int c = smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, so->bound);
+                        if (c > 0)
+                        {
+                            /* We've moved past the equality run on this page; advance to next leaf */
+                            break;
+                        }
+                        else if (c < 0)
+                        {
+                            /* Should not happen (we start at >= bound); skip forward */
+                            so->cur_off++;
+                            continue;
+                        }
+                        /* c == 0: emit normally */
+                    }
                     if (so->key_len == 2) memcpy(so->itup_data, keyp, 2);
                     else if (so->key_len == 4) memcpy(so->itup_data, keyp, 4);
                     else memcpy(so->itup_data, keyp, 8);
@@ -1307,6 +1344,45 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     so->cur_group = 0;
                 }
                 smol2_build_leaf_cache(so, np);
+            }
+            else
+            {
+                /* single-col: if we have a bound, re-seek within new leaf */
+                if (so->have_bound && dir != BackwardScanDirection)
+                {
+                    uint16 n2 = smol_leaf_nitems(np);
+                    uint16 lo2 = FirstOffsetNumber, hi2 = n2, ans2 = InvalidOffsetNumber;
+                    while (lo2 <= hi2)
+                    {
+                        uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
+                        char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
+                        int cc = smol_cmp_keyptr_bound(kp2, so->key_len, so->atttypid, so->bound);
+                        if (so->prof_enabled) so->prof_bsteps++;
+                        if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
+                        else lo2 = (uint16) (mid2 + 1);
+                    }
+                    so->cur_off = (ans2 != InvalidOffsetNumber) ? ans2 : (uint16) (n2 + 1);
+                }
+                else if (so->have_bound && dir == BackwardScanDirection)
+                {
+                    /* backward: position to last <= bound in this leaf */
+                    uint16 n2 = smol_leaf_nitems(np);
+                    /* Find first > bound, then step one back */
+                    uint16 lo2 = FirstOffsetNumber, hi2 = n2, ans2 = InvalidOffsetNumber;
+                    while (lo2 <= hi2)
+                    {
+                        uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
+                        char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
+                        int cc = smol_cmp_keyptr_bound(kp2, so->key_len, so->atttypid, so->bound);
+                        if (so->prof_enabled) so->prof_bsteps++;
+                        if (cc > 0) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
+                        else lo2 = (uint16) (mid2 + 1);
+                    }
+                    if (ans2 == InvalidOffsetNumber)
+                        so->cur_off = n2;
+                    else
+                        so->cur_off = (ans2 > FirstOffsetNumber) ? (uint16) (ans2 - 1) : InvalidOffsetNumber;
+                }
             }
             so->cur_buf = nbuf; so->have_pin = true;
             page = np;
@@ -2155,6 +2231,27 @@ smol2_build_leaf_cache(SmolScanOpaque so, Page page)
     for (uint16 gi = start_g; gi < ng; gi++)
     {
         uint32 off; uint16 cnt;
+        /* Filter groups based on leading-key conditions */
+        if (so->have_bound)
+        {
+            char *gk1 = smol2_group_k1_ptr(page, gi, so->key_len);
+            int c = smol_cmp_keyptr_bound(gk1, so->key_len, so->atttypid, so->bound);
+            if (so->have_k1_eq)
+            {
+                if (c != 0)
+                    continue; /* only equal groups */
+            }
+            else if (so->bound_strict)
+            {
+                if (c <= 0)
+                    continue; /* enforce '>' */
+            }
+            else
+            {
+                if (c < 0)
+                    continue; /* safety: should not happen due to start_g */
+            }
+        }
         smol2_group_offcnt(page, gi, so->key_len, &off, &cnt);
         total += cnt;
     }
@@ -2170,6 +2267,25 @@ smol2_build_leaf_cache(SmolScanOpaque so, Page page)
     {
         char *gk1 = smol2_group_k1_ptr(page, gi, so->key_len);
         int64 v1;
+        if (so->have_bound)
+        {
+            int c = smol_cmp_keyptr_bound(gk1, so->key_len, so->atttypid, so->bound);
+            if (so->have_k1_eq)
+            {
+                if (c != 0)
+                    continue;
+            }
+            else if (so->bound_strict)
+            {
+                if (c <= 0)
+                    continue;
+            }
+            else
+            {
+                if (c < 0)
+                    continue;
+            }
+        }
         if (so->key_len == 2) { int16 t; memcpy(&t, gk1, 2); v1 = (int64) t; }
         else if (so->key_len == 4) { int32 t; memcpy(&t, gk1, 4); v1 = (int64) t; }
         else { int64 t; memcpy(&t, gk1, 8); v1 = t; }

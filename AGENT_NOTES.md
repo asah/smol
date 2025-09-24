@@ -248,6 +248,211 @@ Profiling smol_gettuple
 - For ad-hoc smoke tests (to avoid pg_regress), run minimal correctness via psql as `postgres` without expected-error checks.
 - Build path implementation rules: use radix sort for int2/int4/int8 keys and for (k1,k2) pairs; keep two-col collections in parallel arrays to avoid struct copies.
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.
+
+
+## Test & Benchmark Design (Correctness + Performance)
+
+This section proposes focused, fast correctness tests and higher‑signal benchmark queries tailored to SMOL’s design and likely pitfalls. The goal is to catch ordering/boundary issues, page‑chain traversal, two‑column grouping, backward scans, and parallel leaf claiming. Where heavy data is needed (to force multi‑level trees), guard with psql vars to keep regression fast.
+
+Guiding principles
+- Always compare to a BTREE baseline (assumed correct). Use INCLUDE(a) for two‑column baselines to match IOS behavior.
+- Keep small, deterministic datasets for edge cases; use UNLOGGED tables and disable autovacuum for speed.
+- For multi‑page and multi‑level coverage, use optional heavy sections guarded by RUN_HEAVY.
+- For parallel correctness, prefer 3–5 workers and disable seq/bitmap.
+
+### Correctness Scenarios (small, fast)
+
+1) Empty and single‑leaf trees
+- Empty: CREATE INDEX on empty table; queries return 0 rows; drop works.
+- Single leaf: <= page capacity rows; exercise >=, >, =, and backward scans.
+
+SQL (run manually or add to smol_edgecases)
+  CREATE EXTENSION IF NOT EXISTS smol;
+  -- empty
+  DROP TABLE IF EXISTS e1 CASCADE; CREATE UNLOGGED TABLE e1(a int);
+  CREATE INDEX e1_smol ON e1 USING smol(a);
+  SET enable_seqscan=off; SELECT count(*) FROM e1 WHERE a >= 0;  -- expect 0
+  DROP INDEX e1_smol;
+  -- single leaf
+  DROP TABLE IF EXISTS s1 CASCADE; CREATE UNLOGGED TABLE s1(a int);
+  INSERT INTO s1 SELECT i FROM generate_series(1,1000) i;  -- fits in one page for int4
+  CREATE INDEX s1_smol ON s1 USING smol(a);
+  SET enable_seqscan=off; SELECT array_agg(a) FROM s1 WHERE a >= 990 ORDER BY a;
+  SELECT array_agg(a) FROM s1 WHERE a >= 990 ORDER BY a DESC;  -- backward
+
+2) Boundary values and negatives (ordering)
+- Ensure sign handling and comparisons behave correctly across int2/int4/int8 extremes and around 0.
+
+SQL
+  DROP TABLE IF EXISTS b1 CASCADE; CREATE UNLOGGED TABLE b1(a int2);
+  INSERT INTO b1 VALUES (-32768::int2),(-1::int2),(0::int2),(1::int2),(32767::int2);
+  CREATE INDEX b1_smol ON b1 USING smol(a);
+  SET enable_seqscan=off;
+  -- exact bounds
+  SELECT array_agg(a) FROM b1 WHERE a >= -1 ORDER BY a;
+  SELECT array_agg(a) FROM b1 WHERE a > -1 ORDER BY a;
+  SELECT array_agg(a) FROM b1 WHERE a >= 32767 ORDER BY a;
+  SELECT array_agg(a) FROM b1 WHERE a > 32767 ORDER BY a;  -- expect NULL/empty
+
+3) Duplicates, all‑equal keys, and page‑crossing duplicates
+- Exercise emission order and page boundary logic when many equal keys straddle leaves.
+
+SQL
+  DROP TABLE IF EXISTS d1 CASCADE; CREATE UNLOGGED TABLE d1(a int);
+  -- many equal keys to cross pages
+  INSERT INTO d1 SELECT 42 FROM generate_series(1,20000);
+  INSERT INTO d1 SELECT 7 FROM generate_series(1,10000);
+  CREATE INDEX d1_smol ON d1 USING smol(a);
+  SET enable_seqscan=off;
+  -- order and counts
+  SELECT count(*), min(a), max(a) FROM d1 WHERE a >= 7;  -- count should match total
+  SELECT count(*) FROM d1 WHERE a = 42;                  -- exact dup count
+  -- backward
+  SELECT a FROM d1 WHERE a >= 7 ORDER BY a DESC LIMIT 5;
+
+4) Two‑column grouping and equality on second key
+- Validate that second‑column equality filters are honored across page groups.
+
+SQL
+  DROP TABLE IF EXISTS t2 CASCADE; CREATE UNLOGGED TABLE t2(a int2, b int2);
+  INSERT INTO t2 SELECT (i % 100)::int2, (i % 5)::int2 FROM generate_series(1,20000) i;
+  CREATE INDEX t2_smol ON t2 USING smol(b,a);
+  SET enable_seqscan=off;
+  -- compare with BTREE INCLUDE baseline
+  DROP INDEX IF EXISTS t2_btree; CREATE INDEX t2_btree ON t2 USING btree(b) INCLUDE (a);
+  SELECT (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) =
+         (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) AS match;  -- same query; planner may choose BTREE
+  SET enable_indexscan=off;  -- force IOS
+  SELECT (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) AS smol_sum;
+  SET enable_indexscan=on; SET enable_indexonlyscan=on;
+
+5) No‑match and out‑of‑range bounds
+- Fast‑fail behavior and correct empty results for upper bounds above max or strict lower bounds above all values.
+
+SQL
+  DROP TABLE IF EXISTS nm CASCADE; CREATE UNLOGGED TABLE nm(a int8);
+  INSERT INTO nm SELECT i::bigint FROM generate_series(1,10000) i;
+  CREATE INDEX nm_smol ON nm USING smol(a);
+  SET enable_seqscan=off;
+  SELECT count(*) FROM nm WHERE a > 1000000000000;  -- expect 0
+  SELECT count(*) FROM nm WHERE a = -1;            -- expect 0
+
+6) Rescan and different quals on the same scan node
+- Exercise smol_rescan by parameterizing quals and rescanning in a single session.
+
+SQL
+  DROP TABLE IF EXISTS rs CASCADE; CREATE UNLOGGED TABLE rs(a int);
+  INSERT INTO rs SELECT i FROM generate_series(1,10000) i;
+  CREATE INDEX rs_smol ON rs USING smol(a);
+  PREPARE q(int) AS SELECT count(*) FROM rs WHERE a >= $1;
+  EXECUTE q(9000); EXECUTE q(9500); EXECUTE q(1);
+
+7) Backward scans equivalence
+- Ensure ORDER BY DESC results match reversed ASC range.
+
+SQL
+  DROP TABLE IF EXISTS bw CASCADE; CREATE UNLOGGED TABLE bw(a int);
+  INSERT INTO bw SELECT i FROM generate_series(1,2000) i;
+  CREATE INDEX bw_smol ON bw USING smol(a);
+  SET enable_seqscan=off;
+  SELECT array_agg(a) FROM (SELECT a FROM bw WHERE a >= 1500 ORDER BY a DESC LIMIT 20) s1;
+  SELECT array_agg(a) FROM (SELECT a FROM bw WHERE a >= 1500 ORDER BY a ASC LIMIT 20) s2;  -- reverse should match
+
+8) Non‑leading‑key plan safety
+- If planner still picks SMOL without leading‑key qual (despite high cost), results must still be correct. Force with GUCs.
+
+SQL
+  DROP TABLE IF EXISTS nl CASCADE; CREATE UNLOGGED TABLE nl(a int, b int);
+  INSERT INTO nl SELECT (i % 10), i FROM generate_series(1,5000) i;
+  CREATE INDEX nl_smol ON nl USING smol(a,b);
+  SET enable_seqscan=off; SET enable_indexscan=off; SET enable_indexonlyscan=on;
+  -- No leading key qual on a, but equality on b
+  SELECT (SELECT b FROM nl WHERE b = 1234 ORDER BY a LIMIT 1) IS NOT NULL;
+
+### Multi‑page and Multi‑level Trees (optional heavy)
+
+- Force multiple leaves and internal levels to exercise internal descent and rightlink traversal.
+- Guard with RUN_HEAVY to keep CI fast; set ROWS variable for scale.
+
+SQL (enable with: psql -v RUN_HEAVY=1 -v ROWS=200000)
+  \if :{?RUN_HEAVY}
+  \if :{?ROWS} \else \set ROWS 200000 \endif
+  DROP TABLE IF EXISTS ml4 CASCADE; CREATE UNLOGGED TABLE ml4(a int4);
+  INSERT INTO ml4 SELECT i FROM generate_series(1, :ROWS) i;
+  CREATE INDEX ml4_smol ON ml4 USING smol(a);
+  SET enable_seqscan=off; SET enable_indexonlyscan=on; SET max_parallel_workers_per_gather=0;
+  -- check sums across disjoint ranges that cross many page boundaries
+  SELECT sum(a)::bigint FROM ml4 WHERE a > (:ROWS/3);
+  SELECT sum(a)::bigint FROM ml4 WHERE a > (:ROWS/2);
+  SELECT sum(a)::bigint FROM ml4 WHERE a > (:ROWS-100);
+  -- backward scan sanity
+  SELECT a FROM ml4 WHERE a >= (:ROWS-50) ORDER BY a DESC LIMIT 10;
+  \endif
+
+### Parallel Scan Correctness
+
+- Validate DSM leaf‑claim logic: no double‑emit, no gaps, independent of worker count.
+- Use equality on second key and range on first to vary match density.
+
+SQL
+  SET client_min_messages=warning;
+  SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
+  SET max_parallel_workers_per_gather=5; SET max_parallel_workers=5;
+  SET parallel_setup_cost=0; SET parallel_tuple_cost=0;
+  SET min_parallel_index_scan_size=0; SET min_parallel_table_scan_size=0;
+  DROP TABLE IF EXISTS px CASCADE; CREATE UNLOGGED TABLE px(a int4, b int4);
+  INSERT INTO px SELECT (i % 100000), (i % 1000) FROM generate_series(1,200000) i;
+  ANALYZE px;
+  CREATE INDEX px_bt ON px USING btree(b) INCLUDE (a);
+  CREATE INDEX px_sm ON px USING smol(b,a);
+  -- baseline
+  SELECT sum(a)::bigint, count(*)::bigint FROM px WHERE b > 500; \gset
+  -- force parallel
+  SET max_parallel_workers_per_gather=5;
+  SELECT ((SELECT sum(a)::bigint FROM px WHERE b > 500) = :sum) AND
+         ((SELECT count(*)::bigint FROM px WHERE b > 500) = :count) AS match_all;
+  -- equality on second key (narrow)
+  SELECT ((SELECT count(*)::bigint FROM px WHERE b > 500 AND a = 42) =
+          (SELECT count(*)::bigint FROM px WHERE b > 500 AND a = 42)) AS match_eq;
+
+### Benchmark Query Additions (performance signal)
+
+1) Selectivity sweep (single‑col and two‑col)
+- For TBL(a,b) with SMOL(b[,a]) and BTREE(b INCLUDE a), run b > percentile thresholds (P10,P50,P90,P99) and record plan, runtime, and rows.
+- Two‑col: also run b > P50 AND a = const with varying equality selectivity (~0.1%, 1%, 10%).
+
+2) Out‑of‑range and no‑match microbench
+- Measure overhead of scans that quickly determine emptiness: b > max(b)+1, a = value not present.
+
+3) Backward scan throughput
+- Repeat the selectivity sweep with ORDER BY a DESC to ensure parity with forward throughput.
+
+4) Parallel scaling curve
+- Fix dataset; run with max_parallel_workers_per_gather in {0,1,2,3,5}; report speedup and verify counts equal baseline.
+
+5) Duplicate‑heavy distributions
+- Create skewed data with few distinct b values (e.g., Zipf or 95% in top 5 vals). Compare SMOL(b,a) vs BTREE(b INCLUDE a) for b > thresh near the heavy mode and for equality on a; watch per‑leaf group emission cost.
+
+6) Page‑boundary adversarial batches
+- Seed data so that b transitions exactly at page capacity boundaries (e.g., count per distinct b equals floor(keys_per_leaf)). Ensure scanning across rightlinks is smooth (no duplicates or gaps) and measure impact.
+
+Implementation notes for benches
+- Extend bench/smol_vs_btree.sh with optional flags:
+  - EQUAL_ON_A=val to add AND a = val when comparing two‑col.
+  - SWEEP=percentiles (e.g., 10,50,90,99) to iterate THRESH automatically based on table stats.
+  - WORKERS=n to run the same query under several parallel settings and emit one CSV row per setting.
+- Keep timeouts as is; split long maintenance into separate statements as already done.
+
+### What these catch (mapping to SMOL internals)
+- Boundaries/negatives/strict vs non‑strict: smol_cmp_keyptr_bound, binary‑search seek, strict flag.
+- Duplicates/grouping: two‑col per‑leaf group headers and k2 array packing; single‑col packed payload counts.
+- Page chains: rightlink linkage and pinned‑page iteration across leaves.
+- Internal descent: smol_find_first_leaf child selection via highkeys on height ≥ 2.
+- Backward scans: reverse iteration logic for cur_off and page transitions.
+- Parallel scans: DSM curr atomic claim protocol; no double claims, no missed leaves.
+- Rescans: smol_rescan rebinds keys without leaking old state.
+
+All of the above are designed to be either small and fast or optional heavies, respecting our regression speed policy while raising coverage and confidence.
 - In two-col leaf packing, bulk-memcpy `k2` when key_len2=8; otherwise use tight fixed-width copies (2/4). Reuse a single scratch buffer per page to avoid repeated palloc/free.
 - Link leaf right-siblings by keeping the previous leaf pinned: set its rightlink once the next leaf is allocated, then release; avoid reopen/lock of the previous leaf.
 - To demonstrate multiplicative query speedups, make the workload I/O‑bound; keep
