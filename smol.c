@@ -239,6 +239,9 @@ typedef struct SmolScanOpaqueData
     uint16      itup_off2;      /* second-attr offset from data (two-col), else 0 */
     char        align1;         /* typalign for attr1 */
     char        align2;         /* typalign for attr2 (if any) */
+    /* fixed-size copy helpers to avoid per-row branches */
+    void      (*copy1_fn)(char *dst, const char *src);
+    void      (*copy2_fn)(char *dst, const char *src);
 
     /* lightweight profiling (enabled by smol.profile) */
     bool        prof_enabled;
@@ -253,6 +256,7 @@ typedef struct SmolScanOpaqueData
     int64      *leaf_k2;
     uint32      leaf_n;
     uint32      leaf_i;
+    uint32      leaf_cap;       /* capacity of leaf_k1/leaf_k2 arrays */
 } SmolScanOpaqueData;
 typedef SmolScanOpaqueData *SmolScanOpaque;
 
@@ -295,6 +299,9 @@ static char *smol2_k2_ptr(Page page, uint32 idx, uint16 key_len2, uint16 key_len
 static char *smol2_last_k1_ptr(Page page, uint16 key_len1);
 static int smol_cmp_k1_group(Page page, uint16 g, uint16 key_len1, Oid atttypid, int64 bound);
 static void smol2_build_leaf_cache(SmolScanOpaque so, Page page);
+static void smol_copy2(char *dst, const char *src);
+static void smol_copy4(char *dst, const char *src);
+static void smol_copy8(char *dst, const char *src);
 
 /* Page summary (diagnostic) */
 static void smol_log_page_summary(Relation idx);
@@ -842,6 +849,10 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         so->itup->t_info = (unsigned short) sz; /* no NULLs, no VARWIDTH */
         so->itup_data = (char *) so->itup + data_off;
         so->itup_off2 = so->two_col ? (uint16) (off2 - data_off) : 0;
+        /* set copy helpers */
+        so->copy1_fn = (so->key_len == 2) ? smol_copy2 : (so->key_len == 4) ? smol_copy4 : smol_copy8;
+        if (so->two_col)
+            so->copy2_fn = (so->key_len2 == 2) ? smol_copy2 : (so->key_len2 == 4) ? smol_copy4 : smol_copy8;
     }
     so->prof_enabled = smol_profile_log;
     so->prof_calls = 0;
@@ -1179,8 +1190,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 int64 v2 = so->leaf_k2[so->leaf_i];
                 if (so->have_k2_eq && v2 != so->k2_eq)
                 { so->leaf_i++; continue; }
-                if (so->key_len == 2) { int16 t=(int16)v1; memcpy(so->itup_data,&t,2);} else if (so->key_len==4){int32 t=(int32)v1; memcpy(so->itup_data,&t,4);} else { memcpy(so->itup_data,&v1,8);} 
-                if (so->key_len2 == 2) { int16 t=(int16)v2; memcpy(so->itup_data+so->itup_off2,&t,2);} else if (so->key_len2==4){int32 t=(int32)v2; memcpy(so->itup_data+so->itup_off2,&t,4);} else { memcpy(so->itup_data+so->itup_off2,&v2,8);} 
+                {
+                    if (so->key_len == 2) { int16 t=(int16)v1; so->copy1_fn(so->itup_data,(char*)&t);} 
+                    else if (so->key_len==4){ int32 t=(int32)v1; so->copy1_fn(so->itup_data,(char*)&t);} 
+                    else { so->copy1_fn(so->itup_data,(char*)&v1);} 
+                    if (so->key_len2 == 2) { int16 t2=(int16)v2; so->copy2_fn(so->itup_data+so->itup_off2,(char*)&t2);} 
+                    else if (so->key_len2==4){ int32 t2=(int32)v2; so->copy2_fn(so->itup_data+so->itup_off2,(char*)&t2);} 
+                    else { so->copy2_fn(so->itup_data+so->itup_off2,(char*)&v2);} 
+                }
                 scan->xs_itup = so->itup;
                 ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                 so->leaf_i++;
@@ -1214,9 +1231,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         /* c == 0: emit normally */
                     }
-                    if (so->key_len == 2) memcpy(so->itup_data, keyp, 2);
-                    else if (so->key_len == 4) memcpy(so->itup_data, keyp, 4);
-                    else memcpy(so->itup_data, keyp, 8);
+                    so->copy1_fn(so->itup_data, keyp);
                     if (so->prof_enabled)
                         so->prof_bytes += (uint64) so->key_len;
                     scan->xs_itup = so->itup;
@@ -1247,9 +1262,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         /* c == 0: emit normally */
                     }
-                    if (so->key_len == 2) memcpy(so->itup_data, keyp, 2);
-                    else if (so->key_len == 4) memcpy(so->itup_data, keyp, 4);
-                    else memcpy(so->itup_data, keyp, 8);
+                    so->copy1_fn(so->itup_data, keyp);
                     if (so->prof_enabled)
                         so->prof_bytes += (uint64) so->key_len;
                     scan->xs_itup = so->itup;
@@ -1300,8 +1313,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
         else
         {
-            op = smol_page_opaque(page);
-            next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
+        op = smol_page_opaque(page);
+        next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
+        /* Prefetch the next leaf (forward scans) to overlap I/O */
+        if (dir != BackwardScanDirection && BlockNumberIsValid(next))
+            PrefetchBuffer(idx, MAIN_FORKNUM, next);
         }
         if (so->have_pin && BufferIsValid(buf))
         {
@@ -2253,12 +2269,70 @@ smol2_build_leaf_cache(SmolScanOpaque so, Page page)
             }
         }
         smol2_group_offcnt(page, gi, so->key_len, &off, &cnt);
-        total += cnt;
+        if (so->have_k2_eq)
+        {
+            /* binary-search [off, off+cnt) for k2 == so->k2_eq */
+            char *k2b = smol2_k2_base(page, so->key_len, ng);
+            uint32 lo = 0, hi = (cnt > 0) ? (uint32)(cnt - 1) : 0, first = cnt, last = cnt;
+            /* find first >= k2_eq */
+            while (lo <= hi && cnt > 0)
+            {
+                uint32 mid = lo + ((hi - lo) >> 1);
+                char *p = k2b + ((size_t)(off + mid) * so->key_len2);
+                int64 v;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, p, 2); v = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, p, 4); v = (int64) t; }
+                else { int64 t; memcpy(&t, p, 8); v = t; }
+                int c = (v > so->k2_eq) - (v < so->k2_eq);
+                if (c >= 0) { first = mid; if (mid == 0) break; hi = mid - 1; } else lo = mid + 1;
+            }
+            if (first == cnt)
+                continue; /* none >= */
+            /* check equality and find last <= k2_eq */
+            {
+                char *pf = k2b + ((size_t)(off + first) * so->key_len2);
+                int64 vf;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, pf, 2); vf = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, pf, 4); vf = (int64) t; }
+                else { int64 t; memcpy(&t, pf, 8); vf = t; }
+                if (vf != so->k2_eq)
+                    continue; /* no equals in this group */
+            }
+            lo = first; hi = (uint32)(cnt - 1); last = first;
+            while (lo <= hi)
+            {
+                uint32 mid = lo + ((hi - lo) >> 1);
+                char *p = k2b + ((size_t)(off + mid) * so->key_len2);
+                int64 v;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, p, 2); v = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, p, 4); v = (int64) t; }
+                else { int64 t; memcpy(&t, p, 8); v = t; }
+                int c = (v > so->k2_eq) - (v < so->k2_eq);
+                if (c <= 0) { last = mid; if (mid == UINT32_MAX) break; lo = mid + 1; } else { if (mid == 0) break; hi = mid - 1; }
+            }
+            total += (last - first + 1);
+        }
+        else
+        {
+            total += cnt;
+        }
     }
-    if (so->leaf_k1) pfree(so->leaf_k1);
-    if (so->leaf_k2) pfree(so->leaf_k2);
-    so->leaf_k1 = (int64 *) palloc(total * sizeof(int64));
-    so->leaf_k2 = (int64 *) palloc(total * sizeof(int64));
+    if (total > so->leaf_cap)
+    {
+        /* grow capacity (double or fit exactly) */
+        uint32 newcap = (so->leaf_cap == 0 ? total : (so->leaf_cap * 2));
+        if (newcap < total) newcap = total;
+        if (so->leaf_k1)
+            so->leaf_k1 = (int64 *) repalloc(so->leaf_k1, (Size) newcap * sizeof(int64));
+        else
+            so->leaf_k1 = (int64 *) palloc((Size) newcap * sizeof(int64));
+        if (so->leaf_k2)
+            so->leaf_k2 = (int64 *) repalloc(so->leaf_k2, (Size) newcap * sizeof(int64));
+        else
+            so->leaf_k2 = (int64 *) palloc((Size) newcap * sizeof(int64));
+        so->leaf_cap = newcap;
+    }
+    /* arrays already allocated large enough */
     so->leaf_n = total;
     so->leaf_i = 0;
     char *k2b = smol2_k2_base(page, so->key_len, ng);
@@ -2290,16 +2364,68 @@ smol2_build_leaf_cache(SmolScanOpaque so, Page page)
         else if (so->key_len == 4) { int32 t; memcpy(&t, gk1, 4); v1 = (int64) t; }
         else { int64 t; memcpy(&t, gk1, 8); v1 = t; }
         uint32 off; uint16 cnt; smol2_group_offcnt(page, gi, so->key_len, &off, &cnt);
-        for (uint32 j = 0; j < cnt; j++)
+        if (so->have_k2_eq)
         {
-            char *k2p = k2b + ((size_t)(off + j) * so->key_len2);
-            int64 v2;
-            if (so->key_len2 == 2) { int16 t; memcpy(&t, k2p, 2); v2 = (int64) t; }
-            else if (so->key_len2 == 4) { int32 t; memcpy(&t, k2p, 4); v2 = (int64) t; }
-            else { int64 t; memcpy(&t, k2p, 8); v2 = t; }
-            so->leaf_k1[idx] = v1;
-            so->leaf_k2[idx] = v2;
-            idx++;
+            uint32 lo = 0, hi = (cnt > 0) ? (uint32)(cnt - 1) : 0, first = cnt, last = cnt;
+            while (lo <= hi && cnt > 0)
+            {
+                uint32 mid = lo + ((hi - lo) >> 1);
+                char *p = k2b + ((size_t)(off + mid) * so->key_len2);
+                int64 v;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, p, 2); v = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, p, 4); v = (int64) t; }
+                else { int64 t; memcpy(&t, p, 8); v = t; }
+                int c = (v > so->k2_eq) - (v < so->k2_eq);
+                if (c >= 0) { first = mid; if (mid == 0) break; hi = mid - 1; } else lo = mid + 1;
+            }
+            if (first != cnt)
+            {
+                char *pf = k2b + ((size_t)(off + first) * so->key_len2);
+                int64 vf;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, pf, 2); vf = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, pf, 4); vf = (int64) t; }
+                else { int64 t; memcpy(&t, pf, 8); vf = t; }
+                if (vf == so->k2_eq)
+                {
+                    lo = first; hi = (uint32)(cnt - 1); last = first;
+                    while (lo <= hi)
+                    {
+                        uint32 mid = lo + ((hi - lo) >> 1);
+                        char *p = k2b + ((size_t)(off + mid) * so->key_len2);
+                        int64 v;
+                        if (so->key_len2 == 2) { int16 t; memcpy(&t, p, 2); v = (int64) t; }
+                        else if (so->key_len2 == 4) { int32 t; memcpy(&t, p, 4); v = (int64) t; }
+                        else { int64 t; memcpy(&t, p, 8); v = t; }
+                        int c = (v > so->k2_eq) - (v < so->k2_eq);
+                        if (c <= 0) { last = mid; if (mid == UINT32_MAX) break; lo = mid + 1; } else { if (mid == 0) break; hi = mid - 1; }
+                    }
+                    for (uint32 j = first; j <= last; j++)
+                    {
+                        char *k2p = k2b + ((size_t)(off + j) * so->key_len2);
+                        int64 v2;
+                        if (so->key_len2 == 2) { int16 t; memcpy(&t, k2p, 2); v2 = (int64) t; }
+                        else if (so->key_len2 == 4) { int32 t; memcpy(&t, k2p, 4); v2 = (int64) t; }
+                        else { int64 t; memcpy(&t, k2p, 8); v2 = t; }
+                        so->leaf_k1[idx] = v1;
+                        so->leaf_k2[idx] = v2;
+                        idx++;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (uint32 j = 0; j < cnt; j++)
+            {
+                char *k2p = k2b + ((size_t)(off + j) * so->key_len2);
+                int64 v2;
+                if (so->key_len2 == 2) { int16 t; memcpy(&t, k2p, 2); v2 = (int64) t; }
+                else if (so->key_len2 == 4) { int32 t; memcpy(&t, k2p, 4); v2 = (int64) t; }
+                else { int64 t; memcpy(&t, k2p, 8); v2 = t; }
+                so->leaf_k1[idx] = v1;
+                so->leaf_k2[idx] = v2;
+                idx++;
+            }
         }
     }
 }
@@ -2874,3 +3000,7 @@ smol_parallel_sort_worker(Datum arg)
     dsm_detach(seg);
     proc_exit(0);
 }
+/* fixed-size copy helpers */
+static void smol_copy2(char *dst, const char *src) { memcpy(dst, src, 2); }
+static void smol_copy4(char *dst, const char *src) { memcpy(dst, src, 4); }
+static void smol_copy8(char *dst, const char *src) { memcpy(dst, src, 8); }
