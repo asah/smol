@@ -62,6 +62,7 @@ static double smol_cost_page = 0.02;
 static double smol_cost_tup = 0.002;
 static double smol_selec_eq = 0.01;
 static double smol_selec_range = 0.10;
+static int  smol_parallel_claim_batch = 1; /* number of leaves to reserve per atomic claim */
 extern int maintenance_work_mem;
 
 #if SMOL_TRACE
@@ -150,6 +151,14 @@ _PG_init(void)
                              0.10, 0.0, 1.0,
                              PGC_USERSET, 0,
                              NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.parallel_claim_batch",
+                            "Number of leaves reserved per parallel claim",
+                            "Higher values reduce atomic contention by reserving multiple rightlinked leaves per worker claim.",
+                            &smol_parallel_claim_batch,
+                            1, 1, 32,
+                            PGC_USERSET, 0,
+                            NULL, NULL, NULL);
 }
 
 /* Global comparator context for 2-col row sorting (single-threaded build) */
@@ -321,6 +330,7 @@ typedef struct SmolScanOpaqueData
     uint64      prof_rows;      /* rows returned */
     uint64      prof_pages;     /* leaf pages visited */
     uint64      prof_bytes;     /* bytes copied into tuples */
+    uint64      prof_touched;   /* bytes of key/include touched/emitted (independent of copying) */
     uint64      prof_bsteps;    /* binary-search steps */
 
     /* two-col per-leaf cache to simplify correct emission */
@@ -329,6 +339,7 @@ typedef struct SmolScanOpaqueData
     uint32      leaf_n;
     uint32      leaf_i;
     uint32      leaf_cap;       /* capacity of leaf_k1/leaf_k2 arrays */
+    uint32      chunk_left;     /* parallel: leaves remaining in locally claimed chunk */
 } SmolScanOpaqueData;
 typedef SmolScanOpaqueData *SmolScanOpaque;
 
@@ -338,7 +349,7 @@ typedef SmolScanOpaqueData *SmolScanOpaque;
  * otherwise curr holds the next leaf blkno to claim; workers atomically swap to its rightlink. */
 typedef struct SmolParallelScan
 {
-    pg_atomic_uint32 curr;
+    pg_atomic_uint32 curr;    /* next leaf to claim (0 = init, InvalidBlockNumber = done) */
 } SmolParallelScan;
 
 /* Utilities */
@@ -359,6 +370,7 @@ static BlockNumber smol_rightmost_leaf(Relation idx);
 static BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
 static int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
 static int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, uint16 key_len, bool key_byval, Datum bound);
+static inline int smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp);
 static bytea *smol_options(Datum reloptions, bool validate);
 static bool smol_validate(Oid opclassoid);
 static uint16 smol_leaf_nitems(Page page);
@@ -374,6 +386,18 @@ static inline uint16 smol12_leaf_nrows(Page page)
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
     uint16 n; memcpy(&n, p, sizeof(uint16)); return n;
+}
+
+/* Fast-path comparator dispatcher: for common integer key types, avoid fmgr */
+static inline int
+smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
+{
+    if (so->have_bound && (so->atttypid == INT2OID || so->atttypid == INT4OID || so->atttypid == INT8OID))
+        return smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, (int64)
+                                     (so->atttypid == INT2OID ? (int64) DatumGetInt16(so->bound_datum)
+                                                              : so->atttypid == INT4OID ? (int64) DatumGetInt32(so->bound_datum)
+                                                                                        : DatumGetInt64(so->bound_datum)));
+    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
 }
 static inline char *smol12_row_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
 {
@@ -877,6 +901,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->have_bound = false;
     so->have_k1_eq = false;
     so->bound_strict = false;
+    so->chunk_left = 0;
     so->atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
     so->atttypid2 = (RelationGetDescr(index)->natts >= 2) ? TupleDescAttr(RelationGetDescr(index), 1)->atttypid : InvalidOid;
     /* read meta */
@@ -957,6 +982,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_rows = 0;
     so->prof_pages = 0;
     so->prof_bytes = 0;
+    so->prof_touched = 0;
     so->prof_bsteps = 0;
     scan->opaque = so;
     return scan;
@@ -978,6 +1004,7 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
     so->have_bound = false;
     so->have_k1_eq = false;
     so->have_k2_eq = false;
+    so->chunk_left = 0;
     if (keys && nkeys > 0)
     {
         for (int i = 0; i < nkeys; i++)
@@ -1017,8 +1044,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
     if (so->prof_enabled)
         so->prof_calls++;
 
-    if (!scan->xs_want_itup)
-        ereport(ERROR, (errmsg("smol supports index-only scans only")));
+    /* SMOL is IOS-only. However, if the executor does not require index
+     * attributes for this scan (xs_want_itup=false), we still support the
+     * scan and simply avoid materializing tuples to reduce CPU work. */
     if (dir == NoMovementScanDirection)
         return false;
 
@@ -1052,7 +1080,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 while (so->cur_off >= FirstOffsetNumber)
                 {
                     char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
-                    if (smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum) <= 0)
+                    if (smol_cmp_keyptr_to_bound(so, keyp) <= 0)
                         break;
                     so->cur_off--;
                 }
@@ -1088,31 +1116,54 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
                             }
                             BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
-                            /* publish rightlink(left) so others don't also take left */
+                            /* publish rightlink(left) or skip ahead by batch-1 to reserve a local chunk */
                             Buffer lbuf = ReadBuffer(idx, left);
                             Page lpg = BufferGetPage(lbuf);
-                            BlockNumber rl = smol_page_opaque(lpg)->rightlink;
+                            BlockNumber step = smol_page_opaque(lpg)->rightlink;
+                            uint32 claimed = 0;
+                            for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                            {
+                                Buffer nb = ReadBuffer(idx, step);
+                                Page np = BufferGetPage(nb);
+                                BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                                ReleaseBuffer(nb);
+                                step = rl2;
+                                claimed++;
+                            }
                             ReleaseBuffer(lbuf);
                             uint32 expect = 0u;
-                            uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                            uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
-                            { so->cur_blk = left; break; }
+                            { so->cur_blk = left; so->chunk_left = claimed; break; }
                             continue;
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
-                        /* claim current */
+                        /* claim current and optionally skip ahead by batch-1 */
                         Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
                         Page tpg = BufferGetPage(tbuf);
-                        BlockNumber rl = smol_page_opaque(tpg)->rightlink;
+                        BlockNumber step = smol_page_opaque(tpg)->rightlink;
+                        uint32 claimed = 0;
+                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                        {
+                            Buffer nb = ReadBuffer(idx, step);
+                            Page np = BufferGetPage(nb);
+                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                            ReleaseBuffer(nb);
+                            step = rl2;
+                            claimed++;
+                        }
                         ReleaseBuffer(tbuf);
                         uint32 expected = curv;
-                        uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                         if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
-                        { so->cur_blk = (BlockNumber) curv; break; }
+                        { so->cur_blk = (BlockNumber) curv; so->chunk_left = claimed; break; }
                     }
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
+                    /* prefetch the first claimed leaf */
+                    if (BlockNumberIsValid(so->cur_blk))
+                        PrefetchBuffer(idx, MAIN_FORKNUM, so->cur_blk);
                     if (BlockNumberIsValid(so->cur_blk))
                     {
                         buf = ReadBuffer(idx, so->cur_blk);
@@ -1127,7 +1178,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             {
                                 uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
                                 char *kp2 = smol_leaf_keyptr(page, mid2, so->key_len);
-                                int cc = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, kp2, so->key_len, so->key_byval, so->bound_datum);
+                                int cc = smol_cmp_keyptr_to_bound(so, kp2);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
                                 else lo2 = (uint16) (mid2 + 1);
@@ -1156,7 +1207,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                             char *keyp = smol_leaf_keyptr(page, mid, so->key_len);
-                            int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+                            int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
                             else lo = (uint16) (mid + 1);
@@ -1196,30 +1247,51 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                             Buffer lbuf = ReadBuffer(idx, left);
                             Page lpg = BufferGetPage(lbuf);
-                            BlockNumber rl = smol_page_opaque(lpg)->rightlink;
+                            BlockNumber step = smol_page_opaque(lpg)->rightlink;
+                            uint32 claimed = 0;
+                            for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                            {
+                                Buffer nb = ReadBuffer(idx, step);
+                                Page np = BufferGetPage(nb);
+                                BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                                ReleaseBuffer(nb);
+                                step = rl2;
+                                claimed++;
+                            }
                             ReleaseBuffer(lbuf);
                             uint32 expect = 0u;
-                            uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                            uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
-                            { so->cur_blk = left; break; }
+                            { so->cur_blk = left; so->chunk_left = claimed; break; }
                             continue;
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
                         Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
                         Page tpg = BufferGetPage(tbuf);
-                        BlockNumber rl = smol_page_opaque(tpg)->rightlink;
+                        BlockNumber step = smol_page_opaque(tpg)->rightlink;
+                        uint32 claimed = 0;
+                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                        {
+                            Buffer nb = ReadBuffer(idx, step);
+                            Page np = BufferGetPage(nb);
+                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                            ReleaseBuffer(nb);
+                            step = rl2;
+                            claimed++;
+                        }
                         ReleaseBuffer(tbuf);
                         uint32 expected = curv;
-                        uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
+                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                         if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
-                        { so->cur_blk = (BlockNumber) curv; break; }
+                        { so->cur_blk = (BlockNumber) curv; so->chunk_left = claimed; break; }
                     }
                     so->cur_group = 0;
                     so->pos_in_group = 0;
                     so->initialized = true;
                     if (BlockNumberIsValid(so->cur_blk))
                     {
+                        PrefetchBuffer(idx, MAIN_FORKNUM, so->cur_blk);
                         buf = ReadBuffer(idx, so->cur_blk);
                         page = BufferGetPage(buf);
                         so->cur_buf = buf; so->have_pin = true;
@@ -1231,7 +1303,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             {
                                 uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                                 char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2);
-                                int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, k1p, so->key_len, so->key_byval, so->bound_datum);
+                                int c = smol_cmp_keyptr_to_bound(so, k1p);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
                                 else lo = (uint16) (mid + 1);
@@ -1258,7 +1330,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                             char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2);
-                            int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, k1p, so->key_len, so->key_byval, so->bound_datum);
+                            int c = smol_cmp_keyptr_to_bound(so, k1p);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
                             else lo = (uint16) (mid + 1);
@@ -1300,7 +1372,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 /* Enforce leading-key bound per row for correctness */
                 if (so->have_bound)
                 {
-                    int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, k1p, so->key_len, so->key_byval, so->bound_datum);
+                    int c = smol_cmp_keyptr_to_bound(so, k1p);
                     if (so->bound_strict ? (c <= 0) : (c < 0))
                     { so->leaf_i++; continue; }
                     if (so->have_k1_eq && c > 0)
@@ -1317,15 +1389,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     { so->leaf_i++; continue; }
                 }
                 /* Optimized copies for common fixed lengths; fallback for others */
-                if (so->key_len == 2) so->copy1_fn(so->itup_data, k1p);
-                else if (so->key_len == 4) so->copy1_fn(so->itup_data, k1p);
-                else if (so->key_len == 8) so->copy1_fn(so->itup_data, k1p);
+                if (so->key_len == 2) smol_copy2(so->itup_data, k1p);
+                else if (so->key_len == 4) smol_copy4(so->itup_data, k1p);
+                else if (so->key_len == 8) smol_copy8(so->itup_data, k1p);
                 else if (so->key_len == 16) smol_copy16(so->itup_data, k1p);
                 else smol_copy_small(so->itup_data, k1p, so->key_len);
 
-                if (so->key_len2 == 2) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
-                else if (so->key_len2 == 4) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
-                else if (so->key_len2 == 8) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
+                if (so->key_len2 == 2) smol_copy2(so->itup_data + so->itup_off2, k2p);
+                else if (so->key_len2 == 4) smol_copy4(so->itup_data + so->itup_off2, k2p);
+                else if (so->key_len2 == 8) smol_copy8(so->itup_data + so->itup_off2, k2p);
                 else if (so->key_len2 == 16) smol_copy16(so->itup_data + so->itup_off2, k2p);
                 else smol_copy_small(so->itup_data + so->itup_off2, k2p, so->key_len2);
                 scan->xs_itup = so->itup; ItemPointerSet(&(scan->xs_heaptid), 0, 1);
@@ -1345,7 +1417,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
                     if (so->have_k1_eq)
                     {
-                            int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+                            int c = smol_cmp_keyptr_to_bound(so, keyp);
                         if (c < 0)
                         {
                             /* Past the equality run when scanning backward: terminate overall */
@@ -1360,29 +1432,37 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         /* c == 0: emit normally */
                     }
-                    if (so->key_len == 2) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 4) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 8) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
-                    else smol_copy_small(so->itup_data, keyp, so->key_len);
+                    if (scan->xs_want_itup)
+                    {
+                        if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
+                        else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
+                        else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
+                        else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                        else smol_copy_small(so->itup_data, keyp, so->key_len);
+                    }
                     /* copy INCLUDE attrs */
-                    if (so->ninclude > 0)
+                    if (scan->xs_want_itup && so->ninclude > 0)
                     {
                         uint16 n2 = smol_leaf_nitems(page);
                         uint32 row = (uint32) (so->cur_off - 1);
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
             char *ip = smol1_inc_ptr(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-            if (so->inc_len[ii] == 2) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
-            else if (so->inc_len[ii] == 4) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
-            else if (so->inc_len[ii] == 8) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            if (so->inc_len[ii] == 2) smol_copy2(so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 4) smol_copy4(so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 8) smol_copy8(so->itup_data + so->inc_offs[ii], ip);
             else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
             else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
         }
                     }
                     if (so->prof_enabled)
-                        so->prof_bytes += (uint64) so->key_len;
-                    scan->xs_itup = so->itup;
+                    {
+                        if (scan->xs_want_itup)
+                            so->prof_bytes += (uint64) so->key_len;
+                        so->prof_touched += (uint64) so->key_len;
+                    }
+                    if (scan->xs_want_itup)
+                        scan->xs_itup = so->itup;
                     ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                     so->cur_off--;
                     if (so->prof_enabled) so->prof_rows++;
@@ -1396,7 +1476,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
                     if (so->have_k1_eq)
                     {
-                            int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+                            int c = smol_cmp_keyptr_to_bound(so, keyp);
                         if (c > 0)
                         {
                             /* We've moved past the equality run on this page; advance to next leaf */
@@ -1410,28 +1490,37 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         /* c == 0: emit normally */
                     }
-                    if (so->key_len == 2) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 4) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 8) so->copy1_fn(so->itup_data, keyp);
-                    else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
-                    else smol_copy_small(so->itup_data, keyp, so->key_len);
+                    if (scan->xs_want_itup)
+                    {
+                        if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
+                        else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
+                        else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
+                        else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                        else smol_copy_small(so->itup_data, keyp, so->key_len);
+                    }
                     if (so->ninclude > 0)
+                    if (scan->xs_want_itup)
                     {
                         uint16 n2 = n;
                         uint32 row = (uint32) (so->cur_off - 1);
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
             char *ip = smol1_inc_ptr(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-            if (so->inc_len[ii] == 2) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
-            else if (so->inc_len[ii] == 4) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
-            else if (so->inc_len[ii] == 8) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            if (so->inc_len[ii] == 2) smol_copy2(so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 4) smol_copy4(so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 8) smol_copy8(so->itup_data + so->inc_offs[ii], ip);
             else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
             else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
         }
                     }
                     if (so->prof_enabled)
-                        so->prof_bytes += (uint64) so->key_len;
-                    scan->xs_itup = so->itup;
+                    {
+                        if (scan->xs_want_itup)
+                            so->prof_bytes += (uint64) so->key_len;
+                        so->prof_touched += (uint64) so->key_len;
+                    }
+                    if (scan->xs_want_itup)
+                        scan->xs_itup = so->itup;
                     ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                     so->cur_off++;
                     if (so->prof_enabled) so->prof_rows++;
@@ -1442,47 +1531,88 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         /* advance to next leaf */
         if (scan->parallel_scan && dir != BackwardScanDirection)
-            {
+        {
             SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
-            for (;;)
+            /* If we reserved a local chunk, take the next rightlink without touching shared state. */
+            if (so->chunk_left > 0)
             {
-                uint32 curv = pg_atomic_read_u32(&ps->curr);
-                if (curv == 0u)
+                op = smol_page_opaque(page);
+                next = op->rightlink;
+                so->chunk_left--;
+                if (BlockNumberIsValid(next))
+                    PrefetchBuffer(idx, MAIN_FORKNUM, next);
+            }
+            else
+            {
+                for (;;)
                 {
-                    int64 lb;
-                    if (so->have_bound)
+                    uint32 curv = pg_atomic_read_u32(&ps->curr);
+                    if (curv == 0u)
                     {
-                        if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
-                        else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
-                        else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                        int64 lb;
+                        if (so->have_bound)
+                        {
+                            if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                            else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                            else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                            else lb = PG_INT64_MIN;
+                        }
                         else lb = PG_INT64_MIN;
+                        BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                        Buffer lbuf = ReadBuffer(idx, left);
+                        Page lpg = BufferGetPage(lbuf);
+                        BlockNumber step = smol_page_opaque(lpg)->rightlink;
+                        uint32 claimed = 0;
+                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                        {
+                            Buffer nb = ReadBuffer(idx, step);
+                            Page np = BufferGetPage(nb);
+                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                            ReleaseBuffer(nb);
+                            step = rl2;
+                            claimed++;
+                        }
+                        ReleaseBuffer(lbuf);
+                        uint32 expect = 0u;
+                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                        if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
+                        {
+                            next = left;
+                            so->chunk_left = claimed;
+                            if (BlockNumberIsValid(next))
+                                PrefetchBuffer(idx, MAIN_FORKNUM, next);
+                            break;
+                        }
+                        continue;
                     }
-                    else lb = PG_INT64_MIN;
-                    BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
-                    Buffer lbuf = ReadBuffer(idx, left);
-                    Page lpg = BufferGetPage(lbuf);
-                    BlockNumber rl = smol_page_opaque(lpg)->rightlink;
-                    ReleaseBuffer(lbuf);
-                    uint32 expect = 0u;
-                    uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
-                    if (pg_atomic_compare_exchange_u32(&ps->curr, &expect, newv))
+                    if (curv == (uint32) InvalidBlockNumber)
+                    { next = InvalidBlockNumber; break; }
+                    /* Read rightlink to publish next (batch skip) */
+                    Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
+                    Page tpg = BufferGetPage(tbuf);
+                    BlockNumber step = smol_page_opaque(tpg)->rightlink;
+                    uint32 claimed = 0;
+                    for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
                     {
-                        next = left;
+                        Buffer nb = ReadBuffer(idx, step);
+                        Page np = BufferGetPage(nb);
+                        BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                        ReleaseBuffer(nb);
+                        step = rl2;
+                        claimed++;
+                    }
+                    ReleaseBuffer(tbuf);
+                    uint32 expected = curv;
+                    uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                    if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
+                    {
+                        next = (BlockNumber) curv;
+                        so->chunk_left = claimed;
+                        if (BlockNumberIsValid(next))
+                            PrefetchBuffer(idx, MAIN_FORKNUM, next);
                         break;
                     }
-                    continue;
                 }
-                if (curv == (uint32) InvalidBlockNumber)
-                { next = InvalidBlockNumber; break; }
-                /* Read rightlink to publish next */
-                Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
-                Page tpg = BufferGetPage(tbuf);
-                BlockNumber rl = smol_page_opaque(tpg)->rightlink;
-                ReleaseBuffer(tbuf);
-                uint32 expected = curv;
-                uint32 newv = (uint32) (BlockNumberIsValid(rl) ? rl : InvalidBlockNumber);
-                if (pg_atomic_compare_exchange_u32(&ps->curr, &expected, newv))
-                { next = (BlockNumber) curv; break; }
             }
         }
         else
@@ -1524,7 +1654,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                         char *k1p = smol12_row_k1_ptr(np, mid, so->key_len, so->key_len2);
-                        int c = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, k1p, so->key_len, so->key_byval, so->bound_datum);
+                        int c = smol_cmp_keyptr_to_bound(so, k1p);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
                         else lo = (uint16) (mid + 1);
@@ -1543,7 +1673,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
                         char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
-                        int cc = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, kp2, so->key_len, so->key_byval, so->bound_datum);
+                        int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
                         else lo2 = (uint16) (mid2 + 1);
@@ -1560,7 +1690,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
                         char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
-                        int cc = smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, kp2, so->key_len, so->key_byval, so->bound_datum);
+                        int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (cc > 0) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
                         else lo2 = (uint16) (mid2 + 1);
@@ -1595,11 +1725,12 @@ smol_endscan(IndexScanDesc scan)
         if (so->itup)
             pfree(so->itup);
         if (so->prof_enabled)
-            elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu binsearch_steps=%lu",
+            elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu",
                  (unsigned long) so->prof_calls,
                  (unsigned long) so->prof_rows,
                  (unsigned long) so->prof_pages,
                  (unsigned long) so->prof_bytes,
+                 (unsigned long) so->prof_touched,
                  (unsigned long) so->prof_bsteps);
         pfree(so);
     }

@@ -16,16 +16,33 @@ KILL_AFTER=${KILL_AFTER:-5}
 DBNAME=${DBNAME:-postgres}
 TBL=${TBL:-gap_bench}
 
+# Inherit SMOL profiling across all psql sessions by setting PGOPTIONS
+if [ "${SMOL_PROFILE:-0}" = "1" ]; then export PGOPTIONS="-c smol.profile=on"; fi
 PSQL="/usr/local/pgsql/bin/psql -X -v ON_ERROR_STOP=1 -d ${DBNAME} -qAt"
 PSQL_TMO="timeout -k ${KILL_AFTER}s ${TIMEOUT_SEC}s ${PSQL}"
 
 # Session GUCs
 ${PSQL_TMO} -c "SET client_min_messages=warning" >/dev/null
+if [ "${SMOL_PROFILE:-0}" = "1" ]; then
+  ${PSQL_TMO} -c "SET smol.profile=on" >/dev/null
+fi
+if [ -n "${SMOL_CLAIM:-}" ]; then
+  ${PSQL_TMO} -c "SET smol.parallel_claim_batch=${SMOL_CLAIM}" >/dev/null
+fi
 ${PSQL_TMO} -c "SET max_parallel_workers_per_gather=${WORKERS}; SET max_parallel_workers=${WORKERS}; \
                 SET parallel_setup_cost=0; SET parallel_tuple_cost=0; \
                 SET min_parallel_index_scan_size=0; SET min_parallel_table_scan_size=0;" >/dev/null
 
 echo "Index,Type,Build_ms,Size_MB,Query_ms,Plan"
+
+# Validate selectivity range [0.0 .. 1.0]
+case "$SELECTIVITY" in
+  0|0.*|1|1.*) : ;; # we'll validate strictly below
+esac
+if [[ ! "$SELECTIVITY" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
+  echo "# ERROR: SELECTIVITY out of bounds: '$SELECTIVITY' (expected 0.0..1.0)" >&2
+  exit 2
+fi
 
 # Prepare schema
 ${PSQL_TMO} <<SQL

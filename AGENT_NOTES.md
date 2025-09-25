@@ -201,6 +201,18 @@ Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
 - Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).
 
+# Performance next steps (plan)
+- Enable microprofile counters: set `smol.profile=on` (now also via `SMOL_PROFILE=1` in bench scripts) to log per-scan calls/rows/pages/bytes/bsearch steps at `amendscan`.
+- Run quick sanity benches before long runs:
+  - Gap scenario: `SMOL_PROFILE=1 ROWS=1000000 make bench-gap-scenario` (reports size/time/plan; logs counters).
+  - Selectivity sweep: `SMOL_PROFILE=1 COMPACT=1 ROWS=5000000 COLS=1,2 WORKERS=0,5 make bench-smol-vs-btree`.
+- Inspect hotspots:
+  - Copy cost: counters `bytes_copied` vs time. If high, consider wider copies (8-byte moves are used; explore 16-byte when safe) and reducing redundant copies for INCLUDE.
+  - Comparator cost: `smol_cmp_keyptr_bound_generic` calls dominate bsearch; add type-specialized inline compares for builtin int2/4/8 to avoid fmgr calls.
+  - Page traversal: check `leaf_pages` and plan’s workers launched; tune prefetch (consider `PrefetchBuffer` on rightlink) and chunking in parallel path.
+- Executor interfacing: returning a pointer to on-page data isn’t viable because SMOL stores packed payloads, not `IndexTuple`s; keep prebuilt tuple but minimize per-tuple work and align copies.
+- Keep builds warning-free; measure with `EXPLAIN (ANALYZE, BUFFERS, TIMING ON)` and correlate with SMOL counters to choose next micro-optimizations.
+
 
 # Notes on read-only indexes
 

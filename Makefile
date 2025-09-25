@@ -75,6 +75,11 @@ build:
 	@set -euo pipefail; \
 	  $(MAKE) && $(MAKE) install
 
+deldata:
+	@echo "deleting $(PGDATA)..."
+	@set -euo pipefail; \
+	  /bin/rm -fr $(PGDATA)
+
 start:
 	@# chmod to fix perms for the postgres user - stupid hack
 	chmod 777 /workspace;
