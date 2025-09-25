@@ -54,7 +54,7 @@ dcodex:
 # Use these when you are already inside the smol Docker container.
 # ---------------------------------------------------------------------------
 
-.PHONY: buildclean build start stop psql pgcheck bench-smol-btree-5m bench-smol-vs-btree bench bench-all bench-gap-scenario
+.PHONY: buildclean build start stop psql pgcheck bench-smol-btree-5m bench-smol-vs-btree bench bench-all bench-gap-scenario bench-clean
 
 # Resolve PostgreSQL bin dir from PG_CONFIG
 PG_BIN := $(dir $(PG_CONFIG))
@@ -113,7 +113,7 @@ bench-smol-btree-5m: build start
 	@echo "Running SMOL vs BTREE benchmark (selectivity-based, single-key focus)"
 	@set -euo pipefail; \
       chmod +x bench/smol_vs_btree_selectivity.sh; \
-      su - postgres -c "env ROWS=$${ROWS:-5000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
+      su - postgres -c "env REUSE=$${REUSE:-1} ROWS=$${ROWS:-10000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
       echo "Benchmark finished; leaving PostgreSQL running. Use 'make stop' when done."
 
 # New, parameterized benchmark: SMOL vs BTREE with selectivity fraction and workers
@@ -122,7 +122,7 @@ bench-smol-vs-btree: build start
 	@echo "Running SMOL vs BTREE (selectivity-based)"
 	@set -euo pipefail; \
       chmod +x bench/smol_vs_btree_selectivity.sh; \
-      su - postgres -c "env ROWS=$${ROWS:-5000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
+      su - postgres -c "env REUSE=$${REUSE:-1} ROWS=$${ROWS:-10000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
       echo "Benchmark finished; leaving PostgreSQL running. Use 'make stop' when done."
 
 # Fast variant: assumes PostgreSQL is already running and extension is built/installed.
@@ -132,8 +132,22 @@ bench-smol-vs-btree-fast:
 	@echo "Running SMOL vs BTREE (fast, reuse mode)"
 	@set -euo pipefail; \
       chmod +x bench/smol_vs_btree_selectivity.sh; \
-      su - postgres -c "env REUSE=1 ROWS=$${ROWS:-5000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
-      echo "Fast benchmark finished; PostgreSQL left running. Use 'make stop' when done."
+      su - postgres -c "env REUSE=$${REUSE:-1} ROWS=$${ROWS:-10000000} COLTYPE=$${COLTYPE:-int2} COLS=$${COLS:-2} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-30} KILL_AFTER=$${KILL_AFTER:-5} BATCH=$${BATCH:-250000} bash /workspace/bench/smol_vs_btree_selectivity.sh"; \
+	  echo "Fast benchmark finished; PostgreSQL left running. Use 'make stop' when done."
+
+# Cleanup helper: drop all deterministic bench tables and related indexes by prefix
+bench-clean: start
+	@echo "Dropping bench tables matching 'bm_%' to reclaim space..."; \
+	set -euo pipefail; \
+	su - postgres -c "bash -lc '$(PG_BIN)psql -X -v ON_ERROR_STOP=1 -d postgres -qAt -c ''SELECT n.nspname||''.''||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind = ''\''r''\'' AND c.relname LIKE ''\''bm\\_%''\'';'' | awk '{print "DROP TABLE IF EXISTS "$0" CASCADE;"}' | $(PG_BIN)psql -X -v ON_ERROR_STOP=1 -d postgres -q'"; \
+	echo "Done."
+
+# Alternative cleanup that avoids Makefile quoting issues; runs a small script inside container
+.PHONY: bench-clean-alt
+bench-clean-alt: start
+	@echo "Dropping bench tables via bench/bench_clean.sh ..."; \
+	su - postgres -c "bash /workspace/bench/bench_clean.sh"; \
+	echo "Done."
 
 # Gap-maximizing scenario target (single-key int2, COUNT(*))
 bench-gap-scenario: build start
@@ -152,7 +166,7 @@ bench: build start
 	    for w in 1 2 5; do \
 	      rows=$$(( w * 10000000 )); \
 	      echo "# cols=$$cols sel=$$sel workers=$$w rows=$$rows"; \
-	      SEL=$$sel COLS=$$cols ROWS=$$rows COLTYPE=$${COLTYPE:-int2} WORKERS=$$w COMPACT=$${COMPACT:-1} TBL=mm_bench_$$cols $(MAKE) bench-smol-vs-btree-fast; \
+	      SEL=$$sel COLS=$$cols ROWS=$$rows COLTYPE=$${COLTYPE:-int2} WORKERS=$$w COMPACT=$${COMPACT:-1} REUSE=$${REUSE:-1} $(MAKE) bench-smol-vs-btree-fast; \
 	    done; \
 	  done; \
 	done; \
@@ -166,10 +180,10 @@ bench-all: build start
 	SELS="0.0,0.1,0.25,0.5,0.75,0.9,0.95,0.99,1.0"; \
 	for rows in 500000 5000000 50000000; do \
 	  for ctype in int2 int4 int8; do \
-	    for workers in 1,2,5; do \
+	    for w in 1 2 5; do \
 	      for cols in 1 2 4 8 16; do \
-	        echo "# rows=$$rows type=$$ctype workers=$$workers cols=$$cols"; \
-	        ROWS=$$rows COLTYPE=$$ctype WORKERS=$$workers COLS=$$cols SELECTIVITY=$$SELS $(MAKE) bench-smol-vs-btree; \
+	        echo "# rows=$$rows type=$$ctype workers=$$w cols=$$cols"; \
+	        ROWS=$$rows COLTYPE=$$ctype WORKERS=$$w COLS=$$cols SELECTIVITY=$$SELS REUSE=$${REUSE:-1} $(MAKE) bench-smol-vs-btree; \
 	      done; \
 	    done; \
 	  done; \

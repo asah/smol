@@ -1,4 +1,4 @@
-# smol — Simple Memory-Only Lightweight
+# smol — Simple Memory-Only Lightweight index
 # (a read‑only, space‑efficient PostgreSQL index access method)
 
 This document captures the architecture and operational overview of the

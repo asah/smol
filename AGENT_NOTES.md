@@ -118,6 +118,12 @@ Quick mental checklist
 - Collect → sort (proc 1, collations) → write metapage + data pages.
 - Mark heap blk 0 PD_ALL_VISIBLE then set VM bit with `visibilitymap_set`.
 - IOS only: enforce `xs_want_itup`; set a synthetic `xs_heaptid`.
+
+SIMD/Unrolled tuple materialization (2025-09-25)
+- Hot path amgettuple materialization uses unrolled fixed-size copies and 16B wide copies when aligned.
+- Implemented smol_copy2/4/8 with aligned word stores and fallback to memcpy; smol_copy16 uses a single 16B store when aligned or two 8B stores otherwise; smol_copy_small handles uncommon sizes and short tails.
+- Replaced memcpy in key and INCLUDE materialization where possible to reduce branch/memcpy overhead, notably benefiting uuid/int8 keys and INCLUDE lists.
+- Build is warning-free; regression passes. Sample bench (1M rows, int2, cols=1, sel=0.5, workers=5, compact) produced sane plans; expect gains to grow with larger tuples/INCLUDE.
 - No NULLs; no TIDs; read-only; ordered.
 
 ## Logging
