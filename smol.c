@@ -28,6 +28,7 @@
 #include "utils/guc.h"
 #include "utils/elog.h"
 #include <string.h>
+#include <stdint.h>
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "nodes/pathnodes.h"
@@ -385,9 +386,11 @@ static inline char *smol12_row_k1_ptr(Page page, uint16 row, uint16 key_len1, ui
 { return smol12_row_ptr(page, row, key_len1, key_len2) + 0; }
 static inline char *smol12_row_k2_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
 { return smol12_row_ptr(page, row, key_len1, key_len2) + key_len1; }
-static void smol_copy2(char *dst, const char *src);
-static void smol_copy4(char *dst, const char *src);
-static void smol_copy8(char *dst, const char *src);
+static inline void smol_copy2(char *dst, const char *src);
+static inline void smol_copy4(char *dst, const char *src);
+static inline void smol_copy8(char *dst, const char *src);
+static inline void smol_copy16(char *dst, const char *src);
+static inline void smol_copy_small(char *dst, const char *src, uint16 len);
 /* forward decls for normalizers */
 static inline uint64 smol_norm64(int64 v);
 static inline uint32 smol_norm32(int32 v);
@@ -1313,8 +1316,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     if (v != so->k2_eq)
                     { so->leaf_i++; continue; }
                 }
-                memcpy(so->itup_data, k1p, so->key_len);
-                memcpy(so->itup_data + so->itup_off2, k2p, so->key_len2);
+                /* Optimized copies for common fixed lengths; fallback for others */
+                if (so->key_len == 2) so->copy1_fn(so->itup_data, k1p);
+                else if (so->key_len == 4) so->copy1_fn(so->itup_data, k1p);
+                else if (so->key_len == 8) so->copy1_fn(so->itup_data, k1p);
+                else if (so->key_len == 16) smol_copy16(so->itup_data, k1p);
+                else smol_copy_small(so->itup_data, k1p, so->key_len);
+
+                if (so->key_len2 == 2) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
+                else if (so->key_len2 == 4) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
+                else if (so->key_len2 == 8) so->copy2_fn(so->itup_data + so->itup_off2, k2p);
+                else if (so->key_len2 == 16) smol_copy16(so->itup_data + so->itup_off2, k2p);
+                else smol_copy_small(so->itup_data + so->itup_off2, k2p, so->key_len2);
                 scan->xs_itup = so->itup; ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                 so->leaf_i++;
                 if (so->prof_enabled) { so->prof_rows++; so->prof_bytes += (uint64)(so->key_len + so->key_len2); }
@@ -1350,7 +1363,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     if (so->key_len == 2) so->copy1_fn(so->itup_data, keyp);
                     else if (so->key_len == 4) so->copy1_fn(so->itup_data, keyp);
                     else if (so->key_len == 8) so->copy1_fn(so->itup_data, keyp);
-                    else memcpy(so->itup_data, keyp, so->key_len);
+                    else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                    else smol_copy_small(so->itup_data, keyp, so->key_len);
                     /* copy INCLUDE attrs */
                     if (so->ninclude > 0)
                     {
@@ -1359,7 +1373,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
             char *ip = smol1_inc_ptr(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-            memcpy(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
+            if (so->inc_len[ii] == 2) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 4) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 8) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
+            else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
         }
                     }
                     if (so->prof_enabled)
@@ -1395,7 +1413,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     if (so->key_len == 2) so->copy1_fn(so->itup_data, keyp);
                     else if (so->key_len == 4) so->copy1_fn(so->itup_data, keyp);
                     else if (so->key_len == 8) so->copy1_fn(so->itup_data, keyp);
-                    else memcpy(so->itup_data, keyp, so->key_len);
+                    else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                    else smol_copy_small(so->itup_data, keyp, so->key_len);
                     if (so->ninclude > 0)
                     {
                         uint16 n2 = n;
@@ -1403,7 +1422,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
             char *ip = smol1_inc_ptr(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-            memcpy(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
+            if (so->inc_len[ii] == 2) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 4) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 8) so->inc_copy[ii](so->itup_data + so->inc_offs[ii], ip);
+            else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
+            else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
         }
                     }
                     if (so->prof_enabled)
@@ -2679,9 +2702,88 @@ smol_parallel_sort_worker(Datum arg)
     proc_exit(0);
 }
 /* fixed-size copy helpers */
-static void smol_copy2(char *dst, const char *src) { memcpy(dst, src, 2); }
-static void smol_copy4(char *dst, const char *src) { memcpy(dst, src, 4); }
-static void smol_copy8(char *dst, const char *src) { memcpy(dst, src, 8); }
+/*
+ * Hot-path copy helpers: favor unrolled fixed-size copies and aligned wide
+ * loads/stores to reduce memcpy/branch overhead. Fall back to memcpy for
+ * potentially-unaligned cases. These are small and declared inline to help
+ * the compiler optimize call sites.
+ */
+static inline void
+smol_copy2(char *dst, const char *src)
+{
+    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 1) == 0)
+        *(uint16_t *) dst = *(const uint16_t *) src;
+    else
+        memcpy(dst, src, 2);
+}
+
+static inline void
+smol_copy4(char *dst, const char *src)
+{
+    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 3) == 0)
+        *(uint32_t *) dst = *(const uint32_t *) src;
+    else
+        memcpy(dst, src, 4);
+}
+
+static inline void
+smol_copy8(char *dst, const char *src)
+{
+    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 7) == 0)
+        *(uint64_t *) dst = *(const uint64_t *) src;
+    else
+        memcpy(dst, src, 8);
+}
+
+/* Try a single 16-byte wide copy when both pointers are 16B-aligned. */
+static inline void
+smol_copy16(char *dst, const char *src)
+{
+    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 15) == 0)
+    {
+        struct vec16 { uint64_t a, b; };
+        *(struct vec16 *) dst = *(const struct vec16 *) src;
+    }
+    else
+    {
+        /* Two 8-byte copies are usually competitive; they handle alignment. */
+        smol_copy8(dst, src);
+        smol_copy8(dst + 8, src + 8);
+    }
+}
+
+/* Generic small copy for uncommon fixed lengths (<= 32). */
+static inline void
+smol_copy_small(char *dst, const char *src, uint16 len)
+{
+    switch (len)
+    {
+        case 1: *dst = *src; break;
+        case 2: smol_copy2(dst, src); break;
+        case 3: smol_copy2(dst, src); dst[2] = src[2]; break;
+        case 4: smol_copy4(dst, src); break;
+        case 5: smol_copy4(dst, src); dst[4] = src[4]; break;
+        case 6: smol_copy4(dst, src); smol_copy2(dst+4, src+4); break;
+        case 7: smol_copy4(dst, src); smol_copy2(dst+4, src+4); dst[6] = src[6]; break;
+        case 8: smol_copy8(dst, src); break;
+        case 9: smol_copy8(dst, src); dst[8] = src[8]; break;
+        case 10: smol_copy8(dst, src); smol_copy2(dst+8, src+8); break;
+        case 11: smol_copy8(dst, src); smol_copy2(dst+8, src+8); dst[10] = src[10]; break;
+        case 12: smol_copy8(dst, src); smol_copy4(dst+8, src+8); break;
+        case 13: smol_copy8(dst, src); smol_copy4(dst+8, src+8); dst[12] = src[12]; break;
+        case 14: smol_copy8(dst, src); smol_copy4(dst+8, src+8); smol_copy2(dst+12, src+12); break;
+        case 15: smol_copy8(dst, src); smol_copy4(dst+8, src+8); smol_copy2(dst+12, src+12); dst[14] = src[14]; break;
+        case 16: smol_copy16(dst, src); break;
+        default:
+            /* For larger but still small sizes, copy in 16B then tail. */
+            while (len >= 16) { smol_copy16(dst, src); dst += 16; src += 16; len -= 16; }
+            if (len >= 8) { smol_copy8(dst, src); dst += 8; src += 8; len -= 8; }
+            if (len >= 4) { smol_copy4(dst, src); dst += 4; src += 4; len -= 4; }
+            if (len >= 2) { smol_copy2(dst, src); dst += 2; src += 2; len -= 2; }
+            if (len) *dst = *src;
+            break;
+    }
+}
 /* Callback to collect single key + INCLUDE ints */
 static void
 smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
