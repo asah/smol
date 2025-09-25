@@ -72,3 +72,161 @@ CREATE OPERATOR CLASS int2_ops
         OPERATOR        3       = (int2, int8),
         OPERATOR        4       >= (int2, int8),
         OPERATOR        5       > (int2, int8);
+
+-- Additional fixed-length builtin types (by-value up to 8 bytes)
+
+CREATE OPERATOR CLASS oid_ops
+    DEFAULT FOR TYPE oid USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btoidcmp(oid,oid);
+
+CREATE OPERATOR CLASS float4_ops
+    DEFAULT FOR TYPE float4 USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btfloat4cmp(float4,float4);
+
+CREATE OPERATOR CLASS float8_ops
+    DEFAULT FOR TYPE float8 USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btfloat8cmp(float8,float8);
+
+CREATE OPERATOR CLASS date_ops
+    DEFAULT FOR TYPE date USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       date_cmp(date,date);
+
+CREATE OPERATOR CLASS timestamp_ops
+    DEFAULT FOR TYPE timestamp USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       timestamp_cmp(timestamp,timestamp);
+
+CREATE OPERATOR CLASS timestamptz_ops
+    DEFAULT FOR TYPE timestamptz USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       timestamptz_cmp(timestamptz,timestamptz);
+
+CREATE OPERATOR CLASS bool_ops
+    DEFAULT FOR TYPE bool USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btboolcmp(bool,bool);
+
+CREATE OPERATOR CLASS money_ops
+    DEFAULT FOR TYPE money USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       cash_cmp(money,money);
+
+-- Additional fixed-length builtin types
+
+CREATE OPERATOR CLASS uuid_ops
+    DEFAULT FOR TYPE uuid USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       uuid_cmp(uuid,uuid);
+
+CREATE OPERATOR CLASS macaddr_ops
+    DEFAULT FOR TYPE macaddr USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       macaddr_cmp(macaddr,macaddr);
+
+CREATE OPERATOR CLASS macaddr8_ops
+    DEFAULT FOR TYPE macaddr8 USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       macaddr8_cmp(macaddr8,macaddr8);
+
+CREATE OPERATOR CLASS name_ops
+    DEFAULT FOR TYPE name USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btnamecmp(name,name);
+
+CREATE OPERATOR CLASS char_ops
+    DEFAULT FOR TYPE "char" USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       btcharcmp("char","char");
+
+CREATE OPERATOR CLASS lsn_ops
+    DEFAULT FOR TYPE pg_lsn USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       pg_lsn_cmp(pg_lsn,pg_lsn);
+
+-- time/interval types (fixed-size)
+CREATE OPERATOR CLASS time_ops
+    DEFAULT FOR TYPE time USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       time_cmp(time,time);
+
+CREATE OPERATOR CLASS timetz_ops
+    DEFAULT FOR TYPE timetz USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       timetz_cmp(timetz,timetz);
+
+CREATE OPERATOR CLASS interval_ops
+    DEFAULT FOR TYPE interval USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       interval_cmp(interval,interval);

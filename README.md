@@ -5,9 +5,8 @@ This document captures the architecture and operational overview of the
 smol index access method. Code‑level notes live in `AGENT_NOTES.md`.
 
 Important
-- One container name: smol. Always use/reuse a single container named
-  `smol` for builds, tests, and benchmarks.
-- Always run in Docker. Host toolchains are unsupported.
+- One container name: smol. If using Docker, reuse a single container named
+  `smol` for builds, tests, and benchmarks (see d* targets). Bare Make targets also work outside Docker.
 
 Overview
 - Read‑only index AM optimized for index‑only scans on append‑only data.
@@ -35,25 +34,27 @@ Architecture
 Flags & Capabilities
 - `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`.
 - `amgetbitmap=NULL` (no bitmap scans).
-- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=false`.
+- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=true` (single‑key INCLUDE only).
 - `amstrategies=5` (<, <=, =, >=, >), `amsupport=1` (comparator proc 1).
 - `aminsert` ERROR (read‑only after build).
 
 Limitations
-- Read‑only; drop/recreate to change data.
-- Fixed‑width key types only; no varlena (text, bytea, numeric).
-- No NULL keys; no INCLUDE columns; not unique; not clusterable.
-- Prototype: no WAL/FSM crash‑safety yet.
+- Read-only; drop/recreate to change data.
+- Fixed-length key types only; no varlena (text, bytea, numeric).
+- Multi-column keys supported when all key attributes are fixed-length; correctness-first implementation (no bitmap scans; IOS only).
+- No NULL keys; not unique; not clusterable.
+- INCLUDE columns supported for single-key indexes with fixed-length INCLUDE attrs (not limited to integers).
+- Prototype: no WAL/FSM crash-safety yet.
 
-Build & Test (Docker, PostgreSQL 18 from source)
-- Build image: `make dockerbuild` (builds the image used by the `smol` container).
-- Use inside-container targets via a single container named `smol`:
-  - Clean build + install: `docker exec -it smol make insidebuild`
-  - Quick regression (build, start PG, run installcheck, stop PG):
-    - `docker exec -it smol make insidecheck`
-  - Start PostgreSQL (initdb if needed): `docker exec -it smol make insidestart`
-  - Stop PostgreSQL: `docker exec -it smol make insidestop`
-  - Benchmark (leaves PG running): `docker exec -it smol make insidebench-smol-btree-5m`
+Build & Test (PostgreSQL 18 from source)
+- Docker helpers: `make dbuild` builds the image; `make dstart` creates/runs the `smol` container; `make dexec` opens a shell; `make dpsql` opens psql.
+- Bare targets (inside or outside Docker):
+  - Clean build + install: `make build`
+  - Fast rebuild (no clean): `make rebuild`
+  - Quick regression (build, start PG, run installcheck, stop PG): `make check`
+  - Start PostgreSQL (initdb if needed): `make start`
+  - Stop PostgreSQL: `make stop`
+  - Benchmark: `make bench-smol-vs-btree`
 
 Usage
 - `CREATE EXTENSION smol;`
@@ -62,9 +63,9 @@ Usage
   are supported, but see notes below on deterministic correctness testing.
 
 Tests & Benchmarks
-- `docker exec -it smol make insidecheck` runs the regression suite and stops PG when done.
+- `make check` runs the regression suite and stops PG when done.
 - `sql/` contains correctness/regression tests (kept short).
-- `bench/` contains only benchmarks; stream output live via `docker exec -it smol make insidebench-smol-btree-5m` (use `insidestop` when finished).
+- `bench/` contains benchmarks; run `make bench-smol-vs-btree` (use `make stop` when finished).
 - Bench scripts enforce hard client timeouts (`TIMEOUT_SEC`, `KILL_AFTER`) and
   set a server-side `statement_timeout` slightly below `TIMEOUT_SEC` to avoid
   lingering backends when the client is killed by timeout.
@@ -72,8 +73,11 @@ Tests & Benchmarks
    `parallel_*` costs, and sets `min_parallel_*_scan_size=0` to consistently prefer up to 5‑way
    parallel Index Only Scans for both BTREE and SMOL. This makes parallel throughput benefits
    clear and comparable. For deterministic correctness checks, force single-worker.
+- Gap scenario (key-only COUNT): `make bench-gap-scenario` runs `bench/smol_gap_scenario.sh`.
+  - Schema: UNLOGGED table `gap_bench(b int2)`; indexes: BTREE(b) and SMOL(b); query: `COUNT(*) WHERE b > -1`.
+  - Purpose: emphasize SMOL’s density and IOS advantage with minimal aggregation overhead.
 
-Deterministic Correctness Check (Two‑Column)
+Deterministic Correctness Check (Multi‑Column Regression)
 - Some workloads (e.g., `GROUP BY a` on an index defined as SMOL(b,a)) can pick SMOL even without
   a leading‑key qual. To verify correctness deterministically:
   1. Choose `mode(a)` from a stable slice of the table, e.g., the first 100k rows by `ctid`.
@@ -92,8 +96,30 @@ Deterministic Correctness Check (Two‑Column)
    split into separate `CHECKPOINT`, `VACUUM`, and `ANALYZE` calls to respect statement timeouts.
 
 Operator Classes
-- int2_ops, int4_ops, int8_ops (fixed‑width only).
+- int2_ops, int4_ops, int8_ops, plus several fixed‑length builtins (oid, float4/float8, date, timestamp, timestamptz, bool) as provided in `smol--1.0.sql`.
 
 Roadmap
 - Add WAL/FSM, tune costs, expand opclass coverage, validate DESC/multi‑col
   behavior, optional compression.
+
+Benchmarking
+- Quick default (legacy): `make bench-smol-btree-5m` compares BTREE vs SMOL on 5M rows.
+- Selectivity-based: `make bench-smol-vs-btree` drives `bench/smol_vs_btree_selectivity.sh` and accepts:
+  - ROWS: number of rows (default 5_000_000)
+  - COLTYPE: `int2|int4|int8` (default int2)
+  - COLS: number of columns (default 2). COLS=1 creates a key-only table (b). COLS>1 creates b plus INCLUDE columns a1..a{COLS-1} for BTREE and SMOL.
+  - SELECTIVITY: comma list of fractions in [0.0..1.0]. For each s, the script regenerates data so that the predicate `b >= M` (M is the midpoint of the domain) matches approximately `s * ROWS` rows. Distribution: two random windows on either side of M (~25% of the domain wide) and one precise record at b=M so `s=0.0` yields exactly one match.
+  - WORKERS: comma list for `max_parallel_workers_per_gather` (e.g., `0,1,2,5`).
+  - TIMEOUT_SEC, KILL_AFTER, BATCH, CHUNK_MIN as before.
+- Curated set: `make bench` runs COLS={1,2} and SELECTIVITY in {0.1,0.5,0.9}.
+- Exhaustive matrix (heavy): `make bench-all` loops over `sel={0.0,0.1,0.25,0.5,0.75,0.9,0.95,0.99,1.0}`, `int2/4/8`, `workers=1/2/5`, `rows=500K/5M/50M`, and `cols=1/2/4/8/16`.
+- Output: CSV rows with index type, build time (ms), size (MB), query time (ms), and the EXPLAIN plan line; per-selectivity/worker sweeps are emitted inline.
+
+Development policy
+- Builds must be warning-free: `make build` and `make rebuild` should emit no compiler warnings. Remove unused code or fix signatures to satisfy this.
+
+psql in Docker
+- Always connect as the `postgres` OS user inside the container.
+- From host: run `make dpsql` to open psql as `postgres` in the `smol` container.
+- Inside container: run `make psql` or `su - postgres -c "/usr/local/pgsql/bin/psql"`.
+- If you run `psql` as `root`, PostgreSQL will error with `FATAL: role "root" does not exist`.

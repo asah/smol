@@ -6,10 +6,12 @@ PostgreSQL 18 index access method in this repo.
 Run Policy (Mandatory)
 - One container name only: `smol`. Always build, test, and benchmark using
   a single Docker container named `smol`; reuse it across runs.
-- Always run inside Docker. Build the image with `make dockerbuild`, then
-  run inside-container targets directly as `make <target>` (this agent runs
-  inside the `smol` container via `make dockercodex`). Do not attempt host
-  builds/tests; they are unsupported and prone to SDK/PG mismatches.
+- Preferred: use Docker helpers to ensure a clean PG18 toolchain. Build the image with `make dbuild`, then
+  run targets directly as `make <target>` (this agent can also run inside the `smol` container via `make dcodex`).
+  Bare targets work inside or outside Docker.
+- psql usage inside Docker: connect as the `postgres` OS user. From host, use `make dpsql`. Inside
+  the container, use `make psql` or `su - postgres -c "/usr/local/pgsql/bin/psql"`. Running `psql`
+  as `root` will fail with `FATAL: role "root" does not exist`.
 
 ## Goals & Constraints
 - Ordered semantics; read‑only index. Enforce read-only at the AM level
@@ -18,9 +20,22 @@ Run Policy (Mandatory)
 - No NULL support at all (CREATE INDEX errors on NULLs).
 - Fixed‑width key types only (no varlena such as `text`, `bytea`, `numeric`).
 - Prototype: no WAL/FSM yet; correctness over crash‑safety for now.
-- PostgreSQL 18; no INCLUDE columns; parallel scans stubbed (flag set; no
+- PostgreSQL 18; INCLUDE supported only for single-key indexes with fixed-width
+  integer INCLUDE attrs (int2/int4/int8); parallel scans stubbed (flag set; no
   DSM/chunking yet); no bitmap scan.
 - we are restarting this project to provide cleaner code, so these notes may contain info from the previous iteration(s). If you spot inconsistencies please propose cleanup to the user.
+
+Design memory (bench + planner)
+- Bench favors observing planner choices; no validity toggling or forced enable/disable in COMPACT mode. We print the leading scan node (and index) per query.
+- COMPACT times with EXPLAIN (ANALYZE, TIMING ON, BUFFERS OFF) and parses EXPLAIN (COSTS OFF) for plan text.
+- smol_costestimate tuned to reflect smaller pages + contiguous IOS: low per-page (smol.cost_page), cheap per-tuple (smol.cost_tup), heuristic selectivity for leading-key quals (smol.selec_eq/range), penalty for non-leading. All GUC-tunable.
+- BTREE IOS isn’t always optimal at high selectivity; bench reports actual choice (IOS vs Seq Scan) purely via costs.
+
+Gap scenario (key-only, COUNT(*))
+- Script: bench/smol_gap_scenario.sh; target: make bench-gap-scenario.
+- Schema: UNLOGGED TABLE gap_bench(b int2); indexes: BTREE(b), SMOL(b); query: COUNT(*) WHERE b > -1.
+- Example at 10M / 5 workers / sel=0.5: SMOL ~19 MB vs BTREE ~66 MB; SMOL ~63 ms vs BTREE ~99 ms (no forcing).
+- Optimizations ROI: SIMD copies (10–20%), batched leaf-claims (5–10% @5 workers), rightlink prefetch (2–5% warm-cache), group-aware emission (5–12% two-col).
 
 
 ## Architecture Overview
@@ -44,16 +59,16 @@ Run Policy (Mandatory)
 
 ## AM Flags & Behavior
 - `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amgetbitmap=NULL`.
-- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=false`.
+- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=true` (single-key INCLUDE only).
 - `amstrategies=5` (<, <=, =, >=, >); `amsupport=1` (comparator proc 1).
 - `aminsert` ERROR (read‑only after build).
 
-## Docker & Testing
-- Build image: `make dockerbuild` (image tag: `smol`).
-- Build+install extension: `make insidebuild`.
-- Quick regression (build, start PG, run installcheck, stop PG): `make insidecheck`.
-- Start/stop PostgreSQL in the container: `make insidestart` / `make insidestop`.
-- Run benchmark (leaves PG running): `make insidebench-smol-btree-5m`.
+## Build, Docker & Testing
+- Build image: `make dbuild` (image tag: `smol`).
+- Build+install extension: `make build`.
+- Quick regression (build, start PG, run installcheck, stop PG): `make check`.
+- Start/stop PostgreSQL: `make start` / `make stop`.
+- Run benchmark (leaves PG running): `make bench-smol-btree-5m` or `make bench-smol-vs-btree`.
 - Keep regression fast; correctness lives under `sql/`. `bench/` is for benchmarks only.
 - Server logs: `/tmp/pg.log` (or set a different path) inside the container.
 
@@ -63,7 +78,19 @@ Run Policy (Mandatory)
   - Lowers `parallel_setup_cost` and `parallel_tuple_cost` to 0.
   - Sets `min_parallel_index_scan_size=0` and `min_parallel_table_scan_size=0`.
 - This encourages the planner to use 5 workers for both BTREE and SMOL Index Only Scans.
-- The script also supports `COLTYPE=int2|int4|int8` and scales to ≥50M rows with `TIMEOUT_SEC>=30`.
+- The bench tooling supports `COLTYPE=int2|int4|int8` and scales to ≥50M rows with `TIMEOUT_SEC>=30`.
+
+## Selectivity-Based Benchmarks
+- Primary driver: `bench/smol_vs_btree_selectivity.sh` (used by `make insidebench-smol-vs-btree`).
+- Params: `ROWS`, `COLTYPE`, `COLS`, `SELECTIVITY` (comma list of fractions in [0..1]), `WORKERS` (comma list), plus timeout/insert tunables.
+- Data generation per selectivity s:
+  - Choose midpoint M (0) and two windows on either side of M, each ~25% of the domain wide.
+  - Insert approx `s*ROWS` rows in the upper window (matches for `b >= M`), remainder in lower window (non-matches), and one exact record at `b=M` so `s=0.0` yields exactly one match.
+  - For `COLS>1`, build b plus INCLUDE columns `a1..a{COLS-1}` with random values; compare BTREE(b) INCLUDE vs SMOL(b) INCLUDE.
+- Queries:
+  - Single-col: `SELECT count(*) FROM t WHERE b >= M` (implemented as `b > M-1`).
+  - With INCLUDE: `SELECT sum(a1)::bigint FROM t WHERE b >= M`.
+- Output: CSV per selectivity and worker including build ms, size MB, query ms, and plan line.
 
 ## Parallelism in SMOL
 - Scan: `amcanparallel=true` and the bench uses parallel IOS at query time. Shared-state chunking is
@@ -132,7 +159,7 @@ Key design choices and why
 Build path details and pitfalls
 - Use `table_index_build_scan(table_rel, index_rel, index_info, ..., smol_build_callback, state, scan=NULL)`; the callback signature provides `values[]`, `isnull[]`, and a heap TID. I ignore the TID.
 - Memory: growth bug fixed. Do not call `repalloc` with `cap==0`. First growth must use `palloc(sizeof(T)*newcap)` then `repalloc` subsequently.
-- Include columns: `index->rd_index->indnkeyatts` is the number of key attrs; `RelationGetDescr(index)->natts` can include INCLUDE attributes. Because we don’t support INCLUDE, set `bst.natts = nkeyatts` and disable `amcaninclude`.
+- Include columns: `index->rd_index->indnkeyatts` is the number of key attrs; `RelationGetDescr(index)->natts` can include INCLUDE attributes. We support INCLUDE only for single-key indexes: pack fixed-width integer INCLUDE attrs into the leaf payload and copy them into the prebuilt tuple during IOS. Keep on-disk key storage to `nkeyatts`; planner flag `amcaninclude=true`.
 - Sorting: retrieve comparator with `index_getprocinfo(index, attno, 1)` (proc 1) and call via `FunctionCall2Coll(proc, collation, a, b)`, expecting int32 result semantics like btree `btint4cmp`, `bttextcmp`.
 - Page writing: ensure a metapage exists at block 0 with magic/version/att counts; data starts at block 1. On each data page, `PageInit`, `PageAddItem`. No WAL or FSM yet.
 
@@ -151,18 +178,18 @@ Visibility map required sequence (to keep IOS heapless)
 Bugs to watch out for:
 - Segfault during `CREATE INDEX` before sorting: `repalloc` on a NULL pointer when `cap==0`. Fix: allocate with `palloc` on initial growth.
 - Segfault inside `visibilitymap_set`: I initially passed `InvalidBuffer` for `heapBuf` and hadn’t set PD_ALL_VISIBLE; `visibilitymap_set` requires `PageIsAllVisible(heapBuf)`. Fix: set PD_ALL_VISIBLE under exclusive lock and pass `heapBuf` into `visibilitymap_set`.
-- INCLUDE columns mismatch: using `itupdesc->natts` caused me to think I had `natts` attrs to store, but I only store key attrs. Fix: set `bst.natts = nkeyatts` and `amcaninclude=false`.
+- INCLUDE columns mismatch: using `itupdesc->natts` caused me to think I had `natts` attrs to store, but on-disk we only store key attrs. Fix: set `bst.natts = nkeyatts`. Keep `amcaninclude=true` but restrict INCLUDE to single-key indexes and copy INCLUDE payloads from page to the prebuilt tuple in scans.
 - Starting scan at block 0 (metapage) was wrong. Fix: start at block 1.
 
 Flags and opclasses
-- `amstrategies = 5` for (<, <=, =, >=, >); `amsupport = 1` comparator proc. `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amsearcharray=false`, `amsearchnulls=false`, `amgetbitmap=NULL`, `amcaninclude=false`.
-- Operator classes provided in `smol--1.0.sql` for fixed‑width types (e.g., `int2`, `int4`, `int8`, `date`, `timestamp`) using btree compare procs.
+- `amstrategies = 5` for (<, <=, =, >=, >); `amsupport = 1` comparator proc. `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amsearcharray=false`, `amsearchnulls=false`, `amgetbitmap=NULL`, `amcaninclude=true` (single-key only).
+- Operator classes provided in `smol--1.0.sql` for fixed‑width types (e.g., `int2`, `int4`, `int8`, `oid`, `float4/8`, `date`, `timestamp`, `timestamptz`, `bool`) using btree compare procs.
 
 On-disk tuple and (de)serialization
 - Each tuple is the concatenation of fixed‑width key values in order. Offsets are computed from attribute lengths; advance by `MAXALIGN(attlen)` as needed. Store by‑val types with `store_att_byval`, otherwise `memcpy` fixed‑length by‑ref types. Varlen types are not supported.
 
 C warnings and style
-- GCC/Clang in PGXS environment warn on C90 mixed declarations; stylistically, move declarations to top of block when convenient. Keep functions `static` unless part of AM API.
+- GCC/Clang in PGXS environment warn on C90 mixed declarations; stylistically, move declarations to top of block when convenient. Keep functions `static` unless part of AM API. All builds must be warning-free; remove or refactor unused code instead of ignoring warnings. Treat new warnings as regressions.
 
 Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
@@ -217,12 +244,12 @@ Bench and Timeouts
 - Scripts should exit on timeout and print a clear error; default TIMEOUT_SEC is 30 seconds.
 
 Inside-Container Workflow
-- Run inside-* targets directly (this agent runs inside the `smol` container):
-  - `make insidebuild` — clean build and install
-  - `make insidestart` — initdb if needed and start PostgreSQL
-  - `make insidecheck` — build, run regression (installcheck), then stop PG
-  - `make insidebench-smol-btree-5m` — run the fair 5M-row IOS benchmark (leaves PG running)
-- Use `make insidestop` to stop PostgreSQL when finished.
+- Use the same bare targets inside the container:
+  - `make build` — clean build and install
+  - `make start` — initdb if needed and start PostgreSQL
+  - `make check` — build, run regression (installcheck), then stop PG
+  - `make bench-smol-btree-5m` — run the single-key-focused benchmark (leaves PG running)
+- Use `make stop` to stop PostgreSQL when finished.
 - Benchmark scripts honor `TIMEOUT_SEC` and `KILL_AFTER` env vars.
 
 Profiling smol_gettuple
@@ -233,7 +260,7 @@ Profiling smol_gettuple
   - Reduce small memcpy overhead by favoring constant-size copies (2/4/8 bytes).
 
 ## Session Playbook (Learn-and-Do)
-- Never run regression and benchmarks at the same time. Before `make insidecheck`, ensure no bench run is active; if uncertain, stop PG (`make insidestop`), then `make insidestart` and rerun.
+- Never run regression and benchmarks at the same time. Before `make check`, ensure no bench run is active; if uncertain, stop PG (`make stop`), then `make start` and rerun.
 - Always set a server-side `statement_timeout` in benches for long statements (CREATE INDEX) to be <= client `TIMEOUT_SEC - 2s`. This prevents orphan backends when the client times out.
 - For fair IOS benchmarking, VACUUM the base table (not the index): `VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) <table>` after index creation (BTREE arm). Keep `enable_seqscan=off`, `enable_bitmapscan=off`, `enable_indexonlyscan=on`.
 - Scale benches under the 30s cap: prefer `ROWS=2e6..3e6` if `TIMEOUT_SEC=30`. If the goal is scaling, raise `TIMEOUT_SEC` only for bench runs; do not change regression timeouts.
@@ -244,7 +271,7 @@ Profiling smol_gettuple
 - Quick recovery inside container:
   - Kill stuck backends/postmaster if needed: `ps -ef | grep postgres`, then `kill -9 <backend> <postmaster>`.
   - Remove stale IPC files: `rm -f /tmp/.s.PGSQL.5432 /tmp/.s.PGSQL.5432.lock`.
-  - Start fresh cluster if wedged: `rm -rf /var/lib/postgresql/data && make insidestart` (Makefile re-runs initdb).
+- Start fresh cluster if wedged: `rm -rf /var/lib/postgresql/data && make start` (Makefile re-runs initdb).
 - For ad-hoc smoke tests (to avoid pg_regress), run minimal correctness via psql as `postgres` without expected-error checks.
 - Build path implementation rules: use radix sort for int2/int4/int8 keys and for (k1,k2) pairs; keep two-col collections in parallel arrays to avoid struct copies.
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.

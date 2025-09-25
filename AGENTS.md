@@ -24,14 +24,19 @@ Coding Conventions
 - Follow PG idioms: palloc/pfree, ereport/elog, Buffer/Page APIs.
 - Keep helpers static unless required by IndexAmRoutine.
 - Do not add new files unless necessary for the task; keep module in `smol.c`.
+- Builds must be warning-free: `make build` (and `make rebuild`) should emit no compiler warnings. Fix or remove unused code instead of suppressing warnings.
 
 Build, Test, Run
-- you are running inside a Docker container named "smol" - see Makefile if you care.
-- Quick regression: `make insidecheck` (builds, runs, stops PG).
-- Clean builds: `make insidebuild`.
-- Start/stop PG: `make insidestart` / `make insidestop`.
-- Regression tests live in `sql/`. Benchmarks live in `bench/` (run via `insidebench-smol-btree-5m`).
+- You can run directly on host or inside the Docker container named "smol".
+- Quick regression: `make check` (builds, runs, stops PG).
+- Clean builds: `make build`.
+- Start/stop PG: `make start` / `make stop`.
+- Docker helpers: `make dbuild` (build image), `make dstart` (run container), `make dexec` (shell), `make dpsql` (psql), `make dcodex` (Codex CLI).
+- Regression tests live in `sql/`. Benchmarks live in `bench/` (run via `bench-smol-btree-5m` or `bench-smol-vs-btree`).
 - Keep regression fast; stream long benchmark output to the console.
+ - psql inside Docker: always run as the `postgres` user. From host use `make dpsql`. Inside the
+   container use `make psql` or `su - postgres -c "/usr/local/pgsql/bin/psql"`. Running psql as `root`
+   will fail with `FATAL: role "root" does not exist`.
 
 PR/Commit Hygiene
 - Prefer surgical patches over sprawling refactors; keep changes minimal.

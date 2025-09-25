@@ -323,11 +323,11 @@ Notes
 - For WAL and crash-safety, pair AM sources with their xlog headers (e.g., nbtxlog.h, ginxlog.h) and docs on generic WAL.
 
 SMOL Implementation Notes (LLM‑oriented, dense)
-- AM shape: read‑only, ordered, IOS‑only. No NULLs. Fixed‑width keys only. No TIDs on disk. Parallel scans planned (flag set; shared-state/chunking not implemented yet). No bitmap scans. No INCLUDE columns in v1. Planner should still build multi‑col indexes; smol will only ever return key attrs.
+- AM shape: read‑only, ordered, IOS‑only. No NULLs. Fixed‑width keys only. No TIDs on disk. Parallel scans planned (flag set; shared-state/chunking not implemented yet). No bitmap scans. INCLUDE supported only for single‑key indexes with fixed‑width integer INCLUDE attrs. Planner may build multi‑col indexes as keys; SMOL returns only key attrs from disk and materializes INCLUDE for single‑key.
 - IndexAmRoutine wiring (required fields):
   - amstrategies=5 (<, <=, =, >=, >); amsupport=1 (comparator proc=1); amoptsprocnum=0.
   - amcanorder=true; amcanorderbyop=false; amcanhash=false; amconsistentequality=true; amconsistentordering=true.
-  - amcanbackward=true (serial); amcanparallel=true; amcanbuildparallel=false; amcaninclude=false.
+  - amcanbackward=true (serial); amcanparallel=true; amcanbuildparallel=false; amcaninclude=true (single‑key INCLUDE only).
   - amoptionalkey=true; amsearcharray=false; amsearchnulls=false; amstorage=false; amclusterable=false; ampredlocks=false; amusemaintenanceworkmem=false; amsummarizing=false; amparallelvacuumoptions=0; amkeytype=InvalidOid.
   - callbacks: ambuild, ambuildempty, aminsert(ERROR), ambulkdelete(NULL or stub), amvacuumcleanup(stub), amcanreturn (true for key attnos 1..nkeyatts), amcostestimate (simple placeholder), amgettreeheight (0 or derive from relpages), amoptions(NULL), amproperty(NULL), ambuildphasename(NULL), amvalidate(smolvalidate or NULL if opclass SQL is tight), amadjustmembers(NULL), ambeginscan, amrescan, amgettuple, amgetbitmap=NULL, amendscan, ammarkpos=NULL, amrestrpos=NULL, amestimateparallelscan, aminitparallelscan, amparallelrescan, amtranslatestrategy=NULL, amtranslatecmptype=NULL.
 
