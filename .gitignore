@@ -63,3 +63,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Ignore Emacs autosave/backup
+\#*
+*~
+
+# Build logs
+build*.log
+build*.err

@@ -201,6 +201,17 @@ Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
 - Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).
 
+## RLE opportunity (design)
+- Current on-disk formats:
+  - Single-key (+INCLUDE): leaf stores [uint16 n][keys][include1][include2]… contiguous arrays; no RLE.
+  - Two-key: active format is row-major [nrows][k1||k2]…; no RLE. A legacy group-directory RLE prototype was removed to reduce confusion.
+- Adding RLE (optional, format-versioned):
+  - Single-key: when many adjacent keys equal, store [k][count] and keep includes as contiguous blocks per include column; decoder can expand in scan with minimal state. Benefits heavy-dup workloads and reduces write size.
+  - Two-key: group by k1 with [k1][off][cnt] directory plus packed k2, as in the old prototype; improves density when k1 has repeats and preserves order. Needs careful planner costing.
+- Migration plan: guard under a new meta->version and reloption (or GUC at build) to retain compatibility. Start with single-key RLE for narrowed scope.
+- Scan fast-paths even without RLE:
+  - For single-key, no INCLUDE: detect key runs on the fly and skip memcpy for repeats; SIMD-aided run boundary detection for int2/4/8 further reduces overhead.
+
 # Performance next steps (plan)
 - Enable microprofile counters: set `smol.profile=on` (now also via `SMOL_PROFILE=1` in bench scripts) to log per-scan calls/rows/pages/bytes/bsearch steps at `amendscan`.
 - Run quick sanity benches before long runs:

@@ -6,7 +6,7 @@ MODULES = smol
 PG_CFLAGS=-Wno-declaration-after-statement
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_twocol smol_twocol_uuid_int4 smol_twocol_date_int4 smol_parallel smol_include smol_types
+REGRESS = smol_basic smol_twocol smol_twocol_uuid_int4 smol_twocol_date_int4 smol_parallel smol_include smol_types smol_dup smol_dup_more smol_more_cases
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config

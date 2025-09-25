@@ -39,6 +39,7 @@ Build, Test, Run
    will fail with `FATAL: role "root" does not exist`.
 
 PR/Commit Hygiene
+- after each prompt instruction result, run regression and if it passes then decide whether the code is in a good place to commit for others to try out (e.g. latest features are reasonably complete, not WIP). If so, then please automatically prepare a 1-20 line commit message and ask the user whether to commit with this message and if approved, then run git commit with this message.
 - Prefer surgical patches over sprawling refactors; keep changes minimal.
 - Commits: imperative subject (≤72 chars) + concise body with what/why.
 - Separate mechanical refactors from functional changes.

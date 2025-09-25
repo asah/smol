@@ -119,7 +119,7 @@ ensure_membw() {
   if [ -n "${MEMBW_GBPS:-}" ]; then return; fi
   mkdir -p results || true
   if [ -f results/membw.txt ]; then MEMBW_GBPS=$(cat results/membw.txt); export MEMBW_GBPS; return; fi
-  cat > /tmp/membw.c <<'C'
+cat > /tmp/membw.c <<'C'
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +136,13 @@ int main(){
   double gbps = (bytes / dur) / 1073741824.0;
   printf("%.3f\n", gbps);
   return 0;
+}
+
+C
+  gcc -O3 -march=native -fno-omit-frame-pointer -o /tmp/membw /tmp/membw.c 2>/dev/null || true
+  if [ -x /tmp/membw ]; then MEMBW_GBPS=$(/tmp/membw); else MEMBW_GBPS=0; fi
+  echo "$MEMBW_GBPS" > results/membw.txt
+  export MEMBW_GBPS
 }
 
 # Read or measure practical IOS max return throughput (GB/s) baseline.
@@ -155,12 +162,6 @@ ensure_iosmax() {
     KNOWN_MAX_GBPS=0
   fi
   export KNOWN_MAX_GBPS
-}
-C
-  gcc -O3 -march=native -fno-omit-frame-pointer -o /tmp/membw /tmp/membw.c 2>/dev/null || true
-  if [ -x /tmp/membw ]; then MEMBW_GBPS=$(/tmp/membw); else MEMBW_GBPS=0; fi
-  echo "$MEMBW_GBPS" > results/membw.txt
-  export MEMBW_GBPS
 }
 
 load_selective() {
