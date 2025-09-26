@@ -6,7 +6,7 @@ MODULES = smol
 PG_CFLAGS=-Wno-declaration-after-statement
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_twocol smol_twocol_uuid_int4 smol_twocol_date_int4 smol_parallel smol_include smol_types smol_dup smol_dup_more smol_more_cases
+REGRESS = smol_basic smol_twocol smol_twocol_uuid_int4 smol_twocol_date_int4 smol_parallel smol_include smol_types smol_dup smol_dup_more smol_more_cases smol_rle_cache smol_text
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -54,7 +54,8 @@ dcodex:
 # Use these when you are already inside the smol Docker container.
 # ---------------------------------------------------------------------------
 
-.PHONY: buildclean build start stop psql pgcheck bench-smol-btree-5m bench-smol-vs-btree bench bench-all bench-gap-scenario bench-clean
+.PHONY: buildclean build start stop psql pgcheck bench-smol-btree-5m bench-smol-vs-btree bench bench-all bench-gap-scenario bench-clean bench-text-advantage text-adv-pretty text-adv-plot
+.PHONY: rle-adv-pretty rle-adv-plot
 
 # Resolve PostgreSQL bin dir from PG_CONFIG
 PG_BIN := $(dir $(PG_CONFIG))
@@ -161,6 +162,41 @@ bench-gap-scenario: build start
 	chmod +x bench/smol_gap_scenario.sh; \
 	su - postgres -c "env ROWS=$${ROWS:-10000000} SELECTIVITY=$${SELECTIVITY:-0.5} WORKERS=$${WORKERS:-5} TIMEOUT_SEC=$${TIMEOUT_SEC:-60} KILL_AFTER=$${KILL_AFTER:-5} TBL=$${TBL:-gap_bench} bash /workspace/bench/smol_gap_scenario.sh"; \
 	echo "Gap scenario finished; PostgreSQL left running. Use 'make stop' when done."
+
+# Text key advantage benchmark (short identifiers <=32B, C collation)
+bench-text-advantage: build start
+	@echo "Running SMOL text key advantage benchmark (short identifiers)"; \
+	set -euo pipefail; \
+	chmod +x bench/smol_text_advantage.sh; \
+	su - postgres -c "env ROWS=$${ROWS:-5000000} WORKERS=$${WORKERS:-5} INC=$${INC:-0} UNIQVALS=$${UNIQVALS:-100} SWEEP_UNIQVALS=$${SWEEP_UNIQVALS:-} DISTRIBUTION=$${DISTRIBUTION:-uniform} STRLEN=$${STRLEN:-16} SWEEP_STRLEN=$${SWEEP_STRLEN:-} TIMEOUT_SEC=$${TIMEOUT_SEC:-1800} KILL_AFTER=$${KILL_AFTER:-10} bash /workspace/bench/smol_text_advantage.sh"; \
+	echo "Text benchmark finished; PostgreSQL left running. Use 'make stop' when done."
+
+text-adv-pretty:
+	@ROWS=$${ROWS:-} WORKERS=$${WORKERS:-} INC=$${INC:-} CSV=$${CSV:-results/text_adv.csv} \
+	  python3 bench/pretty_text_adv.py
+
+text-adv-plot:
+	@ROWS=$${ROWS:-} WORKERS=$${WORKERS:-} INC=$${INC:-} CSV=$${CSV:-results/text_adv.csv} OUT=$${OUT:-results/text_adv_plot.png} \
+	  python3 bench/plot_text_adv.py
+
+# RLE + dupcache advantage benchmark (50M rows, 5 workers default)
+.PHONY: bench-rle-advantage
+bench-rle-advantage: build start
+	@echo "Running SMOL RLE+dupcache advantage benchmark (includes, 5 workers)"; \
+	set -euo pipefail; \
+	chmod +x bench/smol_rle_dupcache_advantage.sh; \
+	su - postgres -c "env ROWS=$${ROWS:-50000000} WORKERS=$${WORKERS:-5} INC=$${INC:-8} COLTYPE=$${COLTYPE:-int2} UNIQVALS=$${UNIQVALS:-1} SWEEP_UNIQVALS=$${SWEEP_UNIQVALS:-} DISTRIBUTION=$${DISTRIBUTION:-uniform} TIMEOUT_SEC=$${TIMEOUT_SEC:-1800} KILL_AFTER=$${KILL_AFTER:-10} REUSE=$${REUSE:-1} bash /workspace/bench/smol_rle_dupcache_advantage.sh"; \
+	echo "Benchmark finished; PostgreSQL left running. Use 'make stop' when done."
+
+# Pretty-print latest CSV (filter with ROWS=, WORKERS=, INC=)
+rle-adv-pretty:
+	@ROWS=$${ROWS:-} WORKERS=$${WORKERS:-} INC=$${INC:-} CSV=$${CSV:-results/rle_adv.csv} \
+	  python3 bench/pretty_rle_adv.py
+
+# Generate a simple bar plot from CSV (requires matplotlib)
+rle-adv-plot:
+	@ROWS=$${ROWS:-} WORKERS=$${WORKERS:-} INC=$${INC:-} CSV=$${CSV:-results/rle_adv.csv} OUT=$${OUT:-results/rle_adv_plot.png} \
+	  python3 bench/plot_rle_adv.py
 
 # Curated quick scenarios (fast reuse): single WORKERS per run, ROWS scaled by workers (5 -> 50M)
 bench: build start

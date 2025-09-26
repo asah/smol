@@ -27,7 +27,7 @@ Coding Conventions
 - Builds must be warning-free: `make build` (and `make rebuild`) should emit no compiler warnings. Fix or remove unused code instead of suppressing warnings.
 
 Build, Test, Run
-- You can run directly on host or inside the Docker container named "smol".
+- You can run directly on host or inside the Docker container named "smol". On startup, check if you're running inside Docker - you probably are!
 - Quick regression: `make check` (builds, runs, stops PG).
 - Clean builds: `make build`.
 - Start/stop PG: `make start` / `make stop`.

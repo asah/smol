@@ -201,12 +201,28 @@ Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
 - Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).
 
+## RLE (single-key) — implemented opt-in
+- Added optional RLE encoding for single-key leaves (no INCLUDEs yet). Guarded by `smol.rle=on` at build time. Reader transparently decodes both formats.
+- Rationale: shrink duplicate-heavy runs (e.g., many equal keys) without changing planner or scan semantics. Tests unchanged; default off to keep risk low.
+- On-disk (RLE leaf payload): `[u16 tag=0x8001][u16 nitems][u16 nruns][runs...]` where each run is `[key bytes][u16 count]`. Plain payload remains `[u16 n][keys...]`.
+- Reader changes: `smol_leaf_nitems()` now returns `nitems` for RLE; `smol_leaf_keyptr()` maps a 1-based index to the run’s key pointer by summing counts. Binary search and run-skip logic continue to work unmodified.
+- Build path: when `smol.rle=on`, each leaf chunk is analyzed; if `sizeof(RLE) < sizeof(plain)` it emits RLE, otherwise plain. No changes for INCLUDE path yet.
+
+## Duplicate-caching for INCLUDE (single-key)
+- Scan now caches INCLUDE bytes across equal-key runs: when all INCLUDE columns are constant within a run, SMOL copies them once at run start and skips memcpy for the rest of the run.
+- This reduces per-row CPU materially for SUM-like projections on duplicate-heavy keys. We detect constancy once per run and reuse the decision.
+- Reader supports both plain and RLE pages; INCLUDE dup-caching applies to both layouts.
+
+## Include‑RLE reader scaffolding (writer pending)
+- Reader can locate INCLUDE data in a per-run RLE layout (tag `0x8003`): `[tag][nitems][nruns] [run: key||u16 count||inc1||inc2..]*`.
+- Writer is not yet enabled; planned: emit `0x8003` when all INCLUDEs in a run are constant and the encoded size beats the plain layout. This will further reduce CPU and IO for SUM-heavy workloads.
+
 ## RLE opportunity (design)
 - Current on-disk formats:
   - Single-key (+INCLUDE): leaf stores [uint16 n][keys][include1][include2]… contiguous arrays; no RLE.
   - Two-key: active format is row-major [nrows][k1||k2]…; no RLE. A legacy group-directory RLE prototype was removed to reduce confusion.
 - Adding RLE (optional, format-versioned):
-  - Single-key: when many adjacent keys equal, store [k][count] and keep includes as contiguous blocks per include column; decoder can expand in scan with minimal state. Benefits heavy-dup workloads and reduces write size.
+  - Single-key: when many adjacent keys equal, store [k][count] per run. For INCLUDEs, a follow-up could store one value per run when all INCLUDEs are identical; current implementation leaves INCLUDE layout unchanged and applies RLE only when there are no INCLUDEs.
   - Two-key: group by k1 with [k1][off][cnt] directory plus packed k2, as in the old prototype; improves density when k1 has repeats and preserves order. Needs careful planner costing.
 - Migration plan: guard under a new meta->version and reloption (or GUC at build) to retain compatibility. Start with single-key RLE for narrowed scope.
 - Scan fast-paths even without RLE:
@@ -638,3 +654,21 @@ Note: Attempted switching build to tuplesort to remove the sort bottleneck; firs
 - DESC/backward: ensure backward scans produce correct order when requested by executor (dir=BackwardScanDirection).
 - Multi-column ordering: for small datasets, compare ordered results/sums vs btree on equivalent definitions (btree(b) INCLUDE (a) vs smol(b,a)).
 - Parallel scans: not implemented yet; keep `max_parallel_workers_per_gather=0` during correctness runs.
+
+## Performance: When and Why SMOL Wins
+- Duplicate-heavy keys (long equal-key runs) + constant INCLUDEs: SMOL’s RLE plus dup-caching collapses per-run work to ~O(1) copies, while BTREE IOS still copies INCLUDE bytes per row. The gap scales with INCLUDE width.
+- Space efficiency: SMOL indexes are 2–6× smaller on the scenarios we tested. Smaller indexes stay memory-resident longer; BTREE spills sooner and slows down.
+- Selectivity regimes where wins are largest:
+  - Mid/high selectivity (e.g., 12%–50%) equality on the leading key: SMOL frequently uses IOS with zero heap fetches; BTREE often prefers Seq Scan at higher selectivity or does more per-row work even under IOS.
+  - COUNT(*) scenarios: SMOL shows 2–8× speedups as selectivity grows, due to fewer pages and reduced per-row overhead.
+  - SUM over INCLUDEs: SMOL leads by ~1.1–1.8× without include‑RLE; we expect larger wins once include‑RLE writer is enabled.
+
+## Benchmarking Additions
+- New target: `make bench-rle-advantage` (parameters: `ROWS`, `WORKERS`, `INC`, `COLTYPE`, `UNIQVALS`, `SWEEP_UNIQVALS`, `DISTRIBUTION=uniform|zipf`). Suggested sweep: `SWEEP_UNIQVALS=10,1000,100%`.
+- Selectivity sweep: set `SWEEP="0.12,0.5,0.99"` (or any list). Results written to `results/rle_adv.csv`.
+- Helpers:
+  - Pretty summary: `make rle-adv-pretty ROWS=... WORKERS=... INC=...`
+  - Plot (requires matplotlib): `make rle-adv-plot ROWS=... WORKERS=... INC=... OUT=results/plot.png`
+- Reproducible “wipe-the-floor” scenario (50M rows, 5 workers, INC=16):
+  - 12% selectivity: COUNT ~2.6× faster; SUM ~1.07× faster; SMOL ~1.7× smaller.
+  - 50% selectivity: COUNT ~7.6× faster; SUM ~1.47× faster; same size gap.

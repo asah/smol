@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
     locales emacs \
-  && pip3 install slack_sdk --break-system-packages \
+  && pip3 install slack_sdk matplotlib --break-system-packages \
   && rm -rf /var/lib/apt/lists/*
 
 # Locale

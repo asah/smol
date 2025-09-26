@@ -230,3 +230,14 @@ CREATE OPERATOR CLASS interval_ops
         OPERATOR        4       >= ,
         OPERATOR        5       >  ,
         FUNCTION        1       interval_cmp(interval,interval);
+
+-- Short text (C collation, <=32 bytes) using binary order
+-- Users should specify C/POSIX collation to ensure binary order semantics.
+CREATE OPERATOR CLASS text_ops
+    DEFAULT FOR TYPE text USING smol AS
+        OPERATOR        1       <  ,
+        OPERATOR        2       <= ,
+        OPERATOR        3       =  ,
+        OPERATOR        4       >= ,
+        OPERATOR        5       >  ,
+        FUNCTION        1       bttextcmp(text,text);

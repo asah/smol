@@ -39,24 +39,26 @@ def main():
     # Build series per query
     series = {}
     for r in recs:
-        key = (r['dup_frac'], r['query'])
-        series.setdefault(key, {})[r['index']] = float(r['exec_ms'])
-    dup_fracs = sorted({k[0] for k in series.keys()}, key=lambda x: float(x))
+        # Support new schema; fall back to dup_frac for legacy
+        uv = r.get('uniqvals', r.get('dup_frac','NA'))
+        key = (uv, r['query'])
+        series.setdefault(key, {})[r['index']] = float(r.get('exec_ms', r.get('count_ms','nan')))
+    uniqs = sorted({k[0] for k in series.keys()}, key=lambda x: (float(x) if x!='NA' else -1))
     queries = sorted({k[1] for k in series.keys()})
     fig, axes = plt.subplots(1, len(queries), figsize=(6*len(queries),4), squeeze=False)
     for idx, q in enumerate(queries):
-        x = list(range(len(dup_fracs)))
-        bt = [series[(d,q)].get('btree', float('nan')) for d in dup_fracs]
-        sm = [series[(d,q)].get('smol', float('nan')) for d in dup_fracs]
+        x = list(range(len(uniqs)))
+        bt = [series[(d,q)].get('btree', float('nan')) for d in uniqs]
+        sm = [series[(d,q)].get('smol', float('nan')) for d in uniqs]
         ax = axes[0][idx]
         w = 0.35
         ax.bar([i-w/2 for i in x], bt, width=w, label='btree')
         ax.bar([i+w/2 for i in x], sm, width=w, label='smol')
         ax.set_xticks(x)
-        ax.set_xticklabels(dup_fracs)
+        ax.set_xticklabels(uniqs)
         ax.set_title(f"{q} (rows={rows or 'ANY'}, inc={inc or 'ANY'}, workers={workers or 'ANY'})")
         ax.set_ylabel('ms')
-        ax.set_xlabel('dup_frac')
+        ax.set_xlabel('uniqvals')
         ax.legend()
     plt.tight_layout()
     out = out_path_env or f"results/rle_adv_{rows or 'any'}_{inc or 'inc'}_{workers or 'wk'}.png"

@@ -115,6 +115,16 @@ Benchmarking
 - Exhaustive matrix (heavy): `make bench-all` loops over `sel={0.0,0.1,0.25,0.5,0.75,0.9,0.95,0.99,1.0}`, `int2/4/8`, `workers=1/2/5`, `rows=500K/5M/50M`, and `cols=1/2/4/8/16`.
 - Output: CSV rows with index type, build time (ms), size (MB), query time (ms), and the EXPLAIN plan line; per-selectivity/worker sweeps are emitted inline.
 
+RLE + Duplicate-Caching Advantage (new)
+- Target: `make bench-rle-advantage ROWS=... WORKERS=... INC=... COLTYPE=int2 UNIQVALS=... [DISTRIBUTION=uniform|zipf]`
+- Suggested sweep: `SWEEP_UNIQVALS=10,1000,100%` (represents heavy duplicates → mid → many-distinct).
+- Sweep support: `SWEEP="0.12,0.5,0.99"` runs multiple selectivities; results saved to `results/rle_adv.csv`.
+- Pretty summary: `make rle-adv-pretty ROWS=... WORKERS=... INC=...` prints btree vs smol times and speedups.
+- Plot (requires matplotlib): `make rle-adv-plot ROWS=... WORKERS=... INC=... OUT=results/rle_adv_plot.png`.
+- Suggested “big win” repro (50M rows, 5 workers):
+  - `INC=12` (many identical INCLUDEs), `SWEEP=0.12,0.5`.
+  - Expect SMOL ~2–8× faster on COUNT, ~1.1–1.5× on SUM; SMOL index significantly smaller than BTREE.
+
 Development policy
 - Builds must be warning-free: `make build` and `make rebuild` should emit no compiler warnings. Remove unused code or fix signatures to satisfy this.
 
