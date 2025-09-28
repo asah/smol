@@ -3,6 +3,7 @@ postgres/
 
 # temp dirs
 results/
+sampledata/
 
 # auth
 .codex/auth.json

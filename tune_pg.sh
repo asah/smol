@@ -127,6 +127,10 @@ WM_MB=$(round "$(awk "BEGIN{
 STORAGE_CLASS="ssd"  # default assume SSD (common on servers/cloud)
 DISK_MBPS=0
 TARGET_DIR="${PGDATA:-$(dirname "$CONF_PATH")}"
+# Pick a writable target directory for transient disk test
+if [[ ! -w "$TARGET_DIR" ]]; then
+  TARGET_DIR="/tmp"
+fi
 
 # Try to infer underlying block device rotational flag
 detect_rotational() {
@@ -156,19 +160,28 @@ if [[ "$rot" == "1" ]]; then STORAGE_CLASS="hdd"; fi
 
 # quick write test (256MB) with fsync, avoid oflag=direct for portability
 TMPFILE="${TARGET_DIR%/}/.pg_tune_disk_test.$$"
-(
+{
   sync
-  t_start=$(date +%s%N)
-  dd if=/dev/zero of="$TMPFILE" bs=1M count=256 conv=fsync,nocreat 2>/dev/null
-  sync
-  t_end=$(date +%s%N)
-  elapsed_ns=$((t_end - t_start))
-  if (( elapsed_ns > 0 )); then
-    DISK_MBPS=$(awk -v dur="$elapsed_ns" 'BEGIN{printf "%.0f", (256*1e9)/dur}')
+  # First try parsing dd-reported throughput to avoid clock granularity issues
+  DD_OUT=$( (dd if=/dev/zero of="$TMPFILE" bs=1M count=256 conv=fsync 2>&1) || true )
+  # Extract numeric speed and units from the last line
+  spd=$(printf '%s\n' "$DD_OUT" | awk '/copied,/ {v=$(NF-1); u=$NF; if(u~/(kB\/s)/){m=0.001}else if(u~/(MB\/s)/){m=1}else if(u~/(GB\/s)/){m=1000}else{m=1}; printf "%.0f", v*m}' | tail -1)
+  if [[ -n "$spd" && "$spd" != "0" ]]; then
+    DISK_MBPS="$spd"
   else
-    DISK_MBPS=0
+    # Fallback to wall-clock timing
+    t_start=$(date +%s%N 2>/dev/null || echo 0)
+    dd if=/dev/zero of="$TMPFILE" bs=1M count=256 conv=fsync status=none 2>/dev/null || true
+    sync
+    t_end=$(date +%s%N 2>/dev/null || echo 0)
+    elapsed_ns=$((t_end - t_start))
+    if (( elapsed_ns > 0 )); then
+      DISK_MBPS=$(awk -v dur="$elapsed_ns" 'BEGIN{printf "%.0f", (256*1e9)/dur}')
+    else
+      DISK_MBPS=0
+    fi
   fi
-) || true
+} || true
 rm -f "$TMPFILE" 2>/dev/null || true
 
 # Decide storage class by speed if rotational unknown

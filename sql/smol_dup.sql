@@ -17,8 +17,6 @@ CREATE INDEX d_a_smol ON d USING smol(a) INCLUDE (x);
 
 SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
 
--- Enable skip-dup-copy optimization (should not affect results)
-SET smol.skip_dup_copy=on;
 
 -- Forward run: expect 3 repeated 5, then 4 repeated
 COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
@@ -29,8 +27,7 @@ COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
 -- INCLUDE path: force IOS to read include; sum for a=7 is 7*100*5 + sum(1..5) = 3515
 COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;
 
--- Disable skip-dup-copy and repeat queries; outputs must match
-SET smol.skip_dup_copy=off;
+-- Repeat queries should produce identical outputs
 COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
 COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
 COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;

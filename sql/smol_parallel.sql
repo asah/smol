@@ -35,7 +35,6 @@ SELECT 'int2' AS typ,
        ((SELECT s FROM res_i2) = (SELECT sum(a)::bigint FROM p2_i2 WHERE b > 500)
         AND (SELECT c FROM res_i2) = (SELECT count(*)::bigint FROM p2_i2 WHERE b > 500)) AS match;
 
--- (int4/int8 cases are tracked under bench to keep regression fast and stable)
 -- Case 2: int4
 DROP TABLE IF EXISTS p2_i4 CASCADE;
 CREATE UNLOGGED TABLE p2_i4(a int4, b int4);

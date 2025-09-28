@@ -430,7 +430,7 @@ SMOL Implementation Notes (LLM‑oriented, dense)
   - startup=0; total = pages_vis * random_page_cost * 0.1 + tuples_vis * cpu_index_tuple_cost; correlation=0; indexPages=pages.
   - Keep conservative to allow planner to pick SMOL for IOS with selective quals.
 
-- Testing checklist (regression/bench):
+- Testing checklist (regression):
   - CREATE EXTENSION smol; create tables with smallint/int4/int8; build indexes; run EXPLAIN (ANALYZE, BUFFERS) SELECT … WHERE col = const; expect Index Only Scan using smol.
   - Verify non‑IOS rejection: SELECT without columns in index target list in IndexScan should ERROR.
   - Verify NULLs rejected at build.

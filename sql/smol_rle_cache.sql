@@ -29,13 +29,9 @@ CREATE INDEX ic1_smol ON ic1 USING smol(b) INCLUDE (a1,a2);
 SET enable_indexscan=off; SET enable_indexonlyscan=on;
 -- capture baseline
 SELECT sum(a1)::bigint AS s1, sum(a2)::bigint AS s2, count(*)::bigint AS cnt FROM ic1 WHERE b = 42; \gset
--- verify with dup-copy off
-SET smol.skip_dup_copy = off;
 SELECT (SELECT sum(a1)::bigint FROM ic1 WHERE b = 42) = :'s1' AS match_off1,
        (SELECT sum(a2)::bigint FROM ic1 WHERE b = 42) = :'s2' AS match_off2,
        (SELECT count(*)::bigint FROM ic1 WHERE b = 42) = :'cnt' AS match_off3;
--- verify with dup-copy on
-SET smol.skip_dup_copy = on;
 SELECT (SELECT sum(a1)::bigint FROM ic1 WHERE b = 42) = :'s1' AS match_on1,
        (SELECT sum(a2)::bigint FROM ic1 WHERE b = 42) = :'s2' AS match_on2,
        (SELECT count(*)::bigint FROM ic1 WHERE b = 42) = :'cnt' AS match_on3;

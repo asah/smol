@@ -4,7 +4,7 @@ This file summarizes the hard‑won details needed to work on the `smol`
 PostgreSQL 18 index access method in this repo.
 
 Run Policy (Mandatory)
-- One container name only: `smol`. Always build, test, and benchmark using
+- One container name only: `smol`. Always build and test using
   a single Docker container named `smol`; reuse it across runs.
 - Preferred: use Docker helpers to ensure a clean PG18 toolchain. Build the image with `make dbuild`, then
   run targets directly as `make <target>` (this agent can also run inside the `smol` container via `make dcodex`).
@@ -23,19 +23,15 @@ Run Policy (Mandatory)
 - PostgreSQL 18; INCLUDE supported only for single-key indexes with fixed-width
   integer INCLUDE attrs (int2/int4/int8); parallel scans stubbed (flag set; no
   DSM/chunking yet); no bitmap scan.
-- we are restarting this project to provide cleaner code, so these notes may contain info from the previous iteration(s). If you spot inconsistencies please propose cleanup to the user.
+ 
 
-Design memory (bench + planner)
-- Bench favors observing planner choices; no validity toggling or forced enable/disable in COMPACT mode. We print the leading scan node (and index) per query.
+Planner notes
+- Observe planner choices without forced enable/disable toggles. Print the leading scan node (and index) per query when inspecting.
 - COMPACT times with EXPLAIN (ANALYZE, TIMING ON, BUFFERS OFF) and parses EXPLAIN (COSTS OFF) for plan text.
 - smol_costestimate tuned to reflect smaller pages + contiguous IOS: low per-page (smol.cost_page), cheap per-tuple (smol.cost_tup), heuristic selectivity for leading-key quals (smol.selec_eq/range), penalty for non-leading. All GUC-tunable.
-- BTREE IOS isn’t always optimal at high selectivity; bench reports actual choice (IOS vs Seq Scan) purely via costs.
+- BTREE IOS isn’t always optimal at high selectivity; costs report the actual choice (IOS vs Seq Scan).
 
-Gap scenario (key-only, COUNT(*))
-- Script: bench/smol_gap_scenario.sh; target: make bench-gap-scenario.
-- Schema: UNLOGGED TABLE gap_bench(b int2); indexes: BTREE(b), SMOL(b); query: COUNT(*) WHERE b > -1.
-- Example at 10M / 5 workers / sel=0.5: SMOL ~19 MB vs BTREE ~66 MB; SMOL ~63 ms vs BTREE ~99 ms (no forcing).
-- Optimizations ROI: SIMD copies (10–20%), batched leaf-claims (5–10% @5 workers), rightlink prefetch (2–5% warm-cache), group-aware emission (5–12% two-col).
+ 
 
 
 ## Architecture Overview
@@ -68,38 +64,27 @@ Gap scenario (key-only, COUNT(*))
 - Build+install extension: `make build`.
 - Quick regression (build, start PG, run installcheck, stop PG): `make check`.
 - Start/stop PostgreSQL: `make start` / `make stop`.
-- Run benchmark (leaves PG running): `make bench-smol-btree-5m` or `make bench-smol-vs-btree`.
-- Keep regression fast; correctness lives under `sql/`. `bench/` is for benchmarks only.
+- Keep regression fast; correctness lives under `sql/`.
 - Server logs: `/tmp/pg.log` (or set a different path) inside the container.
 
-## Bench Parallelism Policy
-- For comparability, the bench script forces up to 5‑way parallelism on explanatory queries:
-  - Sets `max_parallel_workers_per_gather=5` and `max_parallel_workers=5`.
-  - Lowers `parallel_setup_cost` and `parallel_tuple_cost` to 0.
-  - Sets `min_parallel_index_scan_size=0` and `min_parallel_table_scan_size=0`.
-- This encourages the planner to use 5 workers for both BTREE and SMOL Index Only Scans.
-- The bench tooling supports `COLTYPE=int2|int4|int8` and scales to ≥50M rows with `TIMEOUT_SEC>=30`.
+## Parallelism (inspection)
+- To encourage parallel IOS during inspection:
+  - Set `max_parallel_workers_per_gather=5` and `max_parallel_workers=5`.
+  - Lower `parallel_setup_cost` and `parallel_tuple_cost` to 0.
+  - Set `min_parallel_index_scan_size=0` and `min_parallel_table_scan_size=0`.
+  This encourages the planner to use up to 5 workers for Index Only Scans.
 
-## Selectivity-Based Benchmarks
-- Primary driver: `bench/smol_vs_btree_selectivity.sh` (used by `make insidebench-smol-vs-btree`).
-- Params: `ROWS`, `COLTYPE`, `COLS`, `SELECTIVITY` (comma list of fractions in [0..1]), `WORKERS` (comma list), plus timeout/insert tunables.
-- Data generation per selectivity s:
-  - Choose midpoint M (0) and two windows on either side of M, each ~25% of the domain wide.
-  - Insert approx `s*ROWS` rows in the upper window (matches for `b >= M`), remainder in lower window (non-matches), and one exact record at `b=M` so `s=0.0` yields exactly one match.
-  - For `COLS>1`, build b plus INCLUDE columns `a1..a{COLS-1}` with random values; compare BTREE(b) INCLUDE vs SMOL(b) INCLUDE.
-- Queries:
-  - Single-col: `SELECT count(*) FROM t WHERE b >= M` (implemented as `b > M-1`).
-  - With INCLUDE: `SELECT sum(a1)::bigint FROM t WHERE b >= M`.
-- Output: CSV per selectivity and worker including build ms, size MB, query ms, and plan line.
+## Selectivity and plans
+When inspecting selectivity-driven behavior, prefer EXPLAIN (ANALYZE) on small, deterministic datasets and vary selectivity by adjusting predicates (e.g., `b > M`) rather than relying on distribution artifacts.
 
 ## Parallelism in SMOL
-- Scan: `amcanparallel=true` and the bench uses parallel IOS at query time. Shared-state chunking is
+- Scan: `amcanparallel=true`. Shared-state chunking is
   still minimal; however, with ordered scans and our pin-across-calls strategy, parallel scans operate
   correctly under the planner’s partitioning. Future work: add explicit shared state to divide leaf ranges.
 - Build: Two‑column path includes a DSM+bgworker sorter (bucketed by k1) with a single‑process fallback.
   Multi‑level internal build (height ≥ 3) prevents root fanout overflows at scale.
 
-Status 2025-09-23: DSM leaf-claim path wired for scans
+DSM leaf-claim path wired for scans
 - Implemented a simple parallel leaf-claim protocol in scan:
   - Added `SmolParallelScan { pg_atomic_uint32 curr; }` in DSM.
   - On first claim, atomically replace `curr=0` with `rightlink(leftmost)` and return `leftmost`.
@@ -112,18 +97,18 @@ Open issue: parallel correctness mismatch (double counting)
 - Ad‑hoc parallel checks (5 workers, btree vs smol) show SMOL returning ~2x rows under parallel IOS on two‑column indexes.
 - Single‑worker (parallel disabled) and regression paths match BTREE.
 - Hypothesis: remaining coordination bug in the leaf‑claim loop lets leader and one worker walk overlapping ranges. Needs deeper tracing (compare claimed blkno sequence across participants) or switch to an LWLock-protected scheme like BTREE’s `BTParallelScanDesc`.
-- Interim guidance: leave `amcanparallel=true` for planning, but force `max_parallel_workers_per_gather=0` for deterministic correctness checks. Benchmarks may show inflated counts until fixed.
+- Interim guidance: leave `amcanparallel=true` for planning, but force `max_parallel_workers_per_gather=0` for deterministic correctness checks.
 
 Quick mental checklist
 - Collect → sort (proc 1, collations) → write metapage + data pages.
 - Mark heap blk 0 PD_ALL_VISIBLE then set VM bit with `visibilitymap_set`.
 - IOS only: enforce `xs_want_itup`; set a synthetic `xs_heaptid`.
 
-SIMD/Unrolled tuple materialization (2025-09-25)
+SIMD/Unrolled tuple materialization
 - Hot path amgettuple materialization uses unrolled fixed-size copies and 16B wide copies when aligned.
 - Implemented smol_copy2/4/8 with aligned word stores and fallback to memcpy; smol_copy16 uses a single 16B store when aligned or two 8B stores otherwise; smol_copy_small handles uncommon sizes and short tails.
 - Replaced memcpy in key and INCLUDE materialization where possible to reduce branch/memcpy overhead, notably benefiting uuid/int8 keys and INCLUDE lists.
-- Build is warning-free; regression passes. Sample bench (1M rows, int2, cols=1, sel=0.5, workers=5, compact) produced sane plans; expect gains to grow with larger tuples/INCLUDE.
+- Build is warning-free; regression passes.
 - No NULLs; no TIDs; read-only; ordered.
 
 ## Logging
@@ -134,9 +119,8 @@ SIMD/Unrolled tuple materialization (2025-09-25)
 - Macros provide near-zero cost when disabled:
   - `SMOL_LOG(msg)` and `SMOL_LOGF(fmt, ...)` guard `elog(LOG, ...)` behind the
     `smol.debug_log` flag; define `SMOL_TRACE=0` at compile time to compile logs out
-    entirely if needed for microbenchmarks.
-  - Default build sets `SMOL_TRACE=1`, but the GUC defaults to off, so production
-    and benchmarks incur no meaningful overhead.
+    entirely if needed for micro profiles.
+  - Default build sets `SMOL_TRACE=1`, but the GUC defaults to off.
 
 ## Detailed Technical Notes (for future me)
 
@@ -198,7 +182,7 @@ C warnings and style
 - GCC/Clang in PGXS environment warn on C90 mixed declarations; stylistically, move declarations to top of block when convenient. Keep functions `static` unless part of AM API. All builds must be warning-free; remove or refactor unused code instead of ignoring warnings. Treat new warnings as regressions.
 
 Practical guidance
-- If Codex is restarted, this section is the authoritative state snapshot. Bench scripts and GUCs allow reproducing results without large chat context. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
+- If Codex is restarted, this section is the authoritative state snapshot. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
 - Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).
 
 ## RLE (single-key) — implemented opt-in
@@ -220,19 +204,16 @@ Practical guidance
 ## RLE opportunity (design)
 - Current on-disk formats:
   - Single-key (+INCLUDE): leaf stores [uint16 n][keys][include1][include2]… contiguous arrays; no RLE.
-  - Two-key: active format is row-major [nrows][k1||k2]…; no RLE. A legacy group-directory RLE prototype was removed to reduce confusion.
+  - Two-key: active format is row-major [nrows][k1||k2]…; no RLE.
 - Adding RLE (optional, format-versioned):
   - Single-key: when many adjacent keys equal, store [k][count] per run. For INCLUDEs, a follow-up could store one value per run when all INCLUDEs are identical; current implementation leaves INCLUDE layout unchanged and applies RLE only when there are no INCLUDEs.
-  - Two-key: group by k1 with [k1][off][cnt] directory plus packed k2, as in the old prototype; improves density when k1 has repeats and preserves order. Needs careful planner costing.
+  - Two-key: group by k1 with [k1][off][cnt] directory plus packed k2 (design option); improves density when k1 has repeats and preserves order. Needs careful planner costing.
 - Migration plan: guard under a new meta->version and reloption (or GUC at build) to retain compatibility. Start with single-key RLE for narrowed scope.
 - Scan fast-paths even without RLE:
   - For single-key, no INCLUDE: detect key runs on the fly and skip memcpy for repeats; SIMD-aided run boundary detection for int2/4/8 further reduces overhead.
 
 # Performance next steps (plan)
-- Enable microprofile counters: set `smol.profile=on` (now also via `SMOL_PROFILE=1` in bench scripts) to log per-scan calls/rows/pages/bytes/bsearch steps at `amendscan`.
-- Run quick sanity benches before long runs:
-  - Gap scenario: `SMOL_PROFILE=1 ROWS=1000000 make bench-gap-scenario` (reports size/time/plan; logs counters).
-  - Selectivity sweep: `SMOL_PROFILE=1 COMPACT=1 ROWS=5000000 COLS=1,2 WORKERS=0,5 make bench-smol-vs-btree`.
+- Enable microprofile counters: set `smol.profile=on` to log per-scan calls/rows/pages/bytes/bsearch steps at `amendscan`.
 - Inspect hotspots:
   - Copy cost: counters `bytes_copied` vs time. If high, consider wider copies (8-byte moves are used; explore 16-byte when safe) and reducing redundant copies for INCLUDE.
   - Comparator cost: `smol_cmp_keyptr_bound_generic` calls dominate bsearch; add type-specialized inline compares for builtin int2/4/8 to avoid fmgr calls.
@@ -283,19 +264,13 @@ Here are tight notes for your LLM coding agent:
   * `INSERT/UPDATE/DELETE` on the indexed table raises your AM’s `FEATURE_NOT_SUPPORTED` error.
   * `SELECT` that can use the index produces correct results via your scan callbacks.
   * `VACUUM` should be a no-op on the index relation, since it's read-only.
-Bench and Timeouts
-- All benchmark scripts must wrap every psql invocation in a hard timeout to avoid hangs.
-- Standard: use `timeout -k 5s ${TIMEOUT_SEC:-30}s psql ...` for both `-c` and heredoc invocations.
-- Scripts should exit on timeout and print a clear error; default TIMEOUT_SEC is 30 seconds.
-
 Inside-Container Workflow
 - Use the same bare targets inside the container:
   - `make build` — clean build and install
   - `make start` — initdb if needed and start PostgreSQL
   - `make check` — build, run regression (installcheck), then stop PG
-  - `make bench-smol-btree-5m` — run the single-key-focused benchmark (leaves PG running)
 - Use `make stop` to stop PostgreSQL when finished.
-- Benchmark scripts honor `TIMEOUT_SEC` and `KILL_AFTER` env vars.
+ 
 
 Profiling smol_gettuple
 - Set `smol.profile = on` (superuser GUC) to log per-scan counters at endscan:
@@ -305,10 +280,7 @@ Profiling smol_gettuple
   - Reduce small memcpy overhead by favoring constant-size copies (2/4/8 bytes).
 
 ## Session Playbook (Learn-and-Do)
-- Never run regression and benchmarks at the same time. Before `make check`, ensure no bench run is active; if uncertain, stop PG (`make stop`), then `make start` and rerun.
-- Always set a server-side `statement_timeout` in benches for long statements (CREATE INDEX) to be <= client `TIMEOUT_SEC - 2s`. This prevents orphan backends when the client times out.
-- For fair IOS benchmarking, VACUUM the base table (not the index): `VACUUM (ANALYZE, FREEZE, DISABLE_PAGE_SKIPPING) <table>` after index creation (BTREE arm). Keep `enable_seqscan=off`, `enable_bitmapscan=off`, `enable_indexonlyscan=on`.
-- Scale benches under the 30s cap: prefer `ROWS=2e6..3e6` if `TIMEOUT_SEC=30`. If the goal is scaling, raise `TIMEOUT_SEC` only for bench runs; do not change regression timeouts.
+ 
 - If `DROP DATABASE` hangs in installcheck: (1) inspect `pg_stat_activity` for lingering `CREATE INDEX` sessions; (2) terminate them; if stuck, (3) `pg_ctl -m immediate stop` then start; (4) rerun installcheck.
 ### Troubleshooting: pg_regress DROP DATABASE hangs
 - Symptom: server log repeats "still waiting for backend to accept ProcSignalBarrier" during `DROP DATABASE IF EXISTS "contrib_regression"`.
@@ -322,9 +294,9 @@ Profiling smol_gettuple
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.
 
 
-## Test & Benchmark Design (Correctness + Performance)
+## Test Design (Correctness)
 
-This section proposes focused, fast correctness tests and higher‑signal benchmark queries tailored to SMOL’s design and likely pitfalls. The goal is to catch ordering/boundary issues, page‑chain traversal, two‑column grouping, backward scans, and parallel leaf claiming. Where heavy data is needed (to force multi‑level trees), guard with psql vars to keep regression fast.
+This section proposes focused, fast correctness tests tailored to SMOL’s design and likely pitfalls. The goal is to catch ordering/boundary issues, page‑chain traversal, two‑column grouping, backward scans, and parallel leaf claiming. Where heavy data is needed (to force multi‑level trees), guard with psql vars to keep regression fast.
 
 Guiding principles
 - Always compare to a BTREE baseline (assumed correct). Use INCLUDE(a) for two‑column baselines to match IOS behavior.
@@ -395,8 +367,10 @@ SQL
   SELECT (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) =
          (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) AS match;  -- same query; planner may choose BTREE
   SET enable_indexscan=off;  -- force IOS
-  SELECT (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) AS smol_sum;
-  SET enable_indexscan=on; SET enable_indexonlyscan=on;
+SELECT (SELECT sum(a)::bigint FROM t2 WHERE b > 2 AND a = 17) AS smol_sum;
+SET enable_indexscan=on; SET enable_indexonlyscan=on;
+
+##
 
 5) No‑match and out‑of‑range bounds
 - Fast‑fail behavior and correct empty results for upper bounds above max or strict lower bounds above all values.
@@ -487,33 +461,26 @@ SQL
   SELECT ((SELECT count(*)::bigint FROM px WHERE b > 500 AND a = 42) =
           (SELECT count(*)::bigint FROM px WHERE b > 500 AND a = 42)) AS match_eq;
 
-### Benchmark Query Additions (performance signal)
+### Performance query ideas (signal)
 
 1) Selectivity sweep (single‑col and two‑col)
 - For TBL(a,b) with SMOL(b[,a]) and BTREE(b INCLUDE a), run b > percentile thresholds (P10,P50,P90,P99) and record plan, runtime, and rows.
 - Two‑col: also run b > P50 AND a = const with varying equality selectivity (~0.1%, 1%, 10%).
 
-2) Out‑of‑range and no‑match microbench
-- Measure overhead of scans that quickly determine emptiness: b > max(b)+1, a = value not present.
+2) Out‑of‑range and no‑match checks
+- Exercise scans that quickly determine emptiness: b > max(b)+1, a = value not present.
 
 3) Backward scan throughput
 - Repeat the selectivity sweep with ORDER BY a DESC to ensure parity with forward throughput.
 
 4) Parallel scaling curve
-- Fix dataset; run with max_parallel_workers_per_gather in {0,1,2,3,5}; report speedup and verify counts equal baseline.
+- Fix dataset; run with max_parallel_workers_per_gather in {0,1,2,3,5}; verify counts equal baseline.
 
 5) Duplicate‑heavy distributions
-- Create skewed data with few distinct b values (e.g., Zipf or 95% in top 5 vals). Compare SMOL(b,a) vs BTREE(b INCLUDE a) for b > thresh near the heavy mode and for equality on a; watch per‑leaf group emission cost.
+- Create skewed data with few distinct b values (e.g., heavy head). Compare SMOL(b,a) vs BTREE(b INCLUDE a); watch per‑leaf group emission cost.
 
 6) Page‑boundary adversarial batches
-- Seed data so that b transitions exactly at page capacity boundaries (e.g., count per distinct b equals floor(keys_per_leaf)). Ensure scanning across rightlinks is smooth (no duplicates or gaps) and measure impact.
-
-Implementation notes for benches
-- Extend bench/smol_vs_btree.sh with optional flags:
-  - EQUAL_ON_A=val to add AND a = val when comparing two‑col.
-  - SWEEP=percentiles (e.g., 10,50,90,99) to iterate THRESH automatically based on table stats.
-  - WORKERS=n to run the same query under several parallel settings and emit one CSV row per setting.
-- Keep timeouts as is; split long maintenance into separate statements as already done.
+- Seed data so that b transitions exactly at page capacity boundaries (e.g., count per distinct b equals floor(keys_per_leaf)). Ensure scanning across rightlinks is smooth (no duplicates or gaps).
 
 ### What these catch (mapping to SMOL internals)
 - Boundaries/negatives/strict vs non‑strict: smol_cmp_keyptr_bound, binary‑search seek, strict flag.
@@ -593,14 +560,10 @@ Action items (incremental)
 - Collection logs: `collect int2/int4/int8/pair: tuples=...` emitted every `smol.progress_log_every` tuples during `table_index_build_scan`.
 - Page-build logs: `leaf built ... progress=..%` (1-col) and `leaf(2col) built ... progress=..%`.
 
-## Benchmark Snapshot (reference)
-- Environment: Docker "smol", PG18, bench/smol_vs_btree.sh with ROWS=1,000,000, TIMEOUT_SEC=30, BATCH=100000, CHUNK_MIN=20000, PGOPTIONS='-c max_parallel_workers_per_gather=0 -c min_parallel_index_scan_size=0'.
-- Multi-col (b,a): BTREE build 228 ms, 21.48 MB, query 36.98 ms (actual ~18.99 ms); SMOL build 92 ms, 2.20 MB, query 28.75 ms (actual ~16.44 ms).
-- Single-col (b): BTREE build 205 ms, 7.17 MB, query 27.53 ms (actual ~20.33 ms); SMOL build 40 ms, 1.95 MB, query 27.93 ms (actual ~15.70 ms).
-- Note: For larger ROWS (e.g., 5M), revisit—user observed slower CREATE INDEX for SMOL; 1M snapshot shows SMOL build faster but we need to validate trend at scale.
+## 
 
 ### 5M rows (multi-col b,a), 30s per-step cap
-- Result (bench/smol_vs_btree.sh default):
+- Result:
   - BTREE: Build_ms=1165, Size_MB=107.28, Query_ms=263.68
   - SMOL: Build_ms≈30007 (hit 30s timeout), Size/Query unavailable (canceled)
 - Indicates SMOL build path exceeds 30s at 5M; need profiling to separate collect vs sort vs write phases (enable `smol.debug_log=on`).
@@ -609,7 +572,7 @@ Note: Attempted switching build to tuplesort to remove the sort bottleneck; firs
 
 ## Testing Checklist
 
-## Investigation Log (2025-09-23)
+## Investigation Log
 - Reproduced 5M two-col timeout at ~30s; no lock waits observed. Collection logs advance rapidly; many leaf inits; client timeout kills CREATE INDEX.
 - Binary-searched 3s cap for two-col: OK up to ~2.60M; first timeout at ~2.62M. Single-col is fine at these scales. Bottleneck is two-col path.
 - Added detailed build-phase logs. With TIMEOUT_SEC=1 at 3.0M (two-col), sort completes quickly (~80 ms), leaf write completes, and cancellation occurs during root build. The last log before cancel is the root PageAddItem failure fallback:
@@ -642,9 +605,9 @@ Note: Attempted switching build to tuplesort to remove the sort bottleneck; firs
   - On leaf advance, atomically publish `rightlink` and move.
 - Next: finish the init/advance control flow and re‑enable amcanparallel (single-worker path remains correct and fast).
 
-## Bench & Deterministic Testing Notes
-- Bench harness standardized to prefer 5‑way parallel IOS by setting planner GUCs and `min_parallel_*_scan_size=0`.
-- Script supports `COLTYPE=int2|int4|int8` and scales to ≥50M; maintenance split into CHECKPOINT, VACUUM, ANALYZE per-step with timeouts.
+## Deterministic Testing Notes
+ - Prefer up to 5‑way parallel IOS for inspection by setting planner GUCs and `min_parallel_*_scan_size=0`.
+ - Use small to moderate scales for correctness; split maintenance into CHECKPOINT, VACUUM, ANALYZE per-step with timeouts when experimenting.
 - Deterministic correctness checks use:
   - `mode(a)` from first 100k by `ctid` to choose a reasonably selective constant.
   - GROUP BY a hash comparison (baseline vs forced SMOL, single and parallel once DSM splitter is finalized).
@@ -663,12 +626,4 @@ Note: Attempted switching build to tuplesort to remove the sort bottleneck; firs
   - COUNT(*) scenarios: SMOL shows 2–8× speedups as selectivity grows, due to fewer pages and reduced per-row overhead.
   - SUM over INCLUDEs: SMOL leads by ~1.1–1.8× without include‑RLE; we expect larger wins once include‑RLE writer is enabled.
 
-## Benchmarking Additions
-- New target: `make bench-rle-advantage` (parameters: `ROWS`, `WORKERS`, `INC`, `COLTYPE`, `UNIQVALS`, `SWEEP_UNIQVALS`, `DISTRIBUTION=uniform|zipf`). Suggested sweep: `SWEEP_UNIQVALS=10,1000,100%`.
-- Selectivity sweep: set `SWEEP="0.12,0.5,0.99"` (or any list). Results written to `results/rle_adv.csv`.
-- Helpers:
-  - Pretty summary: `make rle-adv-pretty ROWS=... WORKERS=... INC=...`
-  - Plot (requires matplotlib): `make rle-adv-plot ROWS=... WORKERS=... INC=... OUT=results/plot.png`
-- Reproducible “wipe-the-floor” scenario (50M rows, 5 workers, INC=16):
-  - 12% selectivity: COUNT ~2.6× faster; SUM ~1.07× faster; SMOL ~1.7× smaller.
-  - 50% selectivity: COUNT ~7.6× faster; SUM ~1.47× faster; same size gap.
+## 

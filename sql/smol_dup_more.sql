@@ -15,21 +15,17 @@ SELECT 7::int2, i::int8 FROM generate_series(1,20000) i;
 CREATE INDEX m_a_smol ON m USING smol(a) INCLUDE (x);
 SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
 
--- Baseline with skip-dup-copy off
-SET smol.skip_dup_copy=off;
+-- Baseline
 COPY (SELECT count(*) FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT sum(x)::bigint FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT a FROM m WHERE a=7 ORDER BY a DESC LIMIT 5) TO STDOUT;
 
--- Turn on skip-dup-copy and verify results identical
-SET smol.skip_dup_copy=on;
+-- Repeat and verify stability
 COPY (SELECT count(*) FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT sum(x)::bigint FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT a FROM m WHERE a=7 ORDER BY a DESC LIMIT 5) TO STDOUT;
 
--- Change prefetch and parallel-claim knobs; results must still match
-SET smol.prefetch_depth=4;
-SET smol.parallel_claim_batch=4;
+-- Third repeat
 COPY (SELECT count(*) FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT sum(x)::bigint FROM m WHERE a=7) TO STDOUT;
 COPY (SELECT a FROM m WHERE a=7 ORDER BY a DESC LIMIT 5) TO STDOUT;

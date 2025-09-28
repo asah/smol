@@ -1,10 +1,11 @@
 /*
- * smol.c (restart, minimal skeleton)
+ * smol.c
  *
- * Fresh, simplified scaffold for the SMOL index AM. The full previous
- * implementation has been moved to smol-old.c for reference only.
- * This file provides a compilable handler and stubs to enable iterative
- * development in small steps.
+ * PostgreSQL index access method "smol": a read-only, space-efficient,
+ * index-only-scan oriented AM that stores packed fixed-width keys.
+ * Supports ordered and backward scans, single-key INCLUDE columns, and
+ * single-key RLE encoding (C/POSIX collation for text keys) is always on
+ * when beneficial for space; reader transparently handles both layouts.
  */
 
 #include "postgres.h"
@@ -27,6 +28,13 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/elog.h"
+#include "access/amvalidate.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_opclass.h"
+#include "utils/syscache.h"
+#include "utils/regproc.h"
+#include "catalog/pg_collation_d.h"
 #include <string.h>
 #include <stdint.h>
 #include "utils/memutils.h"
@@ -48,25 +56,26 @@
 
 PG_MODULE_MAGIC;
 
-/* ---- Lightweight logging ------------------------------------------------ */
+/* ---- Logging and GUCs --------------------------------------------------- */
 #ifndef SMOL_TRACE
 #define SMOL_TRACE 1
 #endif
 
 static bool smol_debug_log = false; /* toggled by GUC smol.debug_log */
 static bool smol_profile_log = false; /* toggled by GUC smol.profile */
-static bool smol_skip_dup_copy = true; /* GUC: skip key memcpy within equal-key runs (single-key) */
 static int  smol_progress_log_every = 250000; /* GUC: log progress every N tuples */
 static int  smol_wait_log_ms = 500; /* GUC: log waits longer than this (ms) */
-static bool smol_rle_enable = false; /* GUC: enable RLE encoding for single-key leaves */
 /* Planner cost GUCs */
-static double smol_cost_page = 0.02;
-static double smol_cost_tup = 0.002;
-static double smol_selec_eq = 0.01;
-static double smol_selec_range = 0.10;
-static int  smol_parallel_claim_batch = 1; /* number of leaves to reserve per atomic claim */
-static int  smol_prefetch_depth = 1; /* speculative prefetch of next N leaf blocks (forward scans) */
+static double smol_cost_page = 0.01;   /* cheaper page walk for contiguous IOS */
+static double smol_cost_tup = 0.0015;  /* per-tuple CPU lower after optimizations */
+static double smol_selec_eq = 0.05;    /* heuristic equality selectivity */
+static double smol_selec_range = 0.15; /* heuristic range selectivity */
+static const int  smol_parallel_claim_batch = 1; /* fixed: reserve one leaf per claim */
+static const int  smol_prefetch_depth = 1; /* fixed: single-step prefetch only */
 extern int maintenance_work_mem;
+/* Debug GUCs */
+static int smol_log_hex_limit = 16;   /* bytes to hex-dump when logging */
+static int smol_log_sample_n = 8;     /* sample first N items per phase */
 
 #if SMOL_TRACE
 #define SMOL_LOG(msg) \
@@ -79,6 +88,9 @@ extern int maintenance_work_mem;
 #endif
 
 void _PG_init(void);
+
+/* Forward decl for debug helper used in amgettuple */
+static char *smol_hex(const char *buf, int len, int maxbytes);
 
 void
 _PG_init(void)
@@ -99,25 +111,9 @@ _PG_init(void)
                              false,
                              PGC_SUSET,
                              0,
-                             NULL, NULL, NULL);
+                            NULL, NULL, NULL);
 
-    DefineCustomBoolVariable("smol.skip_dup_copy",
-                             "Skip key memcpy within equal-key runs (single-key)",
-                             "When on, single-key scans avoid copying the key for repeated values across a run; INCLUDEs are still copied.",
-                             &smol_skip_dup_copy,
-                             true,
-                             PGC_SUSET,
-                             0,
-                             NULL, NULL, NULL);
-
-    DefineCustomBoolVariable("smol.rle",
-                             "Enable RLE encoding for single-key leaves",
-                             "When on, single-key (no INCLUDE) leaves may be stored as runs of (key,count) when beneficial.",
-                             &smol_rle_enable,
-                             false,
-                             PGC_USERSET,
-                             0,
-                             NULL, NULL, NULL);
+    /* RLE is always considered; no GUC. */
 
     DefineCustomIntVariable("smol.progress_log_every",
                             "Emit progress logs every N tuples during build",
@@ -173,19 +169,21 @@ _PG_init(void)
                              PGC_USERSET, 0,
                              NULL, NULL, NULL);
 
-    DefineCustomIntVariable("smol.parallel_claim_batch",
-                            "Number of leaves reserved per parallel claim",
-                            "Higher values reduce atomic contention by reserving multiple rightlinked leaves per worker claim.",
-                            &smol_parallel_claim_batch,
-                            1, 1, 32,
+    /* Removed minor tuning GUCs for simplicity: skip_dup_copy, parallel_claim_batch, prefetch_depth */
+
+    DefineCustomIntVariable("smol.log_hex_limit",
+                            "Bytes to hex-dump when smol.debug_log is on",
+                            NULL,
+                            &smol_log_hex_limit,
+                            16, 1, 128,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
 
-    DefineCustomIntVariable("smol.prefetch_depth",
-                            "Speculative prefetch depth for forward scans",
-                            "Number of subsequent leaf blocks to prefetch speculatively (forward scans).",
-                            &smol_prefetch_depth,
-                            1, 0, 8,
+    DefineCustomIntVariable("smol.log_sample_n",
+                            "Sample first N items to log per build/scan block",
+                            NULL,
+                            &smol_log_sample_n,
+                            8, 0, 1000,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
 }
@@ -210,6 +208,16 @@ smol_pair_qsort_cmp(const void *pa, const void *pb)
     Datum da2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*a2): g_key_len2==2?Int16GetDatum(*(int16*)a2): g_key_len2==4?Int32GetDatum(*(int32*)a2): Int64GetDatum(*(int64*)a2)) : PointerGetDatum(a2);
     Datum db2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*b2): g_key_len2==2?Int16GetDatum(*(int16*)b2): g_key_len2==4?Int32GetDatum(*(int32*)b2): Int64GetDatum(*(int64*)b2)) : PointerGetDatum(b2);
     int32 r2 = DatumGetInt32(FunctionCall2Coll(&g_cmp2, g_coll2, da2, db2)); return r2;
+}
+
+/* qsort comparator for fixed-size byte keys (uses g_k1buf/g_key_len1) */
+static int
+smol_qsort_cmp_bytes(const void *pa, const void *pb)
+{
+    uint32 ia = *(const uint32 *) pa, ib = *(const uint32 *) pb;
+    const char *a = g_k1buf + (size_t) ia * g_key_len1;
+    const char *b = g_k1buf + (size_t) ib * g_key_len1;
+    return memcmp(a, b, g_key_len1);
 }
 
 /* forward decls */
@@ -353,8 +361,10 @@ typedef struct SmolScanOpaqueData
     char        inc_align[16];
     uint16      inc_offs[16];   /* offsets inside tuple data area (from data_off) */
     void      (*inc_copy[16])(char *dst, const char *src);
+    bool        inc_is_text[16]; /* include attr is text32 (varlena in tuple) */
     bool        inc_const[16];  /* within current run, include[ii] is constant */
     bool        run_inc_evaluated; /* inc_const[] computed for current run */
+    int16       run_inc_len[16];   /* cached include varlena lengths for run when inc_const */
 
     /* lightweight profiling (enabled by smol.profile) */
     bool        prof_enabled;
@@ -380,8 +390,17 @@ typedef struct SmolScanOpaqueData
     uint16      run_end_off;    /* inclusive (for forward scans) */
     uint16      run_key_len;    /* bytes of key stored in run_key */
     char        run_key[16];    /* store up to 16 bytes of fixed-length key */
+    int16       run_text_klen;  /* cached varlena key length for current run (text32) */
+    /* Prebuilt varlena blobs reused within run (text) */
+    bool        run_key_built;
+    int16       run_key_vl_len; /* bytes in run_key_vl (VARHDR+payload) */
+    char        run_key_vl[VARHDRSZ + 32];
+    bool        run_inc_built[16];
+    int16       run_inc_vl_len[16];
+    char        run_inc_vl[16][VARHDRSZ + 32];
     /* key type flags */
     bool        key_is_text32;  /* true when key type is text/varchar packed to 32B */
+    bool        has_varwidth;   /* any varlena field present in tuple (key or includes) */
 } SmolScanOpaqueData;
 typedef SmolScanOpaqueData *SmolScanOpaque;
 
@@ -403,6 +422,8 @@ static void smol_build_tree_from_sorted(Relation idx, const void *keys, Size nke
 static void smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * const *incs,
                              Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 static void smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len);
+static void smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * const *incs,
+                             Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 /* removed: static void smol_build_tree2_from_sorted(...); */
 static void smol_build_internal_levels(Relation idx,
                                        BlockNumber *child_blks, const int64 *child_high,
@@ -430,6 +451,8 @@ static bool smol_leaf_run_bounds_rle(Page page, uint16 idx, uint16 key_len,
 static inline char *smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n,
                                       const uint16 *inc_lens, uint16 ninc,
                                       uint16 inc_idx, uint32 row);
+/* Build single-column tuple in-place with dynamic varlena offsets */
+static inline void smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 row);
 /* Two-column row-major helpers (generic fixed-length)
  * On-disk 2-key leaf payload layout:
  *   [uint16 nrows][row0: k1||k2][row1: k1||k2]...
@@ -458,8 +481,9 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
         text *bt = DatumGetTextPP(so->bound_datum);
         int blen = VARSIZE_ANY_EXHDR(bt);
         const char *b = VARDATA_ANY(bt);
-        /* Compute key length up to first zero */
-        int klen = 0; while (klen < 32 && keyp[klen] != '\0') klen++;
+        /* Compute key length up to first zero using memchr */
+        const char *kend = (const char *) memchr(keyp, '\0', 32);
+        int klen = kend ? (int)(kend - keyp) : 32;
         int minl = (klen < blen) ? klen : blen;
         int cmp = minl ? memcmp(keyp, b, minl) : 0;
         if (cmp != 0) return (cmp > 0) - (cmp < 0);
@@ -544,7 +568,17 @@ static void ts_build_cb_text(Relation rel, ItemPointer tid, Datum *values, bool 
 typedef struct { char **pk1; char **pk2; Size *pcap; Size *pcount; uint16 len1; uint16 len2; bool byval1; bool byval2; } PairArrCtx;
 static void smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 /* Single-key + INCLUDE collection (generic fixed-length include attrs) */
-typedef struct CollectIncCtx { int64 **pk; char **pi[16]; uint16 ilen[16]; bool ibyval[16]; bool itext[16]; Size *pcap; Size *pcount; int incn; } CollectIncCtx;
+typedef struct CollectIncCtx {
+    /* key collection: either int64 (fixed-width ints) or fixed-size bytes for text32 */
+    int64 **pk;           /* when !key_is_text32 */
+    char  **pkbytes;      /* when key_is_text32 */
+    uint16 key_len;       /* 8/16/32 for text */
+    bool   key_is_text32; /* key is TEXTOID packed to key_len */
+    /* include buffers (pointers-to-pointers so we can grow/assign) */
+    char **pi[16];
+    uint16 ilen[16]; bool ibyval[16]; bool itext[16];
+    Size *pcap; Size *pcount; int incn;
+} CollectIncCtx;
 static void smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 
 /* --- Handler: wire a minimal IndexAmRoutine --- */
@@ -669,7 +703,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
 
     if (nkeyatts == 1 && ninclude > 0)
     {
-        /* Single-key with INCLUDE fixed-width ints */
+        /* Single-key with INCLUDE (fixed-width ints or text) */
         int inc_count = ninclude;
         uint16 inc_lens[16]; bool inc_byval[16]; bool inc_is_text[16];
         if (inc_count > 16)
@@ -693,38 +727,102 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         Size cap = 0, n = 0;
         int64 *karr = NULL;
         char *incarr[16]; memset(incarr, 0, sizeof(incarr));
-        CollectIncCtx cctx; cctx.pk = &karr; for (int i=0;i<inc_count;i++){ cctx.pi[i] = &incarr[i]; cctx.ilen[i] = inc_lens[i]; cctx.ibyval[i] = inc_byval[i]; cctx.itext[i] = inc_is_text[i]; } cctx.pcap=&cap; cctx.pcount=&n; cctx.incn=inc_count;
+        CollectIncCtx cctx; memset(&cctx, 0, sizeof(cctx));
+        char *kbytes = NULL;
+        cctx.pk = &karr;
+        cctx.pkbytes = &kbytes;
+        cctx.key_is_text32 = (atttypid == TEXTOID);
+        cctx.key_len = key_len;
+        for (int i=0;i<inc_count;i++){ cctx.pi[i] = &incarr[i]; cctx.ilen[i] = inc_lens[i]; cctx.ibyval[i] = inc_byval[i]; cctx.itext[i] = inc_is_text[i]; }
+        cctx.pcap=&cap; cctx.pcount=&n; cctx.incn=inc_count;
         table_index_build_scan(heap, index, indexInfo, true, true, smol_build_cb_inc, (void *) &cctx, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
         SMOL_LOGF("build: collected rows=%zu (key+%d includes)", (size_t) n, inc_count);
+        /* Specialize INCLUDE text caps (8/16/32) and repack source buffers to new stride. */
+        if (n > 0)
+        {
+            for (int c = 0; c < inc_count; c++)
+            {
+                if (!inc_is_text[c]) continue;
+                uint16 old_stride = inc_lens[c];
+                int maxlen = 0;
+                for (Size r = 0; r < n; r++)
+                {
+                    const char *p = incarr[c] + ((size_t) r * old_stride);
+                    const char *zend = (const char *) memchr(p, '\0', old_stride);
+                    int len = zend ? (int)(zend - p) : (int) old_stride;
+                    if (len > maxlen) maxlen = len;
+                }
+                uint16 new_stride = (maxlen <= 8) ? 8 : (maxlen <= 16 ? 16 : 32);
+                if (new_stride != old_stride)
+                {
+                    char *nbuf = (char *) palloc(((Size) n) * new_stride);
+                    for (Size r = 0; r < n; r++)
+                    {
+                        const char *src = incarr[c] + ((size_t) r * old_stride);
+                        const char *zend = (const char *) memchr(src, '\0', old_stride);
+                        int len = zend ? (int)(zend - src) : (int) old_stride;
+                        if (len > (int) new_stride) len = (int) new_stride;
+                        if (len > 0) memcpy(nbuf + ((size_t) r * new_stride), src, (size_t) len);
+                        if (len < (int) new_stride) memset(nbuf + ((size_t) r * new_stride) + len, 0, (size_t) (new_stride - len));
+                    }
+                    pfree(incarr[c]);
+                    incarr[c] = nbuf;
+                    inc_lens[c] = new_stride;
+                }
+            }
+        }
         /* Build permutation via radix sort */
         if (n > 0)
         {
-            uint64 *norm = (uint64 *) palloc(n * sizeof(uint64));
             uint32 *idx = (uint32 *) palloc(n * sizeof(uint32));
-            uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
-            for (Size i = 0; i < n; i++) { norm[i] = smol_norm64(karr[i]); idx[i] = (uint32) i; }
-            smol_radix_sort_idx_u64(norm, idx, tmp, n);
-            pfree(norm); pfree(tmp);
-            /* Apply permutation into new arrays */
-            int64 *sk = (int64 *) palloc(n * sizeof(int64));
+            for (Size i = 0; i < n; i++) idx[i] = (uint32) i;
             char *sinc[16]; for (int i=0;i<inc_count;i++) sinc[i] = (char *) palloc(((Size) n) * inc_lens[i]);
-            for (Size i = 0; i < n; i++)
+            if (!cctx.key_is_text32)
             {
-                uint32 j = idx[i]; sk[i] = karr[j];
-                for (int c = 0; c < inc_count; c++)
+                /* radix sort by int64 key */
+                uint64 *norm = (uint64 *) palloc(n * sizeof(uint64));
+                uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
+                for (Size i = 0; i < n; i++) norm[i] = smol_norm64(karr[i]);
+                smol_radix_sort_idx_u64(norm, idx, tmp, n);
+                pfree(norm); pfree(tmp);
+                /* Apply permutation */
+                int64 *sk = (int64 *) palloc(n * sizeof(int64));
+                for (Size i = 0; i < n; i++)
                 {
-                    memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
+                    uint32 j = idx[i]; sk[i] = karr[j];
+                    for (int c = 0; c < inc_count; c++)
+                        memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
                 }
+                pfree(idx);
+                SMOL_LOGF("build phase: write start n=%zu (includes=%d)", (size_t) n, inc_count);
+                smol_build_tree1_inc_from_sorted(index, sk, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
+                for (int i=0;i<inc_count;i++) pfree(sinc[i]);
+                pfree(sk);
             }
-            pfree(idx);
-            SMOL_LOGF("build phase: write start n=%zu (includes=%d)", (size_t) n, inc_count);
-            /* Write tree and meta with include info */
-            /* Reuse single-column writer with include support */
-            /* Implement below: smol_build_tree1_inc_from_sorted */
-            smol_build_tree1_inc_from_sorted(index, sk, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
-            for (int i=0;i<inc_count;i++) pfree(sinc[i]);
-            pfree(sk);
+            else
+            {
+                /* Text32: sort by binary memcmp on fixed-size keys */
+                /* n * key_len */
+                /* qsort indices by key bytes */
+                g_k1buf = kbytes; g_key_len1 = key_len; /* reuse globals for simple cmp */
+                qsort(idx, n, sizeof(uint32), smol_qsort_cmp_bytes);
+                /* Apply permutation */
+                char *skeys = (char *) palloc(((Size) n) * key_len);
+                for (Size i = 0; i < n; i++)
+                {
+                    uint32 j = idx[i];
+                    memcpy(skeys + ((size_t) i * key_len), kbytes + ((size_t) j * key_len), key_len);
+                    for (int c = 0; c < inc_count; c++)
+                        memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
+                }
+                pfree(idx);
+                SMOL_LOGF("build phase: write start n=%zu (includes=%d, text32)", (size_t) n, inc_count);
+                smol_build_text_inc_from_sorted(index, (const char *) skeys, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
+                for (int i=0;i<inc_count;i++) pfree(sinc[i]);
+                pfree(skeys);
+                pfree(kbytes);
+            }
         }
         for (int i=0;i<inc_count;i++) if (incarr[i]) pfree(incarr[i]);
         if (karr) pfree(karr);
@@ -806,6 +904,12 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     {
         /* Single-key text: sort with tuplesort then pack to 32-byte padded keys */
         Oid ltOp; Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+        if (coll != C_COLLATION_OID)
+        {
+            char *cname = get_collation_name(coll);
+            if (!(cname && (strcmp(cname, "C") == 0 || strcmp(cname, "POSIX") == 0)))
+                ereport(ERROR, (errmsg("smol text keys require C/POSIX collation")));
+        }
         TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
         Tuplesortstate *ts; 
         TsBuildCtxText cb; int maxlen = 0; 
@@ -1032,7 +1136,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         Size data_off = MAXALIGN(sizeof(IndexTupleData));
         Size off1 = data_off;
         Size off2 = 0;
-        Size sz;
+        Size sz = 0;
         int16 typlen1; bool byval1; char align1;
         int16 typlen2 = 0; bool byval2 = true; char align2 = TYPALIGN_INT;
         get_typlenbyvalalign(so->atttypid, &typlen1, &byval1, &align1);
@@ -1051,30 +1155,43 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
                 /* include attrs follow key attrs in the index tupdesc */
                 Form_pg_attribute att = TupleDescAttr(RelationGetDescr(index), 1 /* key attr */ + i);
                 so->inc_align[i] = att->attalign;
+                Oid attoid = att->atttypid;
+                so->inc_is_text[i] = (attoid == TEXTOID);
             }
         }
         so->align1 = align1;
         so->align2 = align2;
+        bool key_is_text = (so->atttypid == TEXTOID);
         if (!so->two_col)
         {
-            /* Layout: key followed by INCLUDE attrs, each aligned per attalign */
-            sz = off1 + so->key_len;
-            Size cur = sz;
+            /* Single-col: key then INCLUDE attrs aligned per attalign */
+            Size stored_key_size = key_is_text ? (Size)(VARHDRSZ + so->key_len) : (Size) so->key_len;
+            Size cur = off1 + stored_key_size;
             for (uint16 i=0;i<so->ninclude;i++)
             {
                 cur = att_align_nominal(cur, so->inc_align[i]);
                 so->inc_offs[i] = (uint16) (cur - data_off);
-                cur += so->inc_len[i];
+                Size inc_bytes = so->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_len[i]) : (Size) so->inc_len[i];
+                cur += inc_bytes;
             }
-            sz = cur;
+            sz = MAXALIGN(cur);
         }
         else
         {
+            /* Two-col: compute offset/aligned size for key2 */
             off2 = att_align_nominal(off1 + so->key_len, align2);
-            sz = off2 + so->key_len2;
+            sz = MAXALIGN(off2 + so->key_len2);
         }
-        so->itup = (IndexTuple) palloc0(sz + VARHDRSZ + 32);
-        so->itup->t_info = (unsigned short) sz; /* updated per-row for varwidth */
+        if (smol_debug_log)
+        {
+            SMOL_LOGF("beginscan layout: key_len=%u two_col=%d ninclude=%u sz=%zu", so->key_len, so->two_col, so->ninclude, (size_t) sz);
+            for (uint16 i=0;i<so->ninclude;i++)
+                SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_len[i], so->inc_align[i], so->inc_offs[i], so->inc_is_text[i]);
+        }
+        so->itup = (IndexTuple) palloc0(sz);
+        so->has_varwidth = key_is_text;
+        for (uint16 i=0;i<so->ninclude;i++) if (so->inc_is_text[i]) { so->has_varwidth = true; break; }
+        so->itup->t_info = (unsigned short) (sz | (so->has_varwidth ? INDEX_VAR_MASK : 0)); /* updated per-row when key varwidth */
         so->itup_data = (char *) so->itup + data_off;
         so->itup_off2 = so->two_col ? (uint16) (off2 - data_off) : 0;
         so->itup_data_off = (uint16) data_off;
@@ -1088,7 +1205,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
         get_typlenbyvalalign(so->atttypid, &so->key_typlen, &so->key_byval, &so->align1);
         fmgr_info_copy(&so->cmp_fmgr, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
-        so->key_is_text32 = (so->atttypid == TEXTOID);
+        so->key_is_text32 = key_is_text;
     }
     so->prof_enabled = smol_profile_log;
     so->prof_calls = 0;
@@ -1097,6 +1214,8 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_bytes = 0;
     so->prof_touched = 0;
     so->prof_bsteps = 0;
+    so->run_key_built = false;
+    for (int i=0;i<16;i++){ so->run_inc_built[i]=false; so->run_inc_vl_len[i]=0; }
     scan->opaque = so;
     return scan;
 }
@@ -1491,7 +1610,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     if (so->bound_strict ? (c <= 0) : (c < 0))
                     { so->leaf_i++; continue; }
                     if (so->have_k1_eq && c > 0)
-                    { /* passed equality run: force advance to next leaf */ so->leaf_i = so->leaf_n; continue; }
+                    {
+                        /* Leading-key equality: once we see > bound on any leaf, we're done overall. */
+                        if (so->have_pin && BufferIsValid(so->cur_buf)) { ReleaseBuffer(so->cur_buf); so->have_pin=false; }
+                        so->cur_blk = InvalidBlockNumber;
+                        return false;
+                    }
                 }
                 /* Optional equality on second key (int2/int4/int8 only) */
                 if (so->have_k2_eq)
@@ -1549,13 +1673,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     /* Duplicate-key skip (single-key path): copy key once per run */
                     if (scan->xs_want_itup)
                     {
-                        bool need_copy = true;
-                        if (smol_skip_dup_copy && !so->two_col)
+                        /* dynamic tuple emission handles copies */
+                        if (!so->two_col)
                         {
                             if (so->run_active && so->cur_off >= so->run_start_off)
                             {
                                 /* within run: key already present in xs_itup */
-                                need_copy = false;
                             }
                             else
                             {
@@ -1580,52 +1703,36 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 so->run_active = true;
                             }
                         }
-                        if (need_copy)
+                        /* build tuple (varlena dynamic or fixed-size fast path) */
+                        uint32 row = (uint32) (so->cur_off - 1);
+                        if (so->has_varwidth)
                         {
-                            if (so->key_is_text32)
-                            {
-                                int klen = 0; while (klen < 32 && keyp[klen] != '\0') klen++;
-                                SET_VARSIZE((struct varlena *) so->itup_data, klen + VARHDRSZ);
-                                memcpy(so->itup_data + VARHDRSZ, keyp, klen);
-                                so->itup->t_info = (unsigned short) (so->itup_data_off + VARHDRSZ + klen) | INDEX_VAR_MASK;
-                            }
-                            else
-                            {
-                                if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
-                                else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
-                                else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
-                                else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
-                                else smol_copy_small(so->itup_data, keyp, so->key_len);
-                            }
+                            smol_emit_single_tuple(so, page, keyp, row);
+                        }
+                        else
+                        {
+                            if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
+                            else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
+                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
+                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                            else smol_copy_small(so->itup_data, keyp, so->key_len);
                         }
                     }
-                    /* copy INCLUDE attrs with duplicate-run skip */
-                    if (scan->xs_want_itup && so->ninclude > 0)
+                    /* include attrs handled in unified block below (supports varlena) */
+                    if (smol_debug_log)
                     {
-                        uint16 n2 = smol_leaf_nitems(page);
-                        uint32 row = (uint32) (so->cur_off - 1);
-                        bool need_inc_copy = true;
-                        if (smol_skip_dup_copy && so->run_active && !so->two_col)
+                        if (so->key_is_text32)
                         {
-                            bool all_eq = true;
-                            for (uint16 ii = 0; ii < so->ninclude; ii++)
-                            {
-                                char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-                                if (memcmp(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]) != 0)
-                                { all_eq = false; break; }
-                            }
-                            if (all_eq) need_inc_copy = false;
+                            int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
+                            SMOL_LOGF("tuple key varlena size=%d", vsz);
                         }
-                        if (need_inc_copy)
+                        for (uint16 ii=0; ii<so->ninclude; ii++)
                         {
-                            for (uint16 ii=0; ii<so->ninclude; ii++)
+                            if (so->inc_is_text[ii])
                             {
-                                char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-                                if (so->inc_len[ii] == 2) smol_copy2(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 4) smol_copy4(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 8) smol_copy8(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
-                                else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
+                                char *dst = so->itup_data + so->inc_offs[ii];
+                                int32 vsz = VARSIZE_ANY((struct varlena *) dst);
+                                SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_offs[ii]);
                             }
                         }
                     }
@@ -1653,8 +1760,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                         if (c > 0)
                         {
-                            /* We've moved past the equality run on this page; advance to next leaf */
-                            break;
+                            /* Leading-key equality: any subsequent leaf cannot have =bound */
+                            if (so->have_pin && BufferIsValid(so->cur_buf)) { ReleaseBuffer(so->cur_buf); so->have_pin=false; }
+                            so->cur_blk = InvalidBlockNumber;
+                            return false;
                         }
                         else if (c < 0)
                         {
@@ -1669,12 +1778,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     /* Duplicate-key skip (single-key path): copy key once per run */
                     if (scan->xs_want_itup)
                     {
-                        bool need_copy = true;
-                        if (smol_skip_dup_copy && !so->two_col)
+                        /* dynamic/fixed emission handles copies */
+                        if (!so->two_col)
                         {
                             if (so->run_active && so->cur_off <= so->run_end_off)
                             {
-                                need_copy = false;
+                                /* run reuse enabled */
                             }
                             else
                             {
@@ -1696,34 +1805,60 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 so->run_end_off = end;
                                 so->run_active = true;
                                 so->run_inc_evaluated = false;
+                                if (so->key_is_text32)
+                                {
+                                    const char *kend = (const char *) memchr(k0, '\0', 32);
+                                    int klen = (int) (kend ? (kend - k0) : 32);
+                                    so->run_text_klen = (int16) klen;
+                                    SET_VARSIZE((struct varlena *) so->run_key_vl, klen + VARHDRSZ);
+                                    memcpy(so->run_key_vl + VARHDRSZ, k0, (size_t) klen);
+                                    so->run_key_vl_len = (int16) (VARHDRSZ + klen);
+                                    so->run_key_built = true;
+                                }
                             }
                         }
-                        if (need_copy)
+                        uint32 row = (uint32) (so->cur_off - 1);
+                        if (so->has_varwidth)
                         {
-                            if (so->key_is_text32)
+                            /* Dynamic varlena tuple build */
+                            smol_emit_single_tuple(so, page, keyp, row);
+                            if (smol_debug_log && so->key_is_text32)
                             {
-                                int klen = 0; while (klen < 32 && keyp[klen] != '\0') klen++;
-                                SET_VARSIZE((struct varlena *) so->itup_data, klen + VARHDRSZ);
-                                memcpy(so->itup_data + VARHDRSZ, keyp, klen);
-                                so->itup->t_info = (unsigned short) (so->itup_data_off + VARHDRSZ + klen) | INDEX_VAR_MASK;
+                                int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
+                                SMOL_LOGF("tuple key varlena size=%d", vsz);
                             }
-                            else
+                        }
+                        else
+                        {
+                            /* Fixed-size fast path: copy key and includes into pre-sized tuple */
+                            if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
+                            else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
+                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
+                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                            else smol_copy_small(so->itup_data, keyp, so->key_len);
+                            if (so->ninclude > 0)
                             {
-                                if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
-                                else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
-                                else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
-                                else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
-                                else smol_copy_small(so->itup_data, keyp, so->key_len);
+                                uint16 n2 = n;
+                                for (uint16 ii=0; ii<so->ninclude; ii++)
+                                {
+                                    char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+                                    char *dst = so->itup_data + so->inc_offs[ii];
+                                    if (so->inc_len[ii] == 2) smol_copy2(dst, ip);
+                                    else if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
+                                    else if (so->inc_len[ii] == 8) smol_copy8(dst, ip);
+                                    else if (so->inc_len[ii] == 16) smol_copy16(dst, ip);
+                                    else smol_copy_small(dst, ip, so->inc_len[ii]);
+                                }
                             }
                         }
                     }
                     }
                     if (so->ninclude > 0 && scan->xs_want_itup)
                     {
+                        /* Determine include run constness for skip decisions (does not emit) */
                         uint16 n2 = n;
-                        uint32 row = (uint32) (so->cur_off - 1);
                         bool need_inc_copy = true;
-                        if (smol_skip_dup_copy && so->run_active && !so->two_col)
+                        if (so->run_active && !so->two_col)
                         {
                             if (!so->run_inc_evaluated)
                             {
@@ -1739,6 +1874,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         { all_eq = false; break; }
                                     }
                                     so->inc_const[ii] = all_eq;
+                                    if (all_eq && so->inc_is_text[ii])
+                                    {
+                                        const char *zend = (const char *) memchr(firstp, '\0', so->inc_len[ii]);
+                                        so->run_inc_len[ii] = (int16) (zend ? (zend - firstp) : so->inc_len[ii]);
+                                    }
                                 }
                                 so->run_inc_evaluated = true;
                                 if (so->cur_off == so->run_start_off)
@@ -1747,11 +1887,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     {
                                         if (!so->inc_const[ii]) continue;
                                         char *ip0 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(so->run_start_off - 1));
-                                        if (so->inc_len[ii] == 2) smol_copy2(so->itup_data + so->inc_offs[ii], ip0);
-                                        else if (so->inc_len[ii] == 4) smol_copy4(so->itup_data + so->inc_offs[ii], ip0);
-                                        else if (so->inc_len[ii] == 8) smol_copy8(so->itup_data + so->inc_offs[ii], ip0);
-                                        else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip0);
-                                        else smol_copy_small(so->itup_data + so->inc_offs[ii], ip0, so->inc_len[ii]);
+                                        if (so->inc_is_text[ii])
+                                        {
+                                            int ilen0 = 0; while (ilen0 < so->inc_len[ii] && ip0[ilen0] != '\0') ilen0++;
+                                            SET_VARSIZE((struct varlena *) so->run_inc_vl[ii], ilen0 + VARHDRSZ);
+                                            memcpy(so->run_inc_vl[ii] + VARHDRSZ, ip0, ilen0);
+                                            so->run_inc_vl_len[ii] = (int16) (VARHDRSZ + ilen0);
+                                            so->run_inc_built[ii] = true;
+                                        }
+                                        /* fixed-size includes are copied later in fixed path */
                                     }
                                 }
                             }
@@ -1760,18 +1904,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             if (all_const && so->cur_off > so->run_start_off)
                                 need_inc_copy = false;
                         }
-                        if (need_inc_copy)
-                        {
-                            for (uint16 ii=0; ii<so->ninclude; ii++)
-                            {
-                                char *ip = smol1_inc_ptr(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
-                                if (so->inc_len[ii] == 2) smol_copy2(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 4) smol_copy4(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 8) smol_copy8(so->itup_data + so->inc_offs[ii], ip);
-                                else if (so->inc_len[ii] == 16) smol_copy16(so->itup_data + so->inc_offs[ii], ip);
-                                else smol_copy_small(so->itup_data + so->inc_offs[ii], ip, so->inc_len[ii]);
-                            }
-                        }
+                        (void) need_inc_copy; /* emission already done above */
                     }
                     if (so->prof_enabled)
                     {
@@ -2002,6 +2135,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 static void
 smol_endscan(IndexScanDesc scan)
 {
+    if (smol_debug_log)
+    {
+        SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
+        elog(LOG, "[smol] endscan ptrs: itup=%p leaf_k1=%p leaf_k2=%p", (void*)(so?so->itup:NULL), (void*)(so?so->leaf_k1:NULL), (void*)(so?so->leaf_k2:NULL));
+    }
     SMOL_LOG("end scan");
     if (scan->opaque)
     {
@@ -2067,8 +2205,133 @@ smol_options(Datum reloptions, bool validate)
 static bool
 smol_validate(Oid opclassoid)
 {
-    (void) opclassoid;
-    return true;
+    bool        result = true;
+    HeapTuple   classtup;
+    Form_pg_opclass classform;
+    Oid         opfamilyoid;
+    Oid         opcintype;
+    Oid         opckeytype;
+    char       *opfamilyname;
+    CatCList   *proclist,
+               *oprlist;
+    List       *grouplist;
+    OpFamilyOpFuncGroup *opclassgroup = NULL;
+    int         i;
+    ListCell   *lc;
+
+    classtup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+    if (!HeapTupleIsValid(classtup))
+        elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+    classform = (Form_pg_opclass) GETSTRUCT(classtup);
+    opfamilyoid = classform->opcfamily;
+    opcintype = classform->opcintype;
+    opckeytype = classform->opckeytype;
+    if (!OidIsValid(opckeytype))
+        opckeytype = opcintype;
+
+    opfamilyname = get_opfamily_name(opfamilyoid, false);
+
+    oprlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamilyoid));
+    proclist = SearchSysCacheList1(AMPROCNUM, ObjectIdGetDatum(opfamilyoid));
+
+    /* Support procs: require comparator at support number 1, int4 return, two args of keytype */
+    for (i = 0; i < proclist->n_members; i++)
+    {
+        HeapTuple   proctup = &proclist->members[i]->tuple;
+        Form_pg_amproc procform = (Form_pg_amproc) GETSTRUCT(proctup);
+        bool        ok = true;
+
+        if (procform->amproclefttype != procform->amprocrighttype)
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains support procedure %s with cross-type registration",
+                            opfamilyname, format_procedure(procform->amproc))));
+            result = false;
+        }
+        if (procform->amproclefttype != opcintype)
+            continue; /* only validate the class's own type group */
+
+        if (procform->amprocnum != 1)
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains function %s with invalid support number %d",
+                            opfamilyname, format_procedure(procform->amproc), procform->amprocnum)));
+            result = false;
+            continue;
+        }
+        ok = check_amproc_signature(procform->amproc, INT4OID, false, 2, 2, opckeytype, opckeytype);
+        if (!ok)
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains function %s with wrong signature for support number %d",
+                            opfamilyname, format_procedure(procform->amproc), procform->amprocnum)));
+            result = false;
+        }
+    }
+
+    /* Operators: strategies 1..5, search purpose, no ORDER BY */
+    for (i = 0; i < oprlist->n_members; i++)
+    {
+        HeapTuple   oprtup = &oprlist->members[i]->tuple;
+        Form_pg_amop oprform = (Form_pg_amop) GETSTRUCT(oprtup);
+
+        if (oprform->amopstrategy < 1 || oprform->amopstrategy > 5)
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains operator %s with invalid strategy number %d",
+                            opfamilyname, format_operator(oprform->amopopr), oprform->amopstrategy)));
+            result = false;
+        }
+        if (oprform->amoppurpose != AMOP_SEARCH || OidIsValid(oprform->amopsortfamily))
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains invalid ORDER BY specification for operator %s",
+                            opfamilyname, format_operator(oprform->amopopr))));
+            result = false;
+        }
+        if (!check_amop_signature(oprform->amopopr, BOOLOID,
+                                  oprform->amoplefttype,
+                                  oprform->amoprighttype))
+        {
+            ereport(INFO,
+                    (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                     errmsg("smol opfamily %s contains operator %s with wrong signature",
+                            opfamilyname, format_operator(oprform->amopopr))));
+            result = false;
+        }
+    }
+
+    /* Ensure the opclass group has comparator proc 1 present */
+    grouplist = identify_opfamily_groups(oprlist, proclist);
+    foreach(lc, grouplist)
+    {
+        OpFamilyOpFuncGroup *grp = (OpFamilyOpFuncGroup *) lfirst(lc);
+        if (grp->lefttype == opcintype && grp->righttype == opcintype)
+        {
+            opclassgroup = grp;
+            break;
+        }
+    }
+    if (opclassgroup == NULL || (opclassgroup->functionset & (((uint64) 1) << 1)) == 0)
+    {
+        ereport(INFO,
+                (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+                 errmsg("smol opclass is missing required comparator support function 1")));
+        result = false;
+    }
+
+    /* release syscache lists */
+    ReleaseSysCache(classtup);
+    ReleaseCatCacheList(oprlist);
+    ReleaseCatCacheList(proclist);
+    list_free(grouplist);
+
+    return result;
 }
 
 /* --- Helpers ----------------------------------------------------------- */
@@ -2088,10 +2351,10 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     double nscan;
 
     /* Heuristic selectivity: favor equality/range on leading key */
+    bool have_leading = false;
+    bool likely_eq = false;
     if (path->indexclauses != NIL)
     {
-        bool have_leading = false;
-        bool likely_eq = false;
         ListCell *lc;
         foreach(lc, path->indexclauses)
         {
@@ -2118,7 +2381,7 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     *indexTotalCost = (pages * page_cost) + (nscan * cpu_per_tuple);
 
     /* Discourage scans with no leading-key quals strongly */
-    if (qual_selec >= 0.5)
+    if (!have_leading)
         *indexTotalCost += 1e6;
 }
 
@@ -2279,7 +2542,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             bool use_rle = false;
             Size rle_sz = 0;
             uint16 rle_nruns = 0;
-            if (smol_rle_enable)
+            /* Always consider RLE and pick it when beneficial and it fits. */
             {
                 const char *base = (const char *) keys + ((size_t) i * key_len);
                 Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
@@ -2458,7 +2721,9 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
 }
 
 
-/* Build single-column tree with INCLUDE attrs from sorted arrays */
+/* Build single-column tree with INCLUDE attrs from sorted arrays.
+ * Variant for integer-like keys (keys as int64 normalized/sign-preserving).
+ */
 static void
 smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * const *incs,
                                  Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens)
@@ -2524,6 +2789,90 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         Size sz = (Size) (p - scratch);
         if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
             ereport(ERROR, (errmsg("smol: failed to add leaf payload (INCLUDE)")));
+        MarkBufferDirty(buf);
+        BlockNumber cur = BufferGetBlockNumber(buf);
+        UnlockReleaseBuffer(buf);
+        if (BlockNumberIsValid(prev))
+        {
+            Buffer pbuf = ReadBuffer(idx, prev);
+            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+            Page pp = BufferGetPage(pbuf);
+            smol_page_opaque(pp)->rightlink = cur;
+            MarkBufferDirty(pbuf);
+            UnlockReleaseBuffer(pbuf);
+        }
+        prev = cur;
+        i += n_this;
+    }
+    /* set root on meta */
+    mbuf = ReadBuffer(idx, 0);
+    LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+    mpage = BufferGetPage(mbuf);
+    meta = smol_meta_ptr(mpage);
+    meta->root_blkno = 1; /* leftmost leaf */
+    meta->height = 1;
+    MarkBufferDirty(mbuf);
+    UnlockReleaseBuffer(mbuf);
+    pfree(scratch);
+}
+
+/* Build single-column TEXT(<=32) keys with INCLUDE attrs from sorted arrays. */
+static void
+smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * const *incs,
+                                Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens)
+{
+    Buffer mbuf; Page mpage; SmolMeta *meta;
+    if (RelationGetNumberOfBlocks(idx) == 0)
+    {
+        mbuf = ReadBufferExtended(idx, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+        LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+        mpage = BufferGetPage(mbuf);
+        PageInit(mpage, BLCKSZ, 0);
+        meta = smol_meta_ptr(mpage);
+        meta->magic = SMOL_META_MAGIC;
+        meta->version = SMOL_META_VERSION;
+        meta->nkeyatts = 1;
+        meta->key_len1 = key_len;
+        meta->key_len2 = 0;
+        meta->root_blkno = InvalidBlockNumber;
+        meta->height = 0;
+        meta->inc_count = (uint16) inc_count;
+        for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+    }
+    if (nkeys == 0) return;
+    Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
+    while (i < nkeys)
+    {
+        Buffer buf = smol_extend(idx);
+        Page page = BufferGetPage(buf);
+        smol_init_page(buf, true, InvalidBlockNumber);
+        Size fs = PageGetFreeSpace(page);
+        Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
+        Size header = sizeof(uint16);
+        Size perrow = (Size) key_len; for (int c=0;c<inc_count;c++) perrow += inc_lens[c];
+        Size max_n = (avail > header) ? ((avail - header) / perrow) : 0;
+        Size remaining = nkeys - i;
+        Size n_this = (remaining < max_n) ? remaining : max_n;
+        if (n_this == 0)
+            ereport(ERROR, (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
+        memcpy(scratch, &n_this, sizeof(uint16));
+        char *p = scratch + sizeof(uint16);
+        /* keys: copy n_this fixed 8/16/32 bytes per key (binary C collation) */
+        memcpy(p, keys32 + ((size_t) i * key_len), (size_t) n_this * key_len);
+        p += (size_t) n_this * key_len;
+        /* includes: contiguous blocks per include column */
+        for (int c=0;c<inc_count;c++)
+        {
+            uint16 len = inc_lens[c];
+            Size bytes = (Size) n_this * (Size) len;
+            memcpy(p, incs[c] + ((size_t) i * len), bytes);
+            p += bytes;
+        }
+        Size sz = (Size) (p - scratch);
+        if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+            ereport(ERROR, (errmsg("smol: failed to add leaf payload (TEXT+INCLUDE)")));
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
@@ -3024,6 +3373,13 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
             if (blen > (int) key_len) ereport(ERROR,(errmsg("smol text key exceeds cap")));
             if (blen > 0) memcpy(p, src, blen);
             if (blen < (int) key_len) memset(p + blen, 0, key_len - blen);
+            if (smol_debug_log && i < (Size) smol_log_sample_n)
+            {
+                int h = (blen < smol_log_hex_limit) ? blen : smol_log_hex_limit;
+                char *hx = smol_hex((const char *) p, h, h);
+                SMOL_LOGF("build text key[%zu] blen=%d hex=%s", (size_t) i, blen, hx);
+                pfree(hx);
+            }
             if (i == n_this - 1) memcpy(lastkey, p, key_len);
             p += key_len;
         }
@@ -3500,6 +3856,81 @@ smol_copy_small(char *dst, const char *src, uint16 len)
             break;
     }
 }
+
+/* Build single-column tuple in-place with dynamic varlena offsets */
+static inline void
+smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 row)
+{
+    Size cur = so->itup_data_off; /* absolute offset from tuple start */
+    char *base = (char *) so->itup;
+    char *wp;
+    /* key */
+    cur = att_align_nominal(cur, so->align1);
+    wp = base + cur;
+    if (so->key_is_text32)
+    {
+        if (so->run_active && so->run_key_built && so->run_key_vl_len > 0)
+        {
+            memcpy(wp, so->run_key_vl, (size_t) so->run_key_vl_len);
+            cur += (Size) so->run_key_vl_len;
+        }
+        else
+        {
+            const char *kend = (const char *) memchr(keyp, '\0', 32);
+            int klen = kend ? (int)(kend - keyp) : 32;
+            SET_VARSIZE((struct varlena *) wp, klen + VARHDRSZ);
+            memcpy(wp + VARHDRSZ, keyp, klen);
+            cur += VARHDRSZ + (Size) klen;
+        }
+    }
+    else
+    {
+        if (so->key_len == 2) smol_copy2(wp, keyp);
+        else if (so->key_len == 4) smol_copy4(wp, keyp);
+        else if (so->key_len == 8) smol_copy8(wp, keyp);
+        else if (so->key_len == 16) smol_copy16(wp, keyp);
+        else smol_copy_small(wp, keyp, so->key_len);
+        cur += so->key_len;
+    }
+    /* includes */
+    if (so->ninclude > 0)
+    {
+        uint16 n2 = smol_leaf_nitems(page);
+        for (uint16 ii=0; ii<so->ninclude; ii++)
+        {
+            cur = att_align_nominal(cur, so->inc_align[ii]);
+            wp = base + cur;
+            char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+            if (so->inc_is_text[ii])
+            {
+                if (so->run_active && so->inc_const[ii] && so->run_inc_built[ii] && so->run_inc_vl_len[ii] > 0)
+                {
+                    memcpy(wp, so->run_inc_vl[ii], (size_t) so->run_inc_vl_len[ii]);
+                    cur += (Size) so->run_inc_vl_len[ii];
+                }
+                else
+                {
+                    const char *iend = (const char *) memchr(ip, '\0', so->inc_len[ii]);
+                    int ilen = iend ? (int)(iend - ip) : (int) so->inc_len[ii];
+                    SET_VARSIZE((struct varlena *) wp, ilen + VARHDRSZ);
+                    memcpy(wp + VARHDRSZ, ip, ilen);
+                    cur += VARHDRSZ + (Size) ilen;
+                }
+            }
+            else
+            {
+                if (so->inc_len[ii] == 2) smol_copy2(wp, ip);
+                else if (so->inc_len[ii] == 4) smol_copy4(wp, ip);
+                else if (so->inc_len[ii] == 8) smol_copy8(wp, ip);
+                else if (so->inc_len[ii] == 16) smol_copy16(wp, ip);
+                else smol_copy_small(wp, ip, so->inc_len[ii]);
+                cur += so->inc_len[ii];
+            }
+        }
+    }
+    cur = MAXALIGN(cur);
+    so->itup->t_info = (unsigned short) (cur | (so->has_varwidth ? INDEX_VAR_MASK : 0));
+}
 /* Callback to collect single key + INCLUDE ints */
 static void
 smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
@@ -3510,8 +3941,17 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     if (*c->pcount == *c->pcap)
     {
         Size newcap = (*c->pcap == 0 ? 1024 : *c->pcap * 2);
-        int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
-        *c->pk = newk;
+        if (!c->key_is_text32)
+        {
+            int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
+            *c->pk = newk;
+        }
+        else
+        {
+            Size bytes = (Size) newcap * (Size) c->key_len;
+            char *newkb = (*c->pcap == 0) ? (char *) palloc(bytes) : (char *) repalloc(*c->pkbytes, bytes);
+            *c->pkbytes = newkb;
+        }
         for (int i=0;i<c->incn;i++)
         {
             Size bytes = (Size) newcap * (Size) c->ilen[i];
@@ -3521,7 +3961,22 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         }
         *c->pcap = newcap;
     }
-    (*c->pk)[*c->pcount] = DatumGetInt64(values[0]);
+    if (!c->key_is_text32)
+    {
+        (*c->pk)[*c->pcount] = DatumGetInt64(values[0]);
+    }
+    else
+    {
+        /* pack text key to fixed key_len bytes (C collation assumed) */
+        text *t = DatumGetTextPP(values[0]);
+        int blen = VARSIZE_ANY_EXHDR(t);
+        if (blen > (int) c->key_len)
+            ereport(ERROR, (errmsg("smol text32 key exceeds %u bytes", (unsigned) c->key_len)));
+        char *dstk = (*c->pkbytes) + ((size_t) (*c->pcount) * (size_t) c->key_len);
+        const char *src = VARDATA_ANY(t);
+        if (blen > 0) memcpy(dstk, src, blen);
+        if (blen < (int) c->key_len) memset(dstk + blen, 0, c->key_len - blen);
+    }
     for (int i=0;i<c->incn;i++)
     {
         char *dst = (*c->pi[i]) + ((size_t)(*c->pcount) * (size_t) c->ilen[i]);
@@ -3551,4 +4006,20 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         }
     }
     (*c->pcount)++;
+}
+/* --- Debug helpers -------------------------------------------------------- */
+static char *
+smol_hex(const char *buf, int len, int maxbytes)
+{
+    int n = len < maxbytes ? len : maxbytes;
+    int outsz = n * 2 + 1; /* hex without spaces */
+    char *out = palloc(outsz);
+    for (int i = 0; i < n; i++)
+    {
+        unsigned char b = (unsigned char) buf[i];
+        out[i*2] = "0123456789ABCDEF"[b >> 4];
+        out[i*2+1] = "0123456789ABCDEF"[b & 0x0F];
+    }
+    out[outsz-1] = '\0';
+    return out;
 }

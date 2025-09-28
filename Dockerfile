@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libicu-dev \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
-    locales emacs \
+    locales jq emacs \
   && pip3 install slack_sdk matplotlib --break-system-packages \
   && rm -rf /var/lib/apt/lists/*
 
@@ -47,7 +47,7 @@ RUN ./configure \
 RUN /usr/local/pgsql/bin/pg_config
 
 # provide codex for inside-docker use
-RUN apt update && apt install nodejs npm -y \
+RUN apt update && apt install curl nodejs npm -y \
   && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
   && apt-get install -y nodejs \
   && npm install -g @openai/codex

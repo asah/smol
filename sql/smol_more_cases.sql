@@ -31,8 +31,6 @@ CREATE UNLOGGED TABLE pfd(a int2);
 INSERT INTO pfd SELECT (i%100)::int2 FROM generate_series(1,5000) i;
 CREATE INDEX pfd_a_smol ON pfd USING smol(a);
 SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
-SET smol.prefetch_depth=0;
+-- Run twice to ensure stable results
 COPY (SELECT sum(a)::bigint FROM pfd WHERE a>=50) TO STDOUT;
-SET smol.prefetch_depth=4;
 COPY (SELECT sum(a)::bigint FROM pfd WHERE a>=50) TO STDOUT;
-
