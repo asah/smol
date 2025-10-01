@@ -7,7 +7,6 @@ CREATE UNLOGGED TABLE r1(a int4);
 INSERT INTO r1 SELECT 42 FROM generate_series(1,2000);
 INSERT INTO r1 SELECT i FROM generate_series(0,19) AS s(i);
 ANALYZE r1;
-SET smol.rle = on;  -- enable RLE encoding at build time
 DROP INDEX IF EXISTS r1_smol;
 CREATE INDEX r1_smol ON r1 USING smol(a);
 SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexscan=off; SET enable_indexonlyscan=on;
@@ -31,7 +30,6 @@ CREATE UNLOGGED TABLE ic1(b int4, a1 int4, a2 int4);
 INSERT INTO ic1 SELECT 42, 111, 222 FROM generate_series(1,2000);
 INSERT INTO ic1 SELECT 7,  111, 222 FROM generate_series(1,10);
 ANALYZE ic1;
-SET smol.rle = off;  -- RLE not used with INCLUDE in this test
 DROP INDEX IF EXISTS ic1_smol;
 CREATE INDEX ic1_smol ON ic1 USING smol(b) INCLUDE (a1,a2);
 SET enable_indexscan=off; SET enable_indexonlyscan=on;

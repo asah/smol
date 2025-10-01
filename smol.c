@@ -391,6 +391,7 @@ typedef struct SmolScanOpaqueData
     uint16      run_key_len;    /* bytes of key stored in run_key */
     char        run_key[16];    /* store up to 16 bytes of fixed-length key */
     int16       run_text_klen;  /* cached varlena key length for current run (text32) */
+    bool        page_is_plain;  /* true when current page is plain (not RLE) - set once per page */
     /* Prebuilt varlena blobs reused within run (text) */
     bool        run_key_built;
     int16       run_key_vl_len; /* bytes in run_key_vl (VARHDR+payload) */
@@ -443,11 +444,13 @@ static bytea *smol_options(Datum reloptions, bool validate);
 static bool smol_validate(Oid opclassoid);
 static uint16 smol_leaf_nitems(Page page);
 static char *smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len);
+static char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc);
 static inline bool smol_key_eq_len(const char *a, const char *b, uint16 len);
 static inline void smol_run_reset(SmolScanOpaque so);
 static inline bool smol_leaf_is_rle(Page page);
-static bool smol_leaf_run_bounds_rle(Page page, uint16 idx, uint16 key_len,
-                                     uint16 *run_start_out, uint16 *run_end_out);
+static bool smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
+                                     uint16 *run_start_out, uint16 *run_end_out,
+                                     const uint16 *inc_lens, uint16 ninc);
 static inline char *smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n,
                                       const uint16 *inc_lens, uint16 ninc,
                                       uint16 inc_idx, uint32 row);
@@ -1311,7 +1314,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 so->cur_off = n;
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     if (smol_cmp_keyptr_to_bound(so, keyp) <= 0)
                         break;
                     so->cur_off--;
@@ -1409,7 +1412,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             while (lo2 <= hi2)
                             {
                                 uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                                char *kp2 = smol_leaf_keyptr(page, mid2, so->key_len);
+                                char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_len, so->ninclude);
                                 int cc = smol_cmp_keyptr_to_bound(so, kp2);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -1438,7 +1441,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            char *keyp = smol_leaf_keyptr(page, mid, so->key_len);
+                            char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude);
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1596,6 +1599,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
         buf = so->cur_buf;
         page = BufferGetPage(buf);
+        /* Check once per page if this is a plain (non-RLE) page for optimization */
+        /* Only optimize when there are NO INCLUDE columns (they need run detection for dup-caching) */
+        if (!so->two_col && so->ninclude == 0)
+            so->page_is_plain = !smol_leaf_is_rle(page);
+        else
+            so->page_is_plain = false;
         if (so->two_col)
         {
             if (so->leaf_i < so->leaf_n)
@@ -1652,7 +1661,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     if (so->have_k1_eq)
                     {
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
@@ -1688,11 +1697,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 memcpy(so->run_key, k0, so->run_key_len);
                                 uint16 start = so->cur_off;
                                 uint16 dummy_end;
-                                if (!smol_leaf_run_bounds_rle(page, so->cur_off, so->key_len, &start, &dummy_end))
+                                /* Optimization: on plain pages, each row is its own run - skip expensive scanning */
+                                if (so->page_is_plain)
                                 {
+                                    /* Plain page: run = current row only (length 1) */
+                                    start = so->cur_off;
+                                }
+                                else if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
+                                {
+                                    /* RLE page but not encoded: scan backward to find run start */
                                     while (start > FirstOffsetNumber)
                                     {
-                                        const char *kp = smol_leaf_keyptr(page, (uint16) (start - 1), so->key_len);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         start--;
@@ -1754,7 +1770,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 while (so->cur_off <= n)
                 {
-                    char *keyp = smol_leaf_keyptr(page, so->cur_off, so->key_len);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     if (so->have_k1_eq)
                     {
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
@@ -1791,11 +1807,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 so->run_key_len = (so->key_len <= sizeof(so->run_key) ? so->key_len : (uint16) sizeof(so->run_key));
                                 memcpy(so->run_key, k0, so->run_key_len);
                                 uint16 start = so->cur_off, end = so->cur_off;
-                                if (!smol_leaf_run_bounds_rle(page, so->cur_off, so->key_len, &start, &end))
+                                /* Optimization: on plain pages, each row is its own run - skip expensive scanning */
+                                if (so->page_is_plain)
                                 {
+                                    /* Plain page: run = current row only (length 1) */
+                                    start = end = so->cur_off;
+                                }
+                                else if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &end, so->inc_len, so->ninclude))
+                                {
+                                    /* RLE page but not encoded: scan forward to find run end */
                                     while (end < n)
                                     {
-                                        const char *kp = smol_leaf_keyptr(page, (uint16) (end + 1), so->key_len);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (end + 1), so->key_len, so->inc_len, so->ninclude);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         end++;
@@ -2093,7 +2116,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude);
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -2110,7 +2133,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr(np, mid2, so->key_len);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude);
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (cc > 0) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -2755,6 +2778,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         return;
 
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
+    Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
     while (i < nkeys)
     {
         Buffer buf = smol_extend(idx);
@@ -2764,31 +2788,150 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
         Size header = sizeof(uint16);
         Size perrow = (Size) key_len; for (int c=0;c<inc_count;c++) perrow += inc_lens[c];
-        Size max_n = (avail > header) ? ((avail - header) / perrow) : 0;
+        Size max_n_plain = (avail > header) ? ((avail - header) / perrow) : 0;
         Size remaining = nkeys - i;
-        Size n_this = (remaining < max_n) ? remaining : max_n;
+
+        /* Try to fit as many rows as possible using Include-RLE if beneficial */
+        bool use_inc_rle = false;
+        Size inc_rle_sz = 0;
+        uint16 inc_rle_nruns = 0;
+        Size n_this = 0;
+
+        /* First, try a larger candidate size for Include-RLE (up to 32000 rows or remaining) */
+        Size candidate = remaining;
+        if (candidate > 32000) candidate = 32000; /* Conservative uint16 limit, reserves high values */
+
+        /* Detect runs and calculate Include-RLE size */
+        Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
+        while (pos < candidate)
+        {
+            Size run = 1;
+            int64 k0 = keys[i + pos];
+            /* Check if key+includes stay constant */
+            bool run_ok = true;
+            while (pos + run < candidate && run_ok && run < 32000)
+            {
+                if (keys[i + pos + run] != k0) { run_ok = false; break; }
+                /* Check all include columns match */
+                for (int c=0; c < inc_count && run_ok; c++)
+                {
+                    Size off0 = (i + pos) * inc_lens[c];
+                    Size off1 = (i + pos + run) * inc_lens[c];
+                    if (memcmp(incs[c] + off0, incs[c] + off1, inc_lens[c]) != 0)
+                        run_ok = false;
+                }
+                if (run_ok) run++;
+            }
+            nr++;
+            if (nr >= 32000)
+            {
+                /* Too many runs for uint16 nruns field (conservative limit) */
+                break;
+            }
+            Size this_run_sz = key_len + sizeof(uint16) + ninc_bytes;
+            Size new_total = sizeof(uint16) * 3 + sz_runs + this_run_sz;
+            if (new_total > avail)
+            {
+                /* This run doesn't fit; stop here */
+                break;
+            }
+            sz_runs += this_run_sz;
+            pos += run;
+        }
+
+        inc_rle_sz = sizeof(uint16) * 3 + sz_runs;
+        inc_rle_nruns = nr;
+        Size n_rle = pos; /* Number of rows that fit with Include-RLE */
+
+        /* Decide: use Include-RLE if it fits more rows OR saves space */
+        if (n_rle > max_n_plain || (n_rle >= max_n_plain && inc_rle_sz <= avail))
+        {
+            n_this = n_rle;
+            use_inc_rle = true;
+            if (n_this > 10000)
+	        SMOL_LOGF("[smol] Include-RLE: fitting %zu rows in %u runs (rle_sz=%zu, avail=%zu)", n_this, inc_rle_nruns, inc_rle_sz, avail);
+        }
+        else
+        {
+            /* Fall back to plain format */
+            n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
+            use_inc_rle = false;
+        }
+
         if (n_this == 0)
             ereport(ERROR, (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
-        memcpy(scratch, &n_this, sizeof(uint16));
-        char *p = scratch + sizeof(uint16);
-        /* keys */
-        if (key_len == 8)
-        { memcpy(p, (const char *) (keys + i), n_this * 8); p += n_this * 8; }
-        else if (key_len == 4)
-        { for (Size j=0;j<n_this;j++){ int32 v=(int32) keys[i+j]; memcpy(p + j*4, &v, 4);} p += n_this*4; }
-        else
-        { for (Size j=0;j<n_this;j++){ int16 v=(int16) keys[i+j]; memcpy(p + j*2, &v, 2);} p += n_this*2; }
-        /* includes: contiguous blocks per include column */
-        for (int c=0;c<inc_count;c++)
+
+        if (use_inc_rle)
         {
-            uint16 len = inc_lens[c];
-            Size bytes = (Size) n_this * (Size) len;
-            memcpy(p, incs[c] + ((size_t) i * len), bytes);
-            p += bytes;
+            /* Write Include-RLE: [0x8003][nitems][nruns][runs...] */
+            uint16 tag = 0x8003u;
+            char *p = scratch;
+            uint16 nitems16 = (uint16) n_this;
+            memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &inc_rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+            Size rle_pos = 0;
+            while (rle_pos < n_this)
+            {
+                Size run = 1;
+                int64 k0 = keys[i + rle_pos];
+                bool run_ok = true;
+                while (rle_pos + run < n_this && run_ok)
+                {
+                    if (keys[i + rle_pos + run] != k0) { run_ok = false; break; }
+                    for (int c=0; c < inc_count && run_ok; c++)
+                    {
+                        Size off0 = (i + rle_pos) * inc_lens[c];
+                        Size off1 = (i + rle_pos + run) * inc_lens[c];
+                        if (memcmp(incs[c] + off0, incs[c] + off1, inc_lens[c]) != 0)
+                            run_ok = false;
+                    }
+                    if (run_ok) run++;
+                }
+                /* Write: key */
+                if (key_len == 8) { memcpy(p, &k0, 8); p += 8; }
+                else if (key_len == 4) { int32 v = (int32) k0; memcpy(p, &v, 4); p += 4; }
+                else { int16 v = (int16) k0; memcpy(p, &v, 2); p += 2; }
+                /* Write: count */
+                uint16 cnt16 = (uint16) run;
+                memcpy(p, &cnt16, sizeof(uint16)); p += sizeof(uint16);
+                /* Write: includes (one copy per run) */
+                for (int c=0; c<inc_count; c++)
+                {
+                    Size off0 = (i + rle_pos) * inc_lens[c];
+                    memcpy(p, incs[c] + off0, inc_lens[c]);
+                    p += inc_lens[c];
+                }
+                rle_pos += run;
+            }
+            Size sz = (Size) (p - scratch);
+            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+                ereport(ERROR, (errmsg("smol: failed to add leaf payload (Include-RLE)")));
         }
-        Size sz = (Size) (p - scratch);
-        if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
-            ereport(ERROR, (errmsg("smol: failed to add leaf payload (INCLUDE)")));
+        else
+        {
+            /* Write plain format: [u16 n][keys...][inc1 block][inc2 block]... */
+            memcpy(scratch, &n_this, sizeof(uint16));
+            char *p = scratch + sizeof(uint16);
+            /* keys */
+            if (key_len == 8)
+            { memcpy(p, (const char *) (keys + i), n_this * 8); p += n_this * 8; }
+            else if (key_len == 4)
+            { for (Size j=0;j<n_this;j++){ int32 v=(int32) keys[i+j]; memcpy(p + j*4, &v, 4);} p += n_this*4; }
+            else
+            { for (Size j=0;j<n_this;j++){ int16 v=(int16) keys[i+j]; memcpy(p + j*2, &v, 2);} p += n_this*2; }
+            /* includes: contiguous blocks per include column */
+            for (int c=0;c<inc_count;c++)
+            {
+                uint16 len = inc_lens[c];
+                Size bytes = (Size) n_this * (Size) len;
+                memcpy(p, incs[c] + ((size_t) i * len), bytes);
+                p += bytes;
+            }
+            Size sz = (Size) (p - scratch);
+            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+                ereport(ERROR, (errmsg("smol: failed to add leaf payload (INCLUDE)")));
+        }
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
@@ -2843,6 +2986,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
     }
     if (nkeys == 0) return;
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
+    Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
     while (i < nkeys)
     {
         Buffer buf = smol_extend(idx);
@@ -2852,27 +2996,146 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
         Size header = sizeof(uint16);
         Size perrow = (Size) key_len; for (int c=0;c<inc_count;c++) perrow += inc_lens[c];
-        Size max_n = (avail > header) ? ((avail - header) / perrow) : 0;
+        Size max_n_plain = (avail > header) ? ((avail - header) / perrow) : 0;
         Size remaining = nkeys - i;
-        Size n_this = (remaining < max_n) ? remaining : max_n;
+
+        /* Try to fit as many rows as possible using Include-RLE if beneficial */
+        bool use_inc_rle = false;
+        Size inc_rle_sz = 0;
+        uint16 inc_rle_nruns = 0;
+        Size n_this = 0;
+
+        /* First, try a larger candidate size for Include-RLE (up to 32000 rows or remaining) */
+        Size candidate = remaining;
+        if (candidate > 32000) candidate = 32000; /* Conservative uint16 limit, reserves high values */
+
+        /* Detect runs and calculate Include-RLE size */
+        Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
+        while (pos < candidate)
+        {
+            Size run = 1;
+            const char *k0 = keys32 + (size_t)(i + pos) * key_len;
+            /* Check if key+includes stay constant */
+            bool run_ok = true;
+            while (pos + run < candidate && run_ok && run < 32000)
+            {
+                const char *k1 = keys32 + (size_t)(i + pos + run) * key_len;
+                if (memcmp(k0, k1, key_len) != 0) { run_ok = false; break; }
+                /* Check all include columns match */
+                for (int c=0; c < inc_count && run_ok; c++)
+                {
+                    Size off0 = (i + pos) * inc_lens[c];
+                    Size off1 = (i + pos + run) * inc_lens[c];
+                    if (memcmp(incs[c] + off0, incs[c] + off1, inc_lens[c]) != 0)
+                        run_ok = false;
+                }
+                if (run_ok) run++;
+            }
+            nr++;
+            if (nr >= 32000)
+            {
+                /* Too many runs for uint16 nruns field (conservative limit) */
+                break;
+            }
+            Size this_run_sz = key_len + sizeof(uint16) + ninc_bytes;
+            Size new_total = sizeof(uint16) * 3 + sz_runs + this_run_sz;
+            if (new_total > avail)
+            {
+                /* This run doesn't fit; stop here */
+                break;
+            }
+            sz_runs += this_run_sz;
+            pos += run;
+        }
+
+        inc_rle_sz = sizeof(uint16) * 3 + sz_runs;
+        inc_rle_nruns = nr;
+        Size n_rle = pos; /* Number of rows that fit with Include-RLE */
+
+        /* Decide: use Include-RLE if it fits more rows OR saves space */
+        if (n_rle > max_n_plain || (n_rle >= max_n_plain && inc_rle_sz <= avail))
+        {
+            n_this = n_rle;
+            use_inc_rle = true;
+            if (n_this > 10000)
+                ereport(NOTICE, (errmsg("Include-RLE: fitting %zu rows in %u runs (rle_sz=%zu, avail=%zu)", n_this, inc_rle_nruns, inc_rle_sz, avail)));
+        }
+        else
+        {
+            /* Fall back to plain format */
+            n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
+            use_inc_rle = false;
+        }
+
         if (n_this == 0)
             ereport(ERROR, (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
-        memcpy(scratch, &n_this, sizeof(uint16));
-        char *p = scratch + sizeof(uint16);
-        /* keys: copy n_this fixed 8/16/32 bytes per key (binary C collation) */
-        memcpy(p, keys32 + ((size_t) i * key_len), (size_t) n_this * key_len);
-        p += (size_t) n_this * key_len;
-        /* includes: contiguous blocks per include column */
-        for (int c=0;c<inc_count;c++)
+
+        if (use_inc_rle)
         {
-            uint16 len = inc_lens[c];
-            Size bytes = (Size) n_this * (Size) len;
-            memcpy(p, incs[c] + ((size_t) i * len), bytes);
-            p += bytes;
+            /* Write Include-RLE: [0x8003][nitems][nruns][runs...] */
+            uint16 tag = 0x8003u;
+            char *p = scratch;
+            uint16 nitems16 = (uint16) n_this;
+            memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &inc_rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+            Size rle_pos = 0;
+            while (rle_pos < n_this)
+            {
+                Size run = 1;
+                const char *k0 = keys32 + (size_t)(i + rle_pos) * key_len;
+                bool run_ok = true;
+                while (rle_pos + run < n_this && run_ok)
+                {
+                    const char *k1 = keys32 + (size_t)(i + rle_pos + run) * key_len;
+                    if (memcmp(k0, k1, key_len) != 0) { run_ok = false; break; }
+                    for (int c=0; c < inc_count && run_ok; c++)
+                    {
+                        Size off0 = (i + rle_pos) * inc_lens[c];
+                        Size off1 = (i + rle_pos + run) * inc_lens[c];
+                        if (memcmp(incs[c] + off0, incs[c] + off1, inc_lens[c]) != 0)
+                            run_ok = false;
+                    }
+                    if (run_ok) run++;
+                }
+                /* Write: key */
+                memcpy(p, k0, key_len); p += key_len;
+                /* Write: count */
+                uint16 cnt16 = (uint16) run;
+                memcpy(p, &cnt16, sizeof(uint16)); p += sizeof(uint16);
+                /* Write: includes (one copy per run) */
+                for (int c=0; c<inc_count; c++)
+                {
+                    Size off0 = (i + rle_pos) * inc_lens[c];
+                    memcpy(p, incs[c] + off0, inc_lens[c]);
+                    p += inc_lens[c];
+                }
+                rle_pos += run;
+            }
+            Size sz = (Size) (p - scratch);
+            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+                ereport(ERROR, (errmsg("smol: failed to add leaf payload (TEXT Include-RLE)")));
         }
-        Size sz = (Size) (p - scratch);
-        if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
-            ereport(ERROR, (errmsg("smol: failed to add leaf payload (TEXT+INCLUDE)")));
+        else
+        {
+            /* Write plain format: [u16 n][keys...][inc1 block][inc2 block]... */
+            memcpy(scratch, &n_this, sizeof(uint16));
+            char *p = scratch + sizeof(uint16);
+            /* keys: copy n_this fixed 8/16/32 bytes per key (binary C collation) */
+            memcpy(p, keys32 + ((size_t) i * key_len), (size_t) n_this * key_len);
+            p += (size_t) n_this * key_len;
+            /* includes: contiguous blocks per include column */
+            for (int c=0;c<inc_count;c++)
+            {
+                uint16 len = inc_lens[c];
+                Size bytes = (Size) n_this * (Size) len;
+                memcpy(p, incs[c] + ((size_t) i * len), bytes);
+                p += bytes;
+            }
+            Size sz = (Size) (p - scratch);
+            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+                ereport(ERROR, (errmsg("smol: failed to add leaf payload (TEXT+INCLUDE)")));
+        }
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
@@ -2996,8 +3259,9 @@ smol_leaf_nitems(Page page)
     }
 }
 
+/* Extended version with include support for multi-run Include-RLE */
 static inline char *
-smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
+smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc)
 {
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
@@ -3011,7 +3275,7 @@ smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
             return NULL;
         return p + sizeof(uint16) + ((size_t)(idx - 1)) * key_len;
     }
-    /* RLE payload: [u16 tag(0x8001)][u16 nitems][u16 nruns][runs: key||u16 cnt]* */
+    /* RLE payload: [u16 tag(0x8001|0x8003)][u16 nitems][u16 nruns][runs]* */
     {
         uint16 nitems, nruns;
         memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
@@ -3028,16 +3292,32 @@ smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
             if (idx <= acc + cnt)
                 return k; /* key pointer inside run entry */
             acc += cnt;
-            if (tag == 0x8001u)
-                rp += (size_t) key_len + sizeof(uint16);
-            else /* 0x8003u: also has includes per run; skip them by computing total include bytes */
+            rp += (size_t) key_len + sizeof(uint16);
+            if (tag == 0x8003u)
             {
-                rp += (size_t) key_len + sizeof(uint16);
-                /* we cannot know inc sizes here; caller should not iterate runs without context. For keyptr, skipping includes is fine only if called during scan where inc layout is read separately. For safety, assume no includes affect key offset (they follow count). We already advanced past key+count; includes follow but we only need key pointer, so we don't need to skip further here. */
+                /* Include-RLE: skip all include columns to reach next run */
+                if (inc_lens && ninc > 0)
+                {
+                    for (uint16 i = 0; i < ninc; i++)
+                        rp += inc_lens[i];
+                }
+                else
+                {
+                    /* No include info provided - can't iterate safely beyond first run */
+                    if (r > 0)
+                        ereport(ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
+                }
             }
         }
         return NULL;
     }
+}
+
+/* Wrapper for backward compatibility - assumes single-run or no includes */
+static inline char *
+smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
+{
+    return smol_leaf_keyptr_ex(page, idx, key_len, NULL, 0);
 }
 
 static inline bool
@@ -3062,10 +3342,11 @@ smol_leaf_is_rle(Page page)
     return (tag == 0x8001u || tag == 0x8003u);
 }
 
-/* For RLE payloads, compute 1-based [run_start, run_end] that contains idx. */
+/* For RLE payloads, compute 1-based [run_start, run_end] that contains idx - extended version with include support */
 static bool
-smol_leaf_run_bounds_rle(Page page, uint16 idx, uint16 key_len,
-                         uint16 *run_start_out, uint16 *run_end_out)
+smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
+                         uint16 *run_start_out, uint16 *run_end_out,
+                         const uint16 *inc_lens, uint16 ninc)
 {
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
@@ -3092,7 +3373,18 @@ smol_leaf_run_bounds_rle(Page page, uint16 idx, uint16 key_len,
         rp += (size_t) key_len + sizeof(uint16);
         if (tag == 0x8003u)
         {
-            /* skip includes for this run: unknown lengths here; caller of this function should not rely on rp alignment afterward. It's fine since we exit on match. */
+            /* Include-RLE: skip all include columns to reach next run */
+            if (inc_lens && ninc > 0)
+            {
+                for (uint16 i = 0; i < ninc; i++)
+                    rp += inc_lens[i];
+            }
+            else
+            {
+                /* No include info provided - can't iterate safely beyond first run */
+                if (r > 0)
+                    ereport(ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
+            }
         }
     }
     return false;
@@ -3572,7 +3864,15 @@ smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, b
     if (isnull[0] || isnull[1]) ereport(ERROR, (errmsg("smol does not support NULL values")));
     if (*c->pcount == *c->pcap)
     {
-        Size newcap = (*c->pcap == 0 ? 1024 : *c->pcap * 2);
+        /* Grow exponentially up to 8M entries, then linearly by 2M to avoid MaxAllocSize (1GB) */
+        Size oldcap = *c->pcap;
+        Size newcap;
+        if (oldcap == 0)
+            newcap = 1024;
+        else if (oldcap < 8388608)  /* 8M entries */
+            newcap = oldcap * 2;
+        else
+            newcap = oldcap + 2097152;  /* +2M entries per grow */
         Size bytes1 = (Size) newcap * (Size) c->len1;
         Size bytes2 = (Size) newcap * (Size) c->len2;
         char *n1 = (*c->pcap == 0) ? (char *) palloc(bytes1) : (char *) repalloc(*c->pk1, bytes1);
@@ -3940,7 +4240,15 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     for (int i=0;i<c->incn;i++) if (isnull[1+i]) ereport(ERROR, (errmsg("smol INCLUDE does not support NULL values")));
     if (*c->pcount == *c->pcap)
     {
-        Size newcap = (*c->pcap == 0 ? 1024 : *c->pcap * 2);
+        /* Grow exponentially up to 8M entries, then linearly by 2M to avoid MaxAllocSize (1GB) */
+        Size oldcap = *c->pcap;
+        Size newcap;
+        if (oldcap == 0)
+            newcap = 1024;
+        else if (oldcap < 8388608)  /* 8M entries */
+            newcap = oldcap * 2;
+        else
+            newcap = oldcap + 2097152;  /* +2M entries per grow */
         if (!c->key_is_text32)
         {
             int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
