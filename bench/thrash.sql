@@ -72,8 +72,6 @@ SELECT inc1, count(*) FROM bench_thrash WHERE k1 % 4 = 0 group by 1 order by 1 l
 explain (analyze, verbose, buffers) SELECT inc1, count(*) FROM bench_thrash WHERE k1 % 4 = 0 group by 1 order by 1 limit 1;
 \echo ''
 
-DROP INDEX bench_thrash_btree;
-
 -- ============================================================================
 -- SMOL Index
 -- ============================================================================
@@ -83,17 +81,15 @@ DROP INDEX bench_thrash_btree;
 CREATE INDEX bench_thrash_smol ON bench_thrash USING smol(k1) INCLUDE (inc1, val);
 \timing off
 
-\echo 'SMOL index size:'
-SELECT pg_size_pretty(pg_relation_size('bench_thrash_smol')) AS smol_size;
-\echo ''
-
 \echo 'Size comparison:'
 SELECT
-    pg_size_pretty(pg_relation_size('bench_thrash_smol')) AS smol_size,
-    pg_size_pretty(
-        pg_relation_size('bench_thrash_smol')
-    ) AS smol;
+    pg_size_pretty(pg_relation_size('bench_thrash_btree')) AS btree_size,
+    pg_size_pretty(pg_relation_size('bench_thrash_smol')) AS smol_size;
 \echo ''
+
+-- ensure btree isn't used
+DROP INDEX bench_thrash_btree;
+
 
 \echo 'SMOL query - multiple iterations to test caching...'
 

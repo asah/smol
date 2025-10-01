@@ -13,7 +13,7 @@ Personality & Workflow
 Memory and Docs Discipline
 - README.md contains architecture and user-facing overview
 - AGENT_PGIDXAM_NOTES.md is a curated PG index AM reading list
-- AGENT_NOTES.md contains smol implementation design and higher-level learnings
+- AGENT_NOTES.md contains smol implementation design and higher-level learnings.
 - together these md files are your memory - as you learn big new things, please automatically update them for future runs.
 - when you start up, please carefully and completely read the *.md, Makefile, *.control, *.sql, *.c, and sql/* and give me a 5 line summary - take your time and really understand this project, so you can move it forward
 - Keep comments up-to-date and focused on current design (no changelogs).

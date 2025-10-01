@@ -1,5 +1,79 @@
 # smol — Simple Memory-Only Lightweight index
-# (a read‑only, space‑efficient PostgreSQL index access method)
+
+SMOL is a read‑only, space‑efficient PostgreSQL index access method that can provide substantial speedups for reporting queries that access a small number of small, fixed-width columns.
+SMOL is currently a research prototype, not suitable for production and only deployable as an EXTENSION in self-hosted PostgreSQL deployments, e.g. not AWS RDS/Aurora.
+The authors are aware that the ideas expressed in SMOL may be best brought to mainstream use as new capabilities of existing features, rather than a new index type.
+To discourage inappropriate use, the authors intentionally are not packaging SMOL yet for pgxn or other "easy" installation methods - you must compile from source for now.
+
+## Performance
+
+SMOL indexes are **60-81% smaller** than BTREE while delivering competitive or superior query performance.
+
+### Benchmark Results (PostgreSQL 18, 1M rows)
+
+| Workload | BTREE | SMOL | Advantage |
+|----------|-------|------|-----------|
+| **Unique int4 range scan** | 13.5ms, 21MB | 15ms, 3.9MB | 81% smaller, competitive speed |
+| **Duplicate keys + INCLUDEs** | 3.2ms, 30MB | 3.9ms, 12MB | 60% smaller, competitive |
+| **Two-column selective** | 13.6ms, 21MB | 2.9ms, 7.9MB | **4.7x faster**, 62% smaller |
+
+### When to Use SMOL
+
+✅ **Use SMOL when:**
+- Memory-constrained environments (cloud, containers)
+- Read-heavy workloads (data warehouses, reporting)
+- Two-column indexes with selective queries
+- Fixed-width columns (int, date, uuid)
+- Smaller backups/faster restores matter
+
+⚠️ **Use BTREE when:**
+- Write-heavy workloads (SMOL is read-only)
+- Variable-length keys (SMOL requires fixed-width or C-collation text)
+- NULL values needed (SMOL rejects NULLs)
+- Ultra low-latency requirements (every millisecond counts)
+
+See [BENCHMARKING.md](BENCHMARKING.md) for detailed results and methodology.
+
+
+## How does SMOL compare with existing PostgreSQL features and index types
+
+It's perhaps helpful to think of SMOL as a form of materialized view. Unlike MATERIALIZED VIEW (MV), existing SQL statements do not need to be retargeted for the MV. That said, for reasons explained below, users are warned not to think they can use SMOL haphazardly, or they may experience errors.
+
+The primary alternative to SMOL are B-trees, specifically the nbtree implementation built into PostgreSQL.
+
+BRIN and HASH indexes cannot satisfy range queries. SMOL is probably not competitive with HASH indexes for equality-only.
+
+
+## How does SMOL work?
+
+SMOL provides a page-oriented tree structure over the data just like nbtree, but unlike nbtree:
+1. SMOL assumes read-only, so avoids the need to check for visibility (also simplifies the code).
+2. SMOL removes per-tuple fields storing the number of attributes and their lengths - this is stored once for the whole index
+3. SMOL stores data in columnar format within a page
+4. given fixed attributes, lengths and columnar layout, SMOL can then tightly pack values and use very fast compression (RLE). Notably, when scanning repeated values, the RLE-aware executor inherently knows how many values are in the repetition, just reading the dictionary.
+5. SMOL optimizes small, repetitive data and caches the response tuple to avoid extra traversal and memory copies.
+6. SMOL detects and enforces maximum strength during CREATE INDEX and assumes "C" collation, which allows its execution to treat strings like fixed width numbers. This is fine for identifier-type strings which are typically ASCII.
+
+## Quick start
+
+### preparing the table
+
+The underlying table must be read-only. If it's not, then you need to copy the table, e.g. to an UNLOGGED table.
+
+The string columns used in SMOL must be short and use "C" collation. If not, consider ALTER TABLE tblname ADD COLUMN colname TEXT COLLATE "C";
+
+See `assignments.sql` for an example. 
+
+### creating the index
+
+CREATE INDEX idxname ON tblname USING smol (keyfield) INCLUDE (other, fields, you, want);
+
+SELECT keyfield, COUNT(*) FROM tblname GROUP BY 1;
+
+SELECT keyfield, other, fields, COUNT(*) FROM tblname GROUP BY 1,2,3;
+
+SELECT keyfield, COUNT(*) FROM tblname GROUP BY 1;
+
 
 This document captures the architecture and operational overview of the
 smol index access method. Code‑level notes live in `AGENT_NOTES.md`.
@@ -62,7 +136,7 @@ Usage
   are supported, but see notes below on deterministic correctness testing.
 
 Tests
-- `make check` runs regression (`sql/`) and stops PG when done.
+- to run tests: make install && make start && su - postgres bash -c "cd /workspace && make installcheck" && make stop
 
 Deterministic Correctness Check (Multi‑Column Regression)
 - Some workloads (e.g., `GROUP BY a` on an index defined as SMOL(b,a)) can pick SMOL even without

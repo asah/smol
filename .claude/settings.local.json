@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "Bash(make:*)"
+      "Bash(make:*)",
+      "Bash(su - postgres -c \"whoami\")",
+      "Bash(su - postgres -c \"make build\")",
+      "Bash(su:*)",
+      "Read(//usr/**)",
+      "Read(//proc/**)",
+      "Bash(awk:*)",
+      "Bash(git status:*)",
+      "Read(///**)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(tee:*)",
+      "Bash(cat:*)",
+      "Bash(test:*)",
+      "Read(//var/lib/postgresql/**)",
+      "Bash(pkill:*)",
+      "Read(//tmp/**)",
+      "Bash(pgrep:*)",
+      "Bash(timeout 60 tail -20 /tmp/pg.log)",
+      "Bash(find:*)",
+      "Bash(xargs:*)",
+      "Bash(wc:*)"
     ],
     "deny": [],
     "ask": []

@@ -96,7 +96,6 @@ if [[ -z "${CUR_MAX_CONN}" ]]; then CUR_MAX_CONN=100; fi
 if ! [[ "$CUR_MAX_CONN" =~ ^[0-9]+$ ]]; then CUR_MAX_CONN=100; fi
 
 # Compute memory settings
-# shared_buffers
 SB_MB=$(round "$(awk "BEGIN{print (${MEM_KB}/1024)*${SHARED_BUFFERS_RATIO}"} )")
 # cap shared_buffers a bit by default to avoid excessive allocation on small hosts
 if (( SB_MB < 128 )); then SB_MB=128; fi

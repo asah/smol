@@ -42,7 +42,8 @@ RUN ./configure \
       --with-llvm \
       --disable-cassert \
   && make -j $(nproc) \
-  && make install
+  && make install \
+  && (cd contrib/pg_buffercache && make install)
 
 RUN /usr/local/pgsql/bin/pg_config
 
@@ -51,6 +52,9 @@ RUN apt update && apt install curl nodejs npm -y \
   && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
   && apt-get install -y nodejs \
   && npm install -g @openai/codex
+
+# provide claude code for inside-docker use
+RUN npm install -g @anthropic-ai/claude-code
 
 # PATH
 ENV PATH="/usr/local/pgsql/bin:${PATH}"
@@ -65,3 +69,5 @@ RUN useradd -m postgres \
 EXPOSE 5432
 #ENTRYPOINT ["/bin/bash"]
 
+# make stop && make install && make start && su - postgres bash -c '/usr/local/pgsql/bin/psql -f bench/thrash.sql' | tee results/thrash.out
+# git config user.email "140002+asah@users.noreply.github.com" && git config user.name "Adam Sah"
