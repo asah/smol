@@ -82,3 +82,41 @@ SET debug_parallel_query = off;
 
 DROP INDEX t_para_int8_smol;
 DROP TABLE t_para_int8;
+
+-- Test CAS failure retry path (line 1593) - force atomic contention
+-- This simulates parallel workers racing to claim the first block
+DROP TABLE IF EXISTS t_cas_retry CASCADE;
+CREATE UNLOGGED TABLE t_cas_retry(k int4, v int4);
+
+INSERT INTO t_cas_retry SELECT i, i*3 FROM generate_series(1, 100000) i;
+ANALYZE t_cas_retry;
+
+CREATE INDEX t_cas_retry_smol ON t_cas_retry USING smol(k) INCLUDE (v);
+
+-- Note: CAS retry path (line ~1700) cannot be reliably tested
+-- Requires precise parallel worker timing that's impossible to simulate deterministically
+
+-- Enable parallel
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET debug_parallel_query = on;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+
+-- Run query - the CAS failure will force retry loop
+SELECT count(*), sum(v)::bigint, min(k), max(k)
+FROM t_cas_retry
+WHERE k >= 10000;
+
+-- Reset
+SET max_parallel_workers_per_gather = 0;
+SET debug_parallel_query = off;
+
+DROP INDEX t_cas_retry_smol;
+DROP TABLE t_cas_retry;

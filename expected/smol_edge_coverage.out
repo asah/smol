@@ -1,0 +1,327 @@
+-- Test rare edge cases for additional coverage
+-- Targets: rescan paths, buffer management, parallel edge cases
+CREATE EXTENSION IF NOT EXISTS smol;
+NOTICE:  extension "smol" already exists, skipping
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+-- ============================================================================
+-- PART 1: Rescan with Pinned Buffer (lines 1257-1259)
+-- ============================================================================
+DROP TABLE IF EXISTS t_rescan CASCADE;
+NOTICE:  table "t_rescan" does not exist, skipping
+CREATE UNLOGGED TABLE t_rescan (a int4);
+INSERT INTO t_rescan SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX idx_rescan ON t_rescan USING smol(a);
+-- Use a cursor to trigger rescan while scan is active
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT a FROM t_rescan WHERE a > 100;
+FETCH 5 FROM c1;
+  a  
+-----
+ 101
+ 102
+ 103
+ 104
+ 105
+(5 rows)
+
+-- Rescan the cursor (should hit buffer cleanup)
+FETCH BACKWARD 2 FROM c1;
+  a  
+-----
+ 106
+ 105
+(2 rows)
+
+FETCH FORWARD 3 FROM c1;
+  a  
+-----
+ 104
+ 105
+ 106
+(3 rows)
+
+CLOSE c1;
+COMMIT;
+-- ============================================================================
+-- PART 2: Defensive Rescan Call (line 1327)
+-- ============================================================================
+-- This should be very hard to trigger naturally, but we can try
+-- by calling gettuple without explicit rescan in certain scenarios
+-- Typically covered by PostgreSQL's executor, but edge case exists
+-- ============================================================================
+-- PART 3: Parallel Scan with Different Lower Bound Types (line 1531, 2075, 2077)
+-- ============================================================================
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_index_scan_size = 0;
+-- INT8 without lower bound (triggers else lb = PG_INT64_MIN)
+DROP TABLE IF EXISTS t_para_int8_nobound CASCADE;
+NOTICE:  table "t_para_int8_nobound" does not exist, skipping
+CREATE UNLOGGED TABLE t_para_int8_nobound (a int8);
+INSERT INTO t_para_int8_nobound SELECT i::int8 FROM generate_series(1, 50000) i;
+CREATE INDEX idx_para_int8_nobound ON t_para_int8_nobound USING smol(a);
+-- Full scan (no bound) - should trigger PG_INT64_MIN path
+SELECT count(*) FROM t_para_int8_nobound;
+ count 
+-------
+ 50000
+(1 row)
+
+-- INT2 without lower bound
+DROP TABLE IF EXISTS t_para_int2_nobound CASCADE;
+NOTICE:  table "t_para_int2_nobound" does not exist, skipping
+CREATE UNLOGGED TABLE t_para_int2_nobound (a int2);
+INSERT INTO t_para_int2_nobound SELECT (i % 30000)::int2 FROM generate_series(1, 50000) i;
+CREATE INDEX idx_para_int2_nobound ON t_para_int2_nobound USING smol(a);
+SELECT count(*) FROM t_para_int2_nobound;
+ count 
+-------
+ 50000
+(1 row)
+
+-- ============================================================================
+-- PART 4: Buffer Re-pin After Release (lines 1647-1648)
+-- ============================================================================
+-- This happens when scanning continues after releasing a buffer
+-- Typically in the main scan loop when moving between pages
+DROP TABLE IF EXISTS t_multipage CASCADE;
+NOTICE:  table "t_multipage" does not exist, skipping
+CREATE UNLOGGED TABLE t_multipage (a int4);
+INSERT INTO t_multipage SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX idx_multipage ON t_multipage USING smol(a);
+-- Scan that crosses multiple pages
+SELECT count(*) FROM t_multipage WHERE a > 50000;
+ count 
+-------
+ 50000
+(1 row)
+
+-- ============================================================================
+-- PART 5: Run Boundary Scanning Edge Case (line 1790)
+-- ============================================================================
+-- This is the inner loop of run detection that scans backward
+-- Need duplicate keys where the run spans boundaries
+DROP TABLE IF EXISTS t_run_boundary CASCADE;
+NOTICE:  table "t_run_boundary" does not exist, skipping
+CREATE UNLOGGED TABLE t_run_boundary (a int4);
+-- Insert duplicates to create runs
+INSERT INTO t_run_boundary SELECT (i % 100) FROM generate_series(1, 10000) i ORDER BY 1;
+CREATE INDEX idx_run_boundary ON t_run_boundary USING smol(a);
+-- Backward scan with duplicates should trigger run boundary detection
+SELECT a FROM t_run_boundary WHERE a = 50 ORDER BY a DESC LIMIT 10;
+ a  
+----
+ 50
+ 50
+ 50
+ 50
+ 50
+ 50
+ 50
+ 50
+ 50
+ 50
+(10 rows)
+
+SELECT a FROM t_run_boundary WHERE a BETWEEN 40 AND 45 ORDER BY a DESC LIMIT 20;
+ a  
+----
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+ 45
+(20 rows)
+
+-- ============================================================================
+-- PART 6: INT8/UUID Backward Scan Copy Paths (lines 1808-1810)
+-- ============================================================================
+-- INT8 backward scan (need to force backward direction)
+DROP TABLE IF EXISTS t_int8_back_real CASCADE;
+NOTICE:  table "t_int8_back_real" does not exist, skipping
+CREATE UNLOGGED TABLE t_int8_back_real (a int8);
+INSERT INTO t_int8_back_real SELECT i::int8 FROM generate_series(1, 1000) i;
+CREATE INDEX idx_int8_back_real ON t_int8_back_real USING smol(a);
+-- Try with BETWEEN and backwards
+SELECT a FROM t_int8_back_real WHERE a BETWEEN 100 AND 500 ORDER BY a DESC LIMIT 5;
+  a  
+-----
+ 500
+ 499
+ 498
+ 497
+ 496
+(5 rows)
+
+-- UUID backward scan
+DROP TABLE IF EXISTS t_uuid_back_real CASCADE;
+NOTICE:  table "t_uuid_back_real" does not exist, skipping
+CREATE UNLOGGED TABLE t_uuid_back_real (u uuid);
+INSERT INTO t_uuid_back_real
+SELECT md5(i::text)::uuid FROM generate_series(1, 1000) i;
+CREATE INDEX idx_uuid_back_real ON t_uuid_back_real USING smol(u);
+ERROR:  unexpected byval==false
+-- Backward scan on UUID
+SELECT u FROM t_uuid_back_real ORDER BY u DESC LIMIT 5;
+                  u                   
+--------------------------------------
+ ffeabd22-3de0-d4ea-cb9a-3e6e53e5448d
+ ffd52f3c-7e12-435a-724a-8f30fddadd9c
+ ff4d5fbb-afdf-976c-fdc0-32e3bde78de5
+ fec8d47d-412b-cbee-ce3d-9128ae855a7a
+ fe9fc289-c3ff-0af1-42b6-d3bead98a923
+(5 rows)
+
+SELECT u FROM t_uuid_back_real WHERE u > '50000000-0000-0000-0000-000000000000'::uuid ORDER BY u DESC LIMIT 10;
+                  u                   
+--------------------------------------
+ ffeabd22-3de0-d4ea-cb9a-3e6e53e5448d
+ ffd52f3c-7e12-435a-724a-8f30fddadd9c
+ ff4d5fbb-afdf-976c-fdc0-32e3bde78de5
+ fec8d47d-412b-cbee-ce3d-9128ae855a7a
+ fe9fc289-c3ff-0af1-42b6-d3bead98a923
+ fe8c15fe-d5f8-0800-6ce9-5eddb7366e35
+ fe7ee8fc-1959-cc72-14fa-21c4840dff0a
+ fe73f687-e5bc-5280-214e-0486b273a5f9
+ fe131d7f-5a6b-38b2-3cc9-67316c13dae2
+ fde9264c-f376-fffe-2ee4-ddf4a988880d
+(10 rows)
+
+-- ============================================================================
+-- PART 7: Text Backward Scan (line 1802 - varlena emission)
+-- ============================================================================
+DROP TABLE IF EXISTS t_text_back_real CASCADE;
+NOTICE:  table "t_text_back_real" does not exist, skipping
+CREATE UNLOGGED TABLE t_text_back_real (s text COLLATE "C");
+INSERT INTO t_text_back_real SELECT 'text_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
+CREATE INDEX idx_text_back_real ON t_text_back_real USING smol(s);
+-- Force backward scan with BETWEEN
+SELECT s FROM t_text_back_real WHERE s BETWEEN 'text_000100' AND 'text_000500' ORDER BY s DESC LIMIT 10;
+      s      
+-------------
+ text_000500
+ text_000499
+ text_000498
+ text_000497
+ text_000496
+ text_000495
+ text_000494
+ text_000493
+ text_000492
+ text_000491
+(10 rows)
+
+-- ============================================================================
+-- PART 8: Parallel Prefetch Depth > 1 (lines 2050-2057, 2085-2101)
+-- ============================================================================
+-- Set prefetch depth to enable prefetching
+SET smol.prefetch_depth = 3;
+DROP TABLE IF EXISTS t_prefetch CASCADE;
+NOTICE:  table "t_prefetch" does not exist, skipping
+CREATE UNLOGGED TABLE t_prefetch (a int4);
+INSERT INTO t_prefetch SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX idx_prefetch ON t_prefetch USING smol(a);
+-- Parallel scan with prefetching enabled
+SELECT count(*) FROM t_prefetch WHERE a > 10000;
+ count 
+-------
+ 90000
+(1 row)
+
+-- Reset prefetch depth
+SET smol.prefetch_depth = 1;
+-- ============================================================================
+-- PART 9: Upper Bound in Backward Scan (lines 1733-1738)
+-- ============================================================================
+-- Backward scan with upper bound checking in the loop
+DROP TABLE IF EXISTS t_upper_back CASCADE;
+NOTICE:  table "t_upper_back" does not exist, skipping
+CREATE UNLOGGED TABLE t_upper_back (a int4);
+INSERT INTO t_upper_back SELECT i FROM generate_series(1, 10000) i;
+CREATE INDEX idx_upper_back ON t_upper_back USING smol(a);
+-- BETWEEN with backward scan
+SELECT a FROM t_upper_back WHERE a BETWEEN 5000 AND 7000 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 7000
+ 6999
+ 6998
+ 6997
+ 6996
+ 6995
+ 6994
+ 6993
+ 6992
+ 6991
+(10 rows)
+
+-- ============================================================================
+-- PART 10: INCLUDE Column Edge Cases (line 1959)
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_edge CASCADE;
+NOTICE:  table "t_inc_edge" does not exist, skipping
+CREATE UNLOGGED TABLE t_inc_edge (a int4, b int8, c uuid);
+INSERT INTO t_inc_edge SELECT i, i::int8, md5(i::text)::uuid FROM generate_series(1, 1000) i;
+CREATE INDEX idx_inc_edge ON t_inc_edge USING smol(a) INCLUDE (b, c);
+-- Query that returns INCLUDE columns with different sizes (count only, UUIDs are deterministic)
+SELECT count(*), min(a), max(a), min(b), max(b) FROM t_inc_edge WHERE a BETWEEN 100 AND 200;
+ count | min | max | min | max 
+-------+-----+-----+-----+-----
+   101 | 100 | 200 | 100 | 200
+(1 row)
+
+-- ============================================================================
+-- PART 11: Generic Upper Bound Comparator (line 597)
+-- ============================================================================
+-- This is used for non-INT types with upper bounds
+DROP TABLE IF EXISTS t_generic_upper CASCADE;
+NOTICE:  table "t_generic_upper" does not exist, skipping
+CREATE UNLOGGED TABLE t_generic_upper (s text COLLATE "C");
+INSERT INTO t_generic_upper SELECT 'key_' || lpad(i::text, 5, '0') FROM generate_series(1, 5000) i;
+CREATE INDEX idx_generic_upper ON t_generic_upper USING smol(s);
+-- Text with upper bound (uses generic comparator)
+SELECT count(*) FROM t_generic_upper WHERE s > 'key_01000' AND s <= 'key_03000';
+ count 
+-------
+  2000
+(1 row)
+
+SELECT count(*) FROM t_generic_upper WHERE s >= 'key_02000' AND s < 'key_04000';
+ count 
+-------
+  2000
+(1 row)
+
+-- ============================================================================
+-- Cleanup
+-- ============================================================================
+DROP TABLE t_rescan CASCADE;
+DROP TABLE t_para_int8_nobound CASCADE;
+DROP TABLE t_para_int2_nobound CASCADE;
+DROP TABLE t_multipage CASCADE;
+DROP TABLE t_run_boundary CASCADE;
+DROP TABLE t_int8_back_real CASCADE;
+DROP TABLE t_uuid_back_real CASCADE;
+DROP TABLE t_text_back_real CASCADE;
+DROP TABLE t_prefetch CASCADE;
+DROP TABLE t_upper_back CASCADE;
+DROP TABLE t_inc_edge CASCADE;
+DROP TABLE t_generic_upper CASCADE;

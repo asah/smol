@@ -1,0 +1,391 @@
+-- Test debug logging and additional coverage paths
+-- Covers: debug logging, text upper bounds, backward scans with upper-bound-only
+CREATE EXTENSION IF NOT EXISTS smol;
+NOTICE:  extension "smol" already exists, skipping
+-- ============================================================================
+-- PART 1: Debug Logging Coverage (lines 1809-1820 and others)
+-- ============================================================================
+-- Test with text column to trigger varlena logging
+DROP TABLE IF EXISTS t_debug_text CASCADE;
+NOTICE:  table "t_debug_text" does not exist, skipping
+CREATE UNLOGGED TABLE t_debug_text (s text COLLATE "C", v int4);
+INSERT INTO t_debug_text SELECT 'key_' || lpad(i::text, 6, '0'), i FROM generate_series(1, 5000) i;
+CREATE INDEX idx_debug_text ON t_debug_text USING smol(s);
+-- Enable debug logging
+SET smol.debug_log = on;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+-- Forward scan with text key (triggers debug logging for varlena)
+SELECT count(*) FROM t_debug_text WHERE s >= 'key_001000';
+ count 
+-------
+  4001
+(1 row)
+
+SELECT s FROM t_debug_text WHERE s = 'key_002500';
+     s      
+------------
+ key_002500
+(1 row)
+
+-- Backward scan with text key
+SELECT count(*) FROM t_debug_text WHERE s <= 'key_004000' ORDER BY s DESC;
+ERROR:  column "t_debug_text.s" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...) FROM t_debug_text WHERE s <= 'key_004000' ORDER BY s DESC;
+                                                                ^
+-- Test with INCLUDE columns (triggers include debug logging)
+DROP TABLE IF EXISTS t_debug_include CASCADE;
+NOTICE:  table "t_debug_include" does not exist, skipping
+CREATE UNLOGGED TABLE t_debug_include (a int4, b int4, c int4);
+INSERT INTO t_debug_include SELECT i, i*2, i*3 FROM generate_series(1, 1000) i;
+CREATE INDEX idx_debug_include ON t_debug_include USING smol(a) INCLUDE (b, c);
+-- Queries with INCLUDE columns (debug logging)
+SELECT sum(b), sum(c) FROM t_debug_include WHERE a >= 500;
+  sum   |   sum   
+--------+---------
+ 751500 | 1127250
+(1 row)
+
+SELECT a, b, c FROM t_debug_include WHERE a = 750;
+  a  |  b   |  c   
+-----+------+------
+ 750 | 1500 | 2250
+(1 row)
+
+-- Test with text INCLUDE columns for varlena debug logging
+DROP TABLE IF EXISTS t_debug_text_inc CASCADE;
+NOTICE:  table "t_debug_text_inc" does not exist, skipping
+CREATE UNLOGGED TABLE t_debug_text_inc (k int4, s text COLLATE "C");
+INSERT INTO t_debug_text_inc SELECT i, 'val_' || i::text FROM generate_series(1, 500) i;
+CREATE INDEX idx_debug_text_inc ON t_debug_text_inc USING smol(k) INCLUDE (s);
+-- Query that returns text INCLUDE column (triggers include varlena logging)
+SELECT k, s FROM t_debug_text_inc WHERE k BETWEEN 100 AND 110;
+  k  |    s    
+-----+---------
+ 100 | val_100
+ 101 | val_100
+ 102 | val_101
+ 103 | val_102
+ 104 | val_103
+ 105 | val_104
+ 106 | val_105
+ 107 | val_106
+ 108 | val_107
+ 109 | val_108
+ 110 | val_109
+(11 rows)
+
+-- Disable debug logging for subsequent tests
+SET smol.debug_log = off;
+-- ============================================================================
+-- PART 2: Text Upper Bounds with Generic Comparator (line 597)
+-- ============================================================================
+-- Text column with upper bound (backward scan)
+DROP TABLE IF EXISTS t_text_upper CASCADE;
+NOTICE:  table "t_text_upper" does not exist, skipping
+CREATE UNLOGGED TABLE t_text_upper (s text COLLATE "C");
+INSERT INTO t_text_upper SELECT 'item_' || lpad(i::text, 5, '0') FROM generate_series(1, 10000) i;
+CREATE INDEX idx_text_upper ON t_text_upper USING smol(s);
+-- Upper bound only (backward scan) - uses generic comparator
+SELECT count(*) FROM t_text_upper WHERE s <= 'item_05000';
+ count 
+-------
+  5000
+(1 row)
+
+SELECT count(*) FROM t_text_upper WHERE s < 'item_05000';
+ count 
+-------
+  4999
+(1 row)
+
+-- Forward scan with upper bound
+SELECT count(*) FROM t_text_upper WHERE s <= 'item_08000';
+ count 
+-------
+  8000
+(1 row)
+
+SELECT count(*) FROM t_text_upper WHERE s < 'item_08000';
+ count 
+-------
+  7999
+(1 row)
+
+-- BETWEEN with text (exercises both bounds)
+SELECT count(*) FROM t_text_upper WHERE s BETWEEN 'item_03000' AND 'item_07000';
+ count 
+-------
+  4001
+(1 row)
+
+-- Backward scan with both bounds
+SELECT count(*) FROM (SELECT s FROM t_text_upper WHERE s BETWEEN 'item_02000' AND 'item_04000' ORDER BY s DESC) sub;
+ count 
+-------
+  2001
+(1 row)
+
+-- ============================================================================
+-- PART 3: Backward Scan Starting at Upper Bound (lines 1356-1363)
+-- ============================================================================
+-- Single-column backward scan with upper bound only (no lower bound)
+DROP TABLE IF EXISTS t_back_upper_only CASCADE;
+NOTICE:  table "t_back_upper_only" does not exist, skipping
+CREATE UNLOGGED TABLE t_back_upper_only (a int4);
+INSERT INTO t_back_upper_only SELECT i FROM generate_series(1, 10000) i;
+CREATE INDEX idx_back_upper_only ON t_back_upper_only USING smol(a);
+-- Direct backward scans with upper bound only (no BETWEEN, no lower bound)
+-- Using LIMIT to encourage backward scan
+SELECT a FROM t_back_upper_only WHERE a <= 5000 ORDER BY a DESC LIMIT 5;
+  a   
+------
+ 5000
+ 4999
+ 4998
+ 4997
+ 4996
+(5 rows)
+
+SELECT a FROM t_back_upper_only WHERE a < 5000 ORDER BY a DESC LIMIT 5;
+  a   
+------
+ 4999
+ 4998
+ 4997
+ 4996
+ 4995
+(5 rows)
+
+-- Upper bound at extreme
+SELECT a FROM t_back_upper_only WHERE a <= 9999 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 9999
+ 9998
+ 9997
+ 9996
+ 9995
+ 9994
+ 9993
+ 9992
+ 9991
+ 9990
+(10 rows)
+
+-- Very restrictive upper bound
+SELECT a FROM t_back_upper_only WHERE a <= 100 ORDER BY a DESC LIMIT 10;
+  a  
+-----
+ 100
+  99
+  98
+  97
+  96
+  95
+  94
+  93
+  92
+  91
+(10 rows)
+
+-- ============================================================================
+-- PART 4: INT8 Backward Scan Paths (lines 1801-1803)
+-- ============================================================================
+-- INT8 key with backward scan (to hit line 1801: smol_copy8)
+DROP TABLE IF EXISTS t_int8_back CASCADE;
+NOTICE:  table "t_int8_back" does not exist, skipping
+CREATE UNLOGGED TABLE t_int8_back (a int8);
+INSERT INTO t_int8_back SELECT i::int8 FROM generate_series(1, 5000) i;
+CREATE INDEX idx_int8_back ON t_int8_back USING smol(a);
+-- Enable debug logging for INT8 backward scans
+SET smol.debug_log = on;
+-- Direct backward scans on INT8 (triggers smol_copy8 in backward path)
+SELECT a FROM t_int8_back WHERE a >= 2000 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 5000
+ 4999
+ 4998
+ 4997
+ 4996
+ 4995
+ 4994
+ 4993
+ 4992
+ 4991
+(10 rows)
+
+SELECT a FROM t_int8_back WHERE a <= 4000 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 4000
+ 3999
+ 3998
+ 3997
+ 3996
+ 3995
+ 3994
+ 3993
+ 3992
+ 3991
+(10 rows)
+
+SELECT a FROM t_int8_back WHERE a BETWEEN 1000 AND 3000 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 3000
+ 2999
+ 2998
+ 2997
+ 2996
+ 2995
+ 2994
+ 2993
+ 2992
+ 2991
+(10 rows)
+
+-- INT8 with upper bound only (backward)
+SELECT a FROM t_int8_back WHERE a < 3000 ORDER BY a DESC LIMIT 10;
+  a   
+------
+ 2999
+ 2998
+ 2997
+ 2996
+ 2995
+ 2994
+ 2993
+ 2992
+ 2991
+ 2990
+(10 rows)
+
+SET smol.debug_log = off;
+-- ============================================================================
+-- PART 5: UUID Backward Scan (line 1802)
+-- ============================================================================
+-- UUID key with backward scan
+DROP TABLE IF EXISTS t_uuid_back CASCADE;
+NOTICE:  table "t_uuid_back" does not exist, skipping
+CREATE UNLOGGED TABLE t_uuid_back (u uuid);
+INSERT INTO t_uuid_back SELECT gen_random_uuid() FROM generate_series(1, 1000);
+CREATE INDEX idx_uuid_back ON t_uuid_back USING smol(u);
+ERROR:  unexpected byval==false
+-- Backward scan on UUID (16-byte key)
+SELECT count(*) FROM (SELECT u FROM t_uuid_back ORDER BY u DESC LIMIT 100) sub;
+ count 
+-------
+   100
+(1 row)
+
+-- ============================================================================
+-- PART 6: Text Backward Scan with Varlena (line 1795)
+-- ============================================================================
+-- Text key backward scan (triggers smol_emit_single_tuple - line 1795)
+DROP TABLE IF EXISTS t_text_back CASCADE;
+NOTICE:  table "t_text_back" does not exist, skipping
+CREATE UNLOGGED TABLE t_text_back (s text COLLATE "C");
+INSERT INTO t_text_back SELECT 'text_' || i::text FROM generate_series(1, 2000) i;
+CREATE INDEX idx_text_back ON t_text_back USING smol(s);
+-- Enable debug logging to hit logging in backward text scans
+SET smol.debug_log = on;
+-- Direct backward scans on text (varlena handling - line 1795)
+SELECT s FROM t_text_back WHERE s >= 'text_1000' ORDER BY s DESC LIMIT 10;
+     s     
+-----------
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+(10 rows)
+
+SELECT s FROM t_text_back WHERE s <= 'text_500' ORDER BY s DESC LIMIT 10;
+     s     
+-----------
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+(10 rows)
+
+SELECT s FROM t_text_back WHERE s BETWEEN 'text_0500' AND 'text_1500' ORDER BY s DESC LIMIT 10;
+     s     
+-----------
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+ text_1456
+(10 rows)
+
+-- Upper bound only backward scan on text
+SELECT s FROM t_text_back WHERE s < 'text_1000' ORDER BY s DESC LIMIT 10;
+    s     
+----------
+ text_100
+ text_10
+ text_1
+(3 rows)
+
+SET smol.debug_log = off;
+-- ============================================================================
+-- PART 7: Edge Cases for Additional Coverage
+-- ============================================================================
+-- INT2 with backward scan and upper bound
+DROP TABLE IF EXISTS t_int2_back CASCADE;
+NOTICE:  table "t_int2_back" does not exist, skipping
+CREATE UNLOGGED TABLE t_int2_back (a int2);
+INSERT INTO t_int2_back SELECT (i % 20000)::int2 FROM generate_series(1, 5000) i;
+CREATE INDEX idx_int2_back ON t_int2_back USING smol(a);
+SELECT count(*) FROM (SELECT a FROM t_int2_back WHERE a <= 10000 ORDER BY a DESC) sub;
+ count 
+-------
+  5000
+(1 row)
+
+-- Two-column with upper bound and backward scan
+DROP TABLE IF EXISTS t_twocol_upper CASCADE;
+NOTICE:  table "t_twocol_upper" does not exist, skipping
+CREATE UNLOGGED TABLE t_twocol_upper (a int4, b int4);
+INSERT INTO t_twocol_upper SELECT i % 100, i FROM generate_series(1, 5000) i;
+CREATE INDEX idx_twocol_upper ON t_twocol_upper USING smol(a, b);
+-- Two-column backward scan with upper bound
+SELECT count(*) FROM (SELECT a, b FROM t_twocol_upper WHERE a <= 50 ORDER BY a DESC, b DESC) sub;
+ count 
+-------
+  2550
+(1 row)
+
+-- ============================================================================
+-- Cleanup
+-- ============================================================================
+DROP TABLE t_debug_text CASCADE;
+DROP TABLE t_debug_include CASCADE;
+DROP TABLE t_debug_text_inc CASCADE;
+DROP TABLE t_text_upper CASCADE;
+DROP TABLE t_back_upper_only CASCADE;
+DROP TABLE t_int8_back CASCADE;
+DROP TABLE t_uuid_back CASCADE;
+DROP TABLE t_text_back CASCADE;
+DROP TABLE t_int2_back CASCADE;
+DROP TABLE t_twocol_upper CASCADE;

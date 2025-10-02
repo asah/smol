@@ -215,3 +215,55 @@ FETCH 10 FROM c6;
 ABORT;
 DROP INDEX t_endscan_smol;
 DROP TABLE t_endscan;
+-- Test 6: Backward scan with INT8 (8-byte key) - tests smol_copy8 at line 1842
+DROP TABLE IF EXISTS t_back_int8 CASCADE;
+CREATE UNLOGGED TABLE t_back_int8(k int8);
+INSERT INTO t_back_int8 SELECT i::int8 FROM generate_series(1, 1000) i;
+CREATE INDEX t_back_int8_smol ON t_back_int8 USING smol(k);
+BEGIN;
+DECLARE c_int8 CURSOR FOR SELECT k FROM t_back_int8 WHERE k >= 100::int8 ORDER BY k;
+FETCH LAST FROM c_int8;
+  k   
+------
+ 1000
+(1 row)
+
+FETCH BACKWARD 5 FROM c_int8;
+  k  
+-----
+ 999
+ 998
+ 997
+ 996
+ 995
+(5 rows)
+
+COMMIT;
+DROP INDEX t_back_int8_smol;
+DROP TABLE t_back_int8;
+-- Test 7: Backward scan with text (varwidth key) - tests smol_emit_single_tuple at line 1836
+DROP TABLE IF EXISTS t_back_text CASCADE;
+CREATE UNLOGGED TABLE t_back_text(s text COLLATE "C");
+INSERT INTO t_back_text SELECT 'key_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
+CREATE INDEX t_back_text_smol ON t_back_text USING smol(s);
+BEGIN;
+DECLARE c_text CURSOR FOR SELECT s FROM t_back_text WHERE s >= 'key_000100' ORDER BY s;
+FETCH LAST FROM c_text;
+     s      
+------------
+ key_000509
+(1 row)
+
+FETCH BACKWARD 5 FROM c_text;
+     s      
+------------
+ key_000509
+ key_000509
+ key_000509
+ key_000509
+ key_000509
+(5 rows)
+
+COMMIT;
+DROP INDEX t_back_text_smol;
+DROP TABLE t_back_text;

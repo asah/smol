@@ -2,8 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(make:*)",
-      "Bash(su - postgres -c \"whoami\")",
-      "Bash(su - postgres -c \"make build\")",
+      "Bash(su - postgres -c:*)",
       "Bash(su:*)",
       "Read(//usr/**)",
       "Read(//proc/**)",
@@ -39,7 +38,16 @@
       "Bash(nm:*)",
       "Bash(pg_ctl restart:*)",
       "Bash(git log:*)",
-      "Bash(COVERAGE=1 make installcheck)"
+      "Bash(COVERAGE=1 make installcheck)",
+      "Bash(sed:*)",
+      "Bash(while read line)",
+      "Bash(do sed -n \"$linep\" /workspace/smol.c)",
+      "Bash(for line in 1816 1818 1819 1821 1823 1825 1826 1827 1833 1834 1835 2049)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(export COVERAGE=1)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do echo \"=== Run $i ===\")"
     ],
     "deny": [],
     "ask": []

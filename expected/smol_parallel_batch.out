@@ -1,0 +1,216 @@
+-- Test parallel batch claiming (smol.parallel_claim_batch > 1)
+-- This exercises the batch claiming loops that reduce atomic contention
+CREATE EXTENSION IF NOT EXISTS smol;
+NOTICE:  extension "smol" already exists, skipping
+-- Test 1: Single-column parallel scan with batch claiming
+DROP TABLE IF EXISTS t_batch1 CASCADE;
+NOTICE:  table "t_batch1" does not exist, skipping
+CREATE UNLOGGED TABLE t_batch1 (a int4);
+-- Insert enough data to create multiple leaf pages
+INSERT INTO t_batch1 SELECT i FROM generate_series(1, 50000) i;
+CREATE INDEX idx_batch1 ON t_batch1 USING smol(a);
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 3;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_index_scan_size = 0;
+-- Set batch claiming to 3 (claim 3 leaves at a time)
+SET smol.parallel_claim_batch = 3;
+-- Parallel scan should trigger batch claiming
+SELECT count(*) FROM t_batch1;
+ count 
+-------
+ 50000
+(1 row)
+
+SELECT sum(a) FROM t_batch1;
+    sum     
+------------
+ 1250025000
+(1 row)
+
+SELECT count(*) FROM t_batch1 WHERE a > 10000;
+ count 
+-------
+ 40000
+(1 row)
+
+-- Test 2: Two-column parallel scan with batch claiming
+DROP TABLE IF EXISTS t_batch2 CASCADE;
+NOTICE:  table "t_batch2" does not exist, skipping
+CREATE UNLOGGED TABLE t_batch2 (a int4, b int4);
+INSERT INTO t_batch2 SELECT i % 1000, i FROM generate_series(1, 50000) i;
+CREATE INDEX idx_batch2 ON t_batch2 USING smol(a, b);
+-- Batch claiming with two-column index
+SET smol.parallel_claim_batch = 4;
+SELECT count(*) FROM t_batch2 WHERE a > 100;
+ count 
+-------
+ 44950
+(1 row)
+
+SELECT sum(b) FROM t_batch2 WHERE a > 100;
+    sum     
+------------
+ 1125997500
+(1 row)
+
+-- Test 3: Batch claiming with selective query (lower bound)
+DROP TABLE IF EXISTS t_batch3 CASCADE;
+NOTICE:  table "t_batch3" does not exist, skipping
+CREATE UNLOGGED TABLE t_batch3 (a int4);
+INSERT INTO t_batch3 SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX idx_batch3 ON t_batch3 USING smol(a);
+SET smol.parallel_claim_batch = 5;
+-- Query with lower bound should use smol_find_first_leaf path
+SELECT count(*) FROM t_batch3 WHERE a >= 50000;
+ count 
+-------
+ 50001
+(1 row)
+
+SELECT sum(a) FROM t_batch3 WHERE a >= 75000;
+    sum     
+------------
+ 2187587500
+(1 row)
+
+-- Test 4: Batch claiming with INT2
+DROP TABLE IF EXISTS t_batch_int2 CASCADE;
+NOTICE:  table "t_batch_int2" does not exist, skipping
+CREATE UNLOGGED TABLE t_batch_int2 (a int2);
+INSERT INTO t_batch_int2 SELECT (i % 30000)::int2 FROM generate_series(1, 100000) i;
+CREATE INDEX idx_batch_int2 ON t_batch_int2 USING smol(a);
+SET smol.parallel_claim_batch = 3;
+SELECT count(*) FROM t_batch_int2 WHERE a > 1000;
+ count 
+-------
+ 95997
+(1 row)
+
+-- Test 5: Batch claiming with INT8
+DROP TABLE IF EXISTS t_batch_int8 CASCADE;
+NOTICE:  table "t_batch_int8" does not exist, skipping
+CREATE UNLOGGED TABLE t_batch_int8 (a int8);
+INSERT INTO t_batch_int8 SELECT i::int8 FROM generate_series(1, 80000) i;
+CREATE INDEX idx_batch_int8 ON t_batch_int8 USING smol(a);
+SET smol.parallel_claim_batch = 4;
+SELECT count(*) FROM t_batch_int8 WHERE a >= 40000;
+ count 
+-------
+ 40001
+(1 row)
+
+-- Test 6: High contention scenario (batch_size=1 vs batch_size>1)
+-- First with batch_size=1 (baseline)
+DROP TABLE IF EXISTS t_contend CASCADE;
+NOTICE:  table "t_contend" does not exist, skipping
+CREATE UNLOGGED TABLE t_contend (a int4, b int4);
+INSERT INTO t_contend SELECT i, i*2 FROM generate_series(1, 100000) i;
+CREATE INDEX idx_contend ON t_contend USING smol(a);
+SET smol.parallel_claim_batch = 1;
+SELECT count(*), sum(a) FROM t_contend;
+ count  |    sum     
+--------+------------
+ 100000 | 5000050000
+(1 row)
+
+-- Now with batch_size=5 (should reduce atomic operations)
+SET smol.parallel_claim_batch = 5;
+SELECT count(*), sum(a) FROM t_contend;
+ count  |    sum     
+--------+------------
+ 100000 | 5000050000
+(1 row)
+
+-- Verify results are identical
+WITH batch1 AS (
+    SELECT count(*) as c, sum(a) as s FROM t_contend
+)
+SELECT c, s FROM batch1;
+   c    |     s      
+--------+------------
+ 100000 | 5000050000
+(1 row)
+
+-- Test 7: Edge case - batch size larger than number of leaves
+DROP TABLE IF EXISTS t_small CASCADE;
+NOTICE:  table "t_small" does not exist, skipping
+CREATE UNLOGGED TABLE t_small (a int4);
+INSERT INTO t_small SELECT i FROM generate_series(1, 100) i;
+CREATE INDEX idx_small ON t_small USING smol(a);
+-- Set batch size very high - should still work correctly
+SET smol.parallel_claim_batch = 10;
+SELECT count(*) FROM t_small;
+ count 
+-------
+   100
+(1 row)
+
+-- Reset to default
+SET smol.parallel_claim_batch = 1;
+-- Test 8: CAS failure retry path (line 2132)
+-- Force atomic CAS to fail every 2nd call to test retry logic
+DROP TABLE IF EXISTS t_cas_fail CASCADE;
+NOTICE:  table "t_cas_fail" does not exist, skipping
+CREATE UNLOGGED TABLE t_cas_fail (a int4);
+INSERT INTO t_cas_fail SELECT i FROM generate_series(1, 50000) i;
+CREATE INDEX idx_cas_fail ON t_cas_fail USING smol(a);
+SET smol.parallel_claim_batch = 3;
+SET smol.cas_fail_every = 2;  -- Fail every 2nd CAS to force retries
+-- Run parallel scan multiple times to ensure CAS gets called many times and triggers retries
+SELECT count(*) FROM t_cas_fail;
+ count 
+-------
+ 50000
+(1 row)
+
+SELECT sum(a) FROM t_cas_fail WHERE a > 10000;
+    sum     
+------------
+ 1200020000
+(1 row)
+
+SELECT count(*) FROM t_cas_fail WHERE a >= 25000;
+ count 
+-------
+ 25001
+(1 row)
+
+-- Reset CAS failure simulation
+SET smol.cas_fail_every = 0;
+-- Test 9: Prefetch depth > 1 (line 2087-2094)
+-- Test prefetching multiple blocks ahead in parallel scans
+DROP TABLE IF EXISTS t_prefetch CASCADE;
+NOTICE:  table "t_prefetch" does not exist, skipping
+CREATE UNLOGGED TABLE t_prefetch (a int4);
+INSERT INTO t_prefetch SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX idx_prefetch ON t_prefetch USING smol(a);
+SET smol.parallel_claim_batch = 2;
+SET smol.prefetch_depth = 3;  -- Prefetch 3 blocks ahead
+SELECT count(*) FROM t_prefetch;
+ count  
+--------
+ 100000
+(1 row)
+
+SELECT sum(a) FROM t_prefetch WHERE a > 50000;
+    sum     
+------------
+ 3750025000
+(1 row)
+
+-- Reset prefetch depth
+SET smol.prefetch_depth = 1;
+-- Cleanup
+DROP TABLE t_batch1 CASCADE;
+DROP TABLE t_batch2 CASCADE;
+DROP TABLE t_batch3 CASCADE;
+DROP TABLE t_batch_int2 CASCADE;
+DROP TABLE t_batch_int8 CASCADE;
+DROP TABLE t_contend CASCADE;
+DROP TABLE t_small CASCADE;
+DROP TABLE t_cas_fail CASCADE;
+DROP TABLE t_prefetch CASCADE;

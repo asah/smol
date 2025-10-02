@@ -30,3 +30,167 @@ SELECT (SELECT sum(a1)::bigint FROM inc1 WHERE b > 50000) = :'bt_sum1' AS sum1_m
  t          | t          | t
 (1 row)
 
+-- Test bool INCLUDE (1-byte byval) - triggers case 1 at line 4436
+DROP TABLE IF EXISTS inc_bool CASCADE;
+CREATE UNLOGGED TABLE inc_bool(k int4, b bool);
+INSERT INTO inc_bool SELECT i, (i % 2 = 0) FROM generate_series(1, 1000) i;
+ANALYZE inc_bool;
+ALTER TABLE inc_bool SET (autovacuum_enabled = off);
+CREATE INDEX inc_bool_smol ON inc_bool USING smol(k) INCLUDE (b);
+ANALYZE inc_bool;
+-- Verify bool INCLUDE works
+SELECT count(*) FROM inc_bool WHERE k > 500;
+ count 
+-------
+   500
+(1 row)
+
+SELECT count(*) FILTER (WHERE b) AS true_count FROM inc_bool WHERE k > 0;
+ true_count 
+------------
+        500
+(1 row)
+
+-- Test int2 INCLUDE (2-byte byval) with TEXT key - triggers line 4364 in smol_emit_single_tuple (RLE path)
+DROP TABLE IF EXISTS inc_int2_text CASCADE;
+CREATE UNLOGGED TABLE inc_int2_text(k text COLLATE "C", v int2);
+-- Create duplicates to trigger RLE encoding
+INSERT INTO inc_int2_text SELECT 'key_' || lpad((i % 100)::text, 3, '0'), (i % 30000)::int2 FROM generate_series(1, 10000) i ORDER BY 1;
+ANALYZE inc_int2_text;
+ALTER TABLE inc_int2_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_int2_text_smol ON inc_int2_text USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int2_text;
+ANALYZE inc_int2_text;
+-- Verify int2 INCLUDE works with text key and index-only scan (should use RLE)
+SET enable_seqscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off;
+SELECT count(*) FROM inc_int2_text WHERE k >= 'key_050';
+ count 
+-------
+  5000
+(1 row)
+
+SELECT sum(v::int8) FROM inc_int2_text WHERE k < 'key_010';
+   sum   
+---------
+ 4964500
+(1 row)
+
+-- Test int8 INCLUDE (8-byte byval) with TEXT key - triggers line 4366 in smol_emit_single_tuple (RLE path)
+DROP TABLE IF EXISTS inc_int8_text CASCADE;
+CREATE UNLOGGED TABLE inc_int8_text(k text COLLATE "C", v int8);
+-- Create duplicates to trigger RLE encoding
+INSERT INTO inc_int8_text SELECT 'key_' || lpad((i % 100)::text, 3, '0'), i::int8 * 1000 FROM generate_series(1, 10000) i ORDER BY 1;
+ANALYZE inc_int8_text;
+ALTER TABLE inc_int8_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_int8_text_smol ON inc_int8_text USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int8_text;
+ANALYZE inc_int8_text;
+-- Verify int8 INCLUDE works with text key and index-only scan (should use RLE)
+SELECT count(*) FROM inc_int8_text WHERE k >= 'key_050';
+ count 
+-------
+  5000
+(1 row)
+
+SELECT sum(v) FROM inc_int8_text WHERE k < 'key_010';
+    sum     
+------------
+ 4964500000
+(1 row)
+
+-- ============================================================================
+-- Test text32 non-RLE path (lines 4364-4368 in smol_emit_single_tuple)
+-- Requires UNIQUE text32 keys to avoid RLE encoding
+-- ============================================================================
+DROP TABLE IF EXISTS inc_text32_unique CASCADE;
+CREATE UNLOGGED TABLE inc_text32_unique(k text COLLATE "C", v int4);
+-- Insert unique keys (no duplicates) to prevent RLE
+INSERT INTO inc_text32_unique SELECT 'unique_' || lpad(i::text, 10, '0'), i FROM generate_series(1, 1000) i;
+ANALYZE inc_text32_unique;
+ALTER TABLE inc_text32_unique SET (autovacuum_enabled = off);
+CREATE INDEX inc_text32_unique_smol ON inc_text32_unique USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_text32_unique;
+ANALYZE inc_text32_unique;
+-- Query with unique text keys (no RLE) - triggers lines 4364-4368
+SELECT count(*), sum(v::int8) FROM inc_text32_unique WHERE k >= 'unique_0000000500';
+ count |  sum   
+-------+--------
+   501 | 375750
+(1 row)
+
+-- ============================================================================
+-- Test fixed-size key copies in smol_emit_single_tuple (lines 4375-4377)
+-- Need int8/uuid keys with text INCLUDE to trigger varwidth tuple building
+-- ============================================================================
+-- Test int8 key + text INCLUDE (line 4375: key_len==8)
+DROP TABLE IF EXISTS inc_int8key_text CASCADE;
+CREATE UNLOGGED TABLE inc_int8key_text(k int8, t text COLLATE "C");
+INSERT INTO inc_int8key_text SELECT i::int8, 'text_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_int8key_text;
+ALTER TABLE inc_int8key_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_int8key_text_smol ON inc_int8key_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int8key_text;
+ANALYZE inc_int8key_text;
+SELECT count(*), sum(k) FROM inc_int8key_text WHERE k >= 500::int8;
+ count |  sum   
+-------+--------
+   501 | 375750
+(1 row)
+
+-- Test uuid key + text INCLUDE (line 4376: key_len==16)
+DROP TABLE IF EXISTS inc_uuid_text CASCADE;
+CREATE UNLOGGED TABLE inc_uuid_text(k uuid, t text COLLATE "C");
+INSERT INTO inc_uuid_text SELECT md5(i::text)::uuid, 'data_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_uuid_text;
+ALTER TABLE inc_uuid_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_uuid_text_smol ON inc_uuid_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_uuid_text;
+ANALYZE inc_uuid_text;
+SELECT count(*) FROM inc_uuid_text WHERE k > '00000000-0000-0000-0000-000000000000'::uuid;
+ count 
+-------
+  1000
+(1 row)
+
+-- Test interval key + text INCLUDE (line 4377: uncommon key_len)
+DROP TABLE IF EXISTS inc_interval_text CASCADE;
+CREATE UNLOGGED TABLE inc_interval_text(k interval, t text COLLATE "C");
+INSERT INTO inc_interval_text SELECT (i || ' days')::interval, 'info_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_interval_text;
+ALTER TABLE inc_interval_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_interval_text_smol ON inc_interval_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_interval_text;
+ANALYZE inc_interval_text;
+SELECT count(*) FROM inc_interval_text WHERE k >= '100 days'::interval;
+ count 
+-------
+   952
+(1 row)
+
+-- ============================================================================
+-- Test smol_copy_small uncommon cases (lines 4319-4333)
+-- These are reached via smol_copy_small with specific lengths
+-- ============================================================================
+-- Test case 4: 4-byte fixed type (already covered by int4)
+-- Test case 5: 5-byte type - use "char"[5] array
+DROP TABLE IF EXISTS inc_char5_text CASCADE;
+CREATE UNLOGGED TABLE inc_char5_text(k "char", t text COLLATE "C");
+INSERT INTO inc_char5_text SELECT (i % 256)::int::char, 'val_' || i::text FROM generate_series(1, 500) i;
+ANALYZE inc_char5_text;
+ALTER TABLE inc_char5_text SET (autovacuum_enabled = off);
+CREATE INDEX inc_char5_text_smol ON inc_char5_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_char5_text;
+ANALYZE inc_char5_text;
+SELECT count(*) FROM inc_char5_text WHERE k >= '0'::char;
+ count 
+-------
+   500
+(1 row)
+

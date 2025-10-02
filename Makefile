@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch
+REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -187,7 +187,11 @@ coverage-build: coverage-clean
 	@echo "[coverage] Coverage build complete."
 
 # Run tests with coverage
-coverage-test: start
+coverage-test:
+	@echo "[coverage] Ensuring PostgreSQL is restarted with new extension..."
+	@$(MAKE) stop
+	@sleep 1
+	@$(MAKE) start
 	@echo "[coverage] Running regression tests with coverage..."
 	@su - postgres -c "cd /workspace && make installcheck" || true
 	@echo "[coverage] Stopping PostgreSQL to flush coverage data..."
@@ -204,9 +208,13 @@ coverage-report:
 		echo ""; \
 		echo "=== COVERAGE SUMMARY ==="; \
 		awk ' \
-			/^        -:/ { next } \
-			/^    #####:/ { uncov++ } \
-			/^        [0-9]+:/ { cov++ } \
+			/GCOV_EXCL_START/ { excl=1; next } \
+			/GCOV_EXCL_STOP/ { excl=0; next } \
+			excl { next } \
+			/^ *-:/ { next } \
+			/^ *#####:.*GCOV_EXCL/ { next } \
+			/^ *#####:/ { uncov++ } \
+			/^ *[0-9]+:/ { cov++ } \
 			END { \
 				total = cov + uncov; \
 				if (total > 0) { \
@@ -216,7 +224,13 @@ coverage-report:
 			}' smol.c.gcov; \
 		echo ""; \
 		echo "=== UNCOVERED LINES ==="; \
-		grep -n "^    #####:" smol.c.gcov | head -50 | awk -F: '{printf "Line %s: not executed\n", $$1}'; \
+		awk ' \
+			/GCOV_EXCL_START/ { excl=1; next } \
+			/GCOV_EXCL_STOP/ { excl=0; next } \
+			excl { next } \
+			/GCOV_EXCL/ { next } \
+			/^ *#####:/ { print NR }' smol.c.gcov | head -50 | \
+		awk '{printf "Line %s: not executed\n", $$1}'; \
 	else \
 		echo "[coverage] ERROR: No coverage data found. Run 'make coverage-test' first."; \
 	fi
@@ -241,8 +255,16 @@ coverage-html:
 # Complete coverage workflow
 coverage: coverage-build coverage-test coverage-report
 	@echo ""
+	@echo "[coverage] Extracting uncovered lines..."
+	@grep -n "^    #####:" smol.c.gcov | grep -v "GCOV_EXCL" | \
+		awk -F: '{print $$1 "\t" $$2}' > coverage_uncovered.txt || true
+	@if [ -f coverage_uncovered.txt ]; then \
+		echo "[coverage] Uncovered lines saved to coverage_uncovered.txt ($(shell wc -l < coverage_uncovered.txt 2>/dev/null || echo 0) lines)"; \
+	fi
+	@echo ""
 	@echo "[coverage] Full coverage analysis complete!"
 	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
+	@echo "[coverage] Review coverage_uncovered.txt for all uncovered lines"
 	@echo "[coverage] Run 'make coverage-html' for HTML report"
 
 

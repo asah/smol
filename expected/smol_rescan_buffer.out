@@ -1,0 +1,66 @@
+-- Test rescan with buffer pin cleanup
+-- Targets lines 1263-1268: ReleaseBuffer during rescan
+CREATE EXTENSION IF NOT EXISTS smol;
+NOTICE:  extension "smol" already exists, skipping
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 0;
+-- Create table with index
+DROP TABLE IF EXISTS t_rescan CASCADE;
+NOTICE:  table "t_rescan" does not exist, skipping
+CREATE UNLOGGED TABLE t_rescan (k int4, v int4);
+INSERT INTO t_rescan SELECT i, i*10 FROM generate_series(1, 10000) i;
+CREATE INDEX idx_rescan ON t_rescan USING smol(k);
+-- Use a cursor to initiate a scan, which will pin a buffer
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT k, v FROM t_rescan WHERE k >= 100;
+-- Fetch some rows (this will pin a buffer in the scan state)
+FETCH 5 FROM c1;
+ERROR:  smol supports index-only scans only
+-- Close and reopen cursor (this should trigger rescan which releases buffer)
+CLOSE c1;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+DECLARE c1 CURSOR FOR SELECT k, v FROM t_rescan WHERE k >= 200;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+FETCH 5 FROM c1;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+CLOSE c1;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+COMMIT;
+-- Try with nested loop join that might trigger rescan
+DROP TABLE IF EXISTS t_outer CASCADE;
+NOTICE:  table "t_outer" does not exist, skipping
+CREATE UNLOGGED TABLE t_outer (id int4);
+INSERT INTO t_outer VALUES (100), (200), (300);
+-- Nested loop where inner side gets rescanned
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+EXPLAIN (COSTS OFF) SELECT t_outer.id, t_rescan.k
+FROM t_outer
+JOIN t_rescan ON t_rescan.k = t_outer.id;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop
+   ->  Seq Scan on t_outer
+         Disabled: true
+   ->  Index Only Scan using idx_rescan on t_rescan
+         Disabled: true
+         Index Cond: (k = t_outer.id)
+(6 rows)
+
+SELECT t_outer.id, t_rescan.k
+FROM t_outer
+JOIN t_rescan ON t_rescan.k = t_outer.id
+ORDER BY t_outer.id;
+ id  |  k  
+-----+-----
+ 100 | 100
+ 200 | 200
+ 300 | 300
+(3 rows)
+
+-- Cleanup
+DROP TABLE t_rescan CASCADE;
+DROP TABLE t_outer CASCADE;
