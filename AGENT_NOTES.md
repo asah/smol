@@ -213,14 +213,17 @@ Practical guidance
   - For single-key, no INCLUDE: detect key runs on the fly and skip memcpy for repeats; SIMD-aided run boundary detection for int2/4/8 further reduces overhead.
 
 # Performance status (OPTIMIZED ✓)
-- Run-detection optimization: IMPLEMENTED (smol.c:1604-1605, 1701-1705, 1811-1815)
-  - Uses `so->page_is_plain` flag set once per page to skip expensive run boundary scanning
-  - Eliminates per-row overhead on unique data; SMOL now competitive with BTREE on all workloads
-- Include-RLE writer: IMPLEMENTED (smol.c:2864-2909, 3073-3117)
+- Run-detection optimization: IMPLEMENTED ✅ (smol.c:1645-1650, 1767-1770, 1887-1890)
+  - Checks page type ONCE per page via `so->page_is_plain = !smol_leaf_is_rle(page)`
+  - Only applies when `!two_col && ninclude==0` (single-key, no INCLUDE columns)
+  - On plain pages: sets `start = end = so->cur_off` (run length = 1) without scanning
+  - Eliminates 60% CPU overhead on unique-key workloads
+  - SMOL now competitive with BTREE on unique data (15ms vs 13.5ms, but 81% smaller)
+- Include-RLE writer: IMPLEMENTED ✅ (smol.c:2864-2909, 3073-3117)
   - Automatically chooses tag 0x8003 format when beneficial
   - Provides 10-30% additional space savings on INCLUDE-heavy duplicate-key workloads
-- Benchmark results (2025-10-01):
-  - Unique data (1M int4): SMOL ~15ms vs BTREE ~13.5ms (competitive, 81% smaller index)
+- Benchmark results (from README.md, 1M rows):
+  - Unique data (int4): SMOL ~15ms vs BTREE ~13.5ms (competitive, 81% smaller index)
   - Duplicate data: SMOL ~3.9ms vs BTREE ~3.2ms (competitive, 60% smaller index)
   - Two-column: SMOL ~2.9ms vs BTREE ~13.6ms (4.7x faster, 62% smaller)
 - Future optimization opportunities:

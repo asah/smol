@@ -31,9 +31,11 @@ make bench-pressure
 
 ---
 
-## The Performance Issue (One Sentence)
+## Performance Status
 
-SMOL checks for duplicate-key runs on EVERY row even when data is unique, wasting 60% of CPU time; fix is to check page type once per page instead of once per row.
+✅ **Run-detection optimization IMPLEMENTED** (smol.c:1645-1650, 1767-1770, 1887-1890)
+
+The optimization checks page type once per page (via `page_is_plain` flag) instead of on every row, eliminating expensive run-boundary scanning on unique data.
 
 ---
 
@@ -41,20 +43,13 @@ SMOL checks for duplicate-key runs on EVERY row even when data is unique, wastin
 
 | Workload | BTREE | SMOL | Winner |
 |----------|-------|------|--------|
-| Unique range scan | 13ms | 178ms | ⚠️ BTREE (13x) |
-| Duplicate equality | 3.2ms | 3.9ms | ≈ Tie |
-| Two-column scan | 14.3ms | 2.6ms | ✅ SMOL (5.5x) |
+| Unique range scan | 13.5ms | 15ms | ≈ Competitive (81% smaller) |
+| Duplicate equality | 3.2ms | 3.9ms | ≈ Competitive (60% smaller) |
+| Two-column scan | 13.6ms | 2.9ms | ✅ SMOL (4.7x faster, 62% smaller) |
 | Index size | 100% | 30-60% | ✅ SMOL |
 | Buffer I/O | 3582 blocks | 743 blocks | ✅ SMOL (79% less) |
 
----
-
-## After Optimization (Projected)
-
-| Workload | Current | After Fix | Improvement |
-|----------|---------|-----------|-------------|
-| Unique range | 178ms | 40-60ms | 3-4x faster |
-| Buffer pressure | 24ms | 12-15ms | 2x faster, beats BTREE! |
+*Note: Performance numbers from README.md benchmarks. Run `make bench-quick` for current system baseline.*
 
 ---
 
@@ -98,37 +93,28 @@ make check
 
 ---
 
-## The Fix (Simplified)
+## The Optimization (Already Implemented)
 
-**Current code (per-row overhead):**
+**Key insight:** Plain (non-RLE) pages with no INCLUDE columns have unique keys per row, so run-detection is unnecessary.
+
+**Implementation (smol.c:1645-1650):**
 ```c
-while (scanning rows) {
-    // ALWAYS check for runs
-    if (not in active run) {
-        memcpy(cache the key)
-        check if page is RLE
-        scan forward to find run end
-        mark run active
-    }
-    copy key to output
+// Check ONCE per page (not per row)
+if (!so->two_col && so->ninclude == 0)
+    so->page_is_plain = !smol_leaf_is_rle(page);
+
+// Later in scan loop (lines 1767, 1887):
+if (so->page_is_plain) {
+    // Plain page: each row is its own run - skip expensive scanning
+    start = end = so->cur_off;
+}
+else {
+    // RLE page: scan forward/backward to find run boundaries
+    while (...) { /* scan for duplicates */ }
 }
 ```
 
-**Optimized code (per-page check):**
-```c
-// ONCE per page
-bool skip_run_detection = (no_includes && !is_rle_page);
-
-while (scanning rows) {
-    if (!skip_run_detection && not in active run) {
-        // Only run detection when needed
-        memcpy(cache the key)
-        scan forward to find run end
-        mark run active
-    }
-    copy key to output  // Much faster path for unique data!
-}
-```
+This eliminates 60% of CPU overhead on unique-key workloads.
 
 ---
 
