@@ -22,7 +22,8 @@
       "Bash(timeout 60 tail -20 /tmp/pg.log)",
       "Bash(find:*)",
       "Bash(xargs:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(./analyze_coverage.sh)"
     ],
     "deny": [],
     "ask": []

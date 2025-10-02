@@ -5,8 +5,14 @@ MODULES = smol
 
 PG_CFLAGS=-Wno-declaration-after-statement
 
+# Coverage build flags (gcov-compatible)
+ifeq ($(COVERAGE),1)
+PG_CFLAGS += --coverage -O0
+SHLIB_LINK += --coverage
+endif
+
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_twocol smol_twocol_uuid_int4 smol_twocol_date_int4 smol_parallel smol_include smol_types smol_dup smol_dup_more smol_more_cases smol_rle_cache smol_text
+REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -161,4 +167,82 @@ pgcheck: build start
 	  su - postgres -c "cd /workspace && make installcheck"; \
 	  $(MAKE) stop
 
- 
+# ---------------------------------------------------------------------------
+# Code Coverage Targets (Ubuntu 24.04/Docker only)
+# ---------------------------------------------------------------------------
+.PHONY: coverage coverage-build coverage-clean coverage-report coverage-html
+
+# Clean coverage artifacts
+coverage-clean:
+	@echo "[coverage] Cleaning coverage data..."
+	@rm -f *.gcda *.gcno *.gcov smol.so
+	@rm -rf coverage_html
+	@echo "[coverage] Coverage data cleaned."
+
+# Build with coverage instrumentation
+coverage-build: coverage-clean
+	@echo "[coverage] Building with coverage instrumentation..."
+	@$(MAKE) clean
+	@COVERAGE=1 $(MAKE) all install
+	@echo "[coverage] Coverage build complete."
+
+# Run tests with coverage
+coverage-test: start
+	@echo "[coverage] Running regression tests with coverage..."
+	@su - postgres -c "cd /workspace && make installcheck" || true
+	@echo "[coverage] Stopping PostgreSQL to flush coverage data..."
+	@$(MAKE) stop
+	@sleep 1
+	@echo "[coverage] Test run complete."
+
+# Generate coverage report
+coverage-report:
+	@echo "[coverage] Generating coverage report..."
+	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov execution completed"
+	@if [ -f smol.c.gcov ]; then \
+		echo "[coverage] Coverage report generated: smol.c.gcov"; \
+		echo ""; \
+		echo "=== COVERAGE SUMMARY ==="; \
+		awk ' \
+			/^        -:/ { next } \
+			/^    #####:/ { uncov++ } \
+			/^        [0-9]+:/ { cov++ } \
+			END { \
+				total = cov + uncov; \
+				if (total > 0) { \
+					pct = (cov * 100.0) / total; \
+					printf "Lines executed: %.2f%% (%d/%d)\n", pct, cov, total; \
+				} \
+			}' smol.c.gcov; \
+		echo ""; \
+		echo "=== UNCOVERED LINES ==="; \
+		grep -n "^    #####:" smol.c.gcov | head -50 | awk -F: '{printf "Line %s: not executed\n", $$1}'; \
+	else \
+		echo "[coverage] ERROR: No coverage data found. Run 'make coverage-test' first."; \
+	fi
+
+# Generate HTML coverage report using lcov
+coverage-html:
+	@echo "[coverage] Generating HTML coverage report..."
+	@if ! command -v lcov >/dev/null 2>&1; then \
+		echo "[coverage] Installing lcov..."; \
+		apt-get update -qq && apt-get install -y -qq lcov >/dev/null 2>&1; \
+	fi
+	@lcov --capture --directory . --output-file coverage.info --quiet 2>/dev/null || true
+	@lcov --remove coverage.info '/usr/*' --output-file coverage.info --quiet 2>/dev/null || true
+	@genhtml coverage.info --output-directory coverage_html --quiet 2>/dev/null || true
+	@if [ -d coverage_html ]; then \
+		echo "[coverage] HTML report generated in coverage_html/index.html"; \
+	else \
+		echo "[coverage] HTML generation failed. Using text report instead."; \
+		$(MAKE) coverage-report; \
+	fi
+
+# Complete coverage workflow
+coverage: coverage-build coverage-test coverage-report
+	@echo ""
+	@echo "[coverage] Full coverage analysis complete!"
+	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
+	@echo "[coverage] Run 'make coverage-html' for HTML report"
+
+

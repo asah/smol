@@ -1,0 +1,88 @@
+-- Comprehensive duplicate-run coverage for single-key SMOL with INCLUDE
+-- Tests both small groups and large multi-leaf duplicate runs
+SET client_min_messages = warning;
+\pset format unaligned
+\pset tuples_only on
+\pset footer off
+\pset pager off
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Test 1: Small duplicate groups (10 groups of 5 duplicates each)
+DROP TABLE IF EXISTS d CASCADE;
+CREATE UNLOGGED TABLE d(a int2, x int4);
+INSERT INTO d
+SELECT g::int2, (g*100 + r)::int4
+FROM generate_series(1,10) g, generate_series(1,5) r;
+CREATE INDEX d_a_smol ON d USING smol(a) INCLUDE (x);
+SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
+-- Forward run: expect 3 repeated 5, then 4 repeated
+COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
+3
+3
+3
+3
+3
+4
+4
+4
+-- Backward run: expect 10 repeated 5, then 9 repeated
+COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
+10
+10
+10
+10
+10
+9
+9
+-- INCLUDE path: sum for a=7 is 7*100*5 + sum(1..5) = 3515
+COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;
+3515
+-- Repeat queries for stability
+COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
+3
+3
+3
+3
+3
+4
+4
+4
+COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
+10
+10
+10
+10
+10
+9
+9
+COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;
+3515
+DROP INDEX d_a_smol;
+DROP TABLE d;
+-- Test 2: Large multi-leaf duplicate run (20k rows, single duplicate key)
+-- This forces multiple leaf pages with the same key, testing run-detection
+-- and INCLUDE dup-caching across page boundaries
+CREATE UNLOGGED TABLE dm(a int4, x int4);
+INSERT INTO dm SELECT 42::int4, i::int4 FROM generate_series(1,20000) i;
+CREATE INDEX dm_a_smol ON dm USING smol(a) INCLUDE (x);
+SET enable_seqscan=off; SET enable_indexonlyscan=on;
+-- Count and sum checks (run 3 times for stability)
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+20000
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+200010000
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+42
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+20000
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+200010000
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+42
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+20000
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+200010000
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+42
+DROP INDEX dm_a_smol;
+DROP TABLE dm;

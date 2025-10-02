@@ -11,6 +11,11 @@ sampledata/
 # Prerequisites
 *.d
 
+*.gcov
+regression.*
+*.gcda
+*.gcno
+
 # Object files
 *.o
 *.ko

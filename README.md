@@ -136,7 +136,11 @@ Usage
   are supported, but see notes below on deterministic correctness testing.
 
 Tests
-- to run tests: make install && make start && su - postgres bash -c "cd /workspace && make installcheck" && make stop
+- Run regression tests: `make install && make start && su - postgres bash -c "cd /workspace && make installcheck" && make stop`
+- Code coverage: `make coverage` (builds with instrumentation, runs tests, generates report)
+  - Coverage report: `smol.c.gcov` (line-by-line) and `COVERAGE_REPORT.md` (analysis)
+  - HTML report: `make coverage-html` (requires lcov)
+  - Current coverage: ~39% (core functionality fully tested, see COVERAGE_REPORT.md)
 
 Deterministic Correctness Check (Multi‑Column Regression)
 - Some workloads (e.g., `GROUP BY a` on an index defined as SMOL(b,a)) can pick SMOL even without
