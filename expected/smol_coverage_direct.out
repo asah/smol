@@ -1,0 +1,183 @@
+-- Direct coverage tests - bypass planner to exercise unreachable code
+-- These tests call index AM functions directly via C wrappers
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Create test table and index
+DROP TABLE IF EXISTS t_cov CASCADE;
+CREATE UNLOGGED TABLE t_cov(k int4);
+INSERT INTO t_cov SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX t_cov_smol ON t_cov USING smol(k);
+-- Test 1: Backward scan without bound
+-- This directly calls smol_gettuple() with BackwardScanDirection
+-- Covers lines 1299-1332 (backward scan initialization)
+SELECT smol_test_backward_scan('t_cov_smol'::regclass) AS backward_count;
+ backward_count 
+----------------
+             10
+(1 row)
+
+-- Test 2: Backward scan with bound
+-- Covers lines 1301-1324 (backward scan with bound check)
+SELECT smol_test_backward_scan('t_cov_smol'::regclass, 500) AS backward_with_bound;
+ backward_with_bound 
+---------------------
+                  10
+(1 row)
+
+-- Test 3: Parallel scan using SQL with forced parallel workers
+-- Force parallel execution to trigger parallel scan coordination code
+-- Covers lines 1336-1406 (parallel scan coordination)
+DROP TABLE IF EXISTS t_cov_parallel CASCADE;
+CREATE UNLOGGED TABLE t_cov_parallel(k int4);
+-- Insert enough data to trigger parallel scan
+INSERT INTO t_cov_parallel SELECT i FROM generate_series(1, 1000000) i;
+CREATE INDEX t_cov_parallel_smol ON t_cov_parallel USING smol(k);
+ANALYZE t_cov_parallel;
+-- Force parallel execution with multiple workers
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+-- This should trigger parallel index scan paths
+-- (Just check that parallel scan plan is used)
+EXPLAIN SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=4340.95..4340.96 rows=1 width=8)
+   ->  Gather  (cost=4340.93..4340.94 rows=4 width=8)
+         Workers Planned: 4
+         ->  Partial Aggregate  (cost=4340.93..4340.94 rows=1 width=8)
+               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel  (cost=0.00..3715.96 rows=249988 width=0)
+                     Index Cond: (k > 0)
+(6 rows)
+
+-- Actually run it to ensure parallel code executes
+SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
+  count  
+---------
+ 1000000
+(1 row)
+
+-- Test 5: Two-column index backward scan
+DROP TABLE IF EXISTS t_cov_2col CASCADE;
+CREATE UNLOGGED TABLE t_cov_2col(k1 int4, k2 int4);
+INSERT INTO t_cov_2col SELECT i % 100, i FROM generate_series(1, 1000) i;
+CREATE INDEX t_cov_2col_smol ON t_cov_2col USING smol(k1, k2);
+SELECT smol_test_backward_scan('t_cov_2col_smol'::regclass) AS two_col_backward;
+ two_col_backward 
+------------------
+                0
+(1 row)
+
+-- Test 6: Index with INCLUDE backward scan
+DROP TABLE IF EXISTS t_cov_inc CASCADE;
+CREATE UNLOGGED TABLE t_cov_inc(k int4, v int4);
+INSERT INTO t_cov_inc SELECT i, i*10 FROM generate_series(1, 1000) i;
+CREATE INDEX t_cov_inc_smol ON t_cov_inc USING smol(k) INCLUDE (v);
+SELECT smol_test_backward_scan('t_cov_inc_smol'::regclass) AS include_backward;
+ include_backward 
+------------------
+               10
+(1 row)
+
+SELECT smol_test_backward_scan('t_cov_inc_smol'::regclass, 750) AS include_backward_bound;
+ include_backward_bound 
+------------------------
+                     10
+(1 row)
+
+-- Test 7: Error path - non-index-only scan (line 1286)
+-- This should fail because SMOL requires index-only scans
+\set VERBOSITY terse
+DO $$
+BEGIN
+    -- Try to call scan without xs_want_itup set (simulates non-IOS)
+    PERFORM smol_test_error_non_ios('t_cov_smol'::regclass);
+    RAISE EXCEPTION 'Expected error was not raised';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLERRM LIKE '%smol supports index-only scans only%' THEN
+            RAISE NOTICE 'Correctly caught non-IOS error';
+        ELSE
+            RAISE;
+        END IF;
+END $$;
+-- Test 8: Error path - NoMovementScanDirection (line 1288)
+-- This should return false without error
+SELECT smol_test_no_movement('t_cov_smol'::regclass) AS no_movement_result;
+ no_movement_result 
+--------------------
+ f
+(1 row)
+
+-- Test 9: Test INT2 (smallint) for parallel scan bound logic (line 1351)
+DROP TABLE IF EXISTS t_cov_int2 CASCADE;
+CREATE UNLOGGED TABLE t_cov_int2(k int2);
+INSERT INTO t_cov_int2 SELECT i::int2 FROM generate_series(1, 10000) i;
+CREATE INDEX t_cov_int2_smol ON t_cov_int2 USING smol(k);
+ANALYZE t_cov_int2;
+-- Force parallel scan with INT2 bound
+SET max_parallel_workers_per_gather = 4;
+SELECT COUNT(*) FROM t_cov_int2 WHERE k > 100::int2;
+ count 
+-------
+  9900
+(1 row)
+
+-- Test 10: Test INT8 (bigint) for parallel scan bound logic (line 1353)
+DROP TABLE IF EXISTS t_cov_int8 CASCADE;
+CREATE UNLOGGED TABLE t_cov_int8(k int8);
+INSERT INTO t_cov_int8 SELECT i::int8 FROM generate_series(1, 10000) i;
+CREATE INDEX t_cov_int8_smol ON t_cov_int8 USING smol(k);
+ANALYZE t_cov_int8;
+-- Force parallel scan with INT8 bound
+SELECT COUNT(*) FROM t_cov_int8 WHERE k > 100::int8;
+ count 
+-------
+  9900
+(1 row)
+
+-- Test 11: Type validation in amvalidate - attempt to create operator class for unsupported type
+-- amvalidate is called explicitly, not automatically during CREATE OPERATOR CLASS
+\set VERBOSITY terse
+DO $$
+DECLARE
+    opcoid oid;
+BEGIN
+    -- Create an operator class for numeric (variable-length, not supported)
+    CREATE OPERATOR CLASS numeric_ops_test
+        FOR TYPE numeric USING smol AS
+            OPERATOR 1 <,
+            OPERATOR 2 <=,
+            OPERATOR 3 =,
+            OPERATOR 4 >=,
+            OPERATOR 5 >,
+            FUNCTION 1 numeric_cmp(numeric, numeric);
+
+    -- Get the OID of the operator class
+    SELECT oid INTO opcoid FROM pg_opclass WHERE opcname = 'numeric_ops_test';
+
+    -- Now call amvalidate - this should fail with validation error
+    BEGIN
+        PERFORM amvalidate(opcoid);
+        RAISE EXCEPTION 'Expected validation error was not raised';
+    EXCEPTION
+        WHEN invalid_object_definition THEN
+            IF SQLERRM LIKE '%unsupported data type%' THEN
+                RAISE NOTICE 'Correctly caught type validation error in amvalidate';
+            ELSE
+                RAISE;
+            END IF;
+    END;
+
+    -- Cleanup the operator class
+    DROP OPERATOR CLASS numeric_ops_test USING smol;
+END $$;
+-- Cleanup
+DROP TABLE t_cov CASCADE;
+DROP TABLE t_cov_parallel CASCADE;
+DROP TABLE t_cov_2col CASCADE;
+DROP TABLE t_cov_inc CASCADE;
+DROP TABLE t_cov_int2 CASCADE;
+DROP TABLE t_cov_int8 CASCADE;

@@ -4,6 +4,37 @@ RETURNS index_am_handler
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
 
+-- Test functions for coverage (call AM functions directly to bypass planner)
+CREATE FUNCTION smol_test_backward_scan(regclass)
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION smol_test_backward_scan(regclass, integer)
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION smol_test_backward_scan(regclass) IS
+'Test function to force backward scan execution (for code coverage)';
+COMMENT ON FUNCTION smol_test_backward_scan(regclass, integer) IS
+'Test function to force backward scan with bound (for code coverage)';
+
+CREATE FUNCTION smol_test_error_non_ios(regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION smol_test_no_movement(regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION smol_test_error_non_ios(regclass) IS
+'Test function to exercise non-index-only scan error path (for code coverage)';
+COMMENT ON FUNCTION smol_test_no_movement(regclass) IS
+'Test function to exercise NoMovementScanDirection path (for code coverage)';
+
 -- Create the access method
 CREATE ACCESS METHOD smol TYPE INDEX HANDLER smol_handler;
 

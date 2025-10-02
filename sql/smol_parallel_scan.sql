@@ -1,0 +1,84 @@
+-- Parallel scan test - forces parallel index-only scan execution
+-- Requires large enough data and proper parallel settings
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Create large table to justify parallelism
+DROP TABLE IF EXISTS t_para CASCADE;
+CREATE UNLOGGED TABLE t_para(k int4, v int4);
+
+-- Insert 500k rows to make parallelism worthwhile
+INSERT INTO t_para SELECT i, i*2 FROM generate_series(1, 500000) i;
+
+-- Critical: ANALYZE to get accurate statistics for planner
+ANALYZE t_para;
+
+CREATE INDEX t_para_smol ON t_para USING smol(k) INCLUDE (v);
+
+-- Force parallel execution settings
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET debug_parallel_query = on;  -- Force parallel mode in PG18+
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+
+-- Run parallel query - large enough to trigger parallel workers
+-- Query returns actual data to verify correctness
+SELECT count(*), sum(v)::bigint, min(k), max(k)
+FROM t_para
+WHERE k >= 10000;
+
+-- Run another parallel query with different selectivity
+SELECT count(*), sum(k)::bigint
+FROM t_para
+WHERE k >= 100000 AND k < 400000;
+
+-- Test with equality on specific range to test parallel claim batches
+SELECT count(*), sum(v)::bigint
+FROM t_para
+WHERE k >= 250000;
+
+-- Reset parallel settings
+SET max_parallel_workers_per_gather = 0;
+SET debug_parallel_query = off;
+
+DROP INDEX t_para_smol;
+DROP TABLE t_para;
+
+-- Test parallel scan with int8 keys
+DROP TABLE IF EXISTS t_para_int8 CASCADE;
+CREATE UNLOGGED TABLE t_para_int8(k int8, v int4);
+
+INSERT INTO t_para_int8 SELECT i::int8, i::int4 FROM generate_series(1, 500000) i;
+ANALYZE t_para_int8;
+
+CREATE INDEX t_para_int8_smol ON t_para_int8 USING smol(k) INCLUDE (v);
+
+-- Enable parallel
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET debug_parallel_query = on;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+
+SELECT count(*), sum(v)::bigint
+FROM t_para_int8
+WHERE k >= 200000::int8;
+
+SET max_parallel_workers_per_gather = 0;
+SET debug_parallel_query = off;
+
+DROP INDEX t_para_int8_smol;
+DROP TABLE t_para_int8;

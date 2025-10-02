@@ -23,7 +23,10 @@
       "Bash(find:*)",
       "Bash(xargs:*)",
       "Bash(wc:*)",
-      "Bash(./analyze_coverage.sh)"
+      "Bash(./analyze_coverage.sh)",
+      "Bash(gcov:*)",
+      "Bash(COVERAGE=1 make all install)",
+      "Bash(COVERAGE=1 make clean all install)"
     ],
     "deny": [],
     "ask": []

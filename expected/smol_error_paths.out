@@ -1,0 +1,143 @@
+-- Error validation paths - tests remaining uncovered error checks
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Test 1: Invalid first column type (variable-length non-text)
+DROP TABLE IF EXISTS t_err_k1 CASCADE;
+CREATE TABLE t_err_k1(k jsonb);
+INSERT INTO t_err_k1 VALUES ('{"a": 1}'::jsonb);
+\set ON_ERROR_STOP 0
+CREATE INDEX t_err_k1_smol ON t_err_k1 USING smol(k);
+ERROR:  data type jsonb has no default operator class for access method "smol"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+\set ON_ERROR_STOP 1
+DROP TABLE t_err_k1;
+-- Test 2: Invalid second column type (variable-length)
+DROP TABLE IF EXISTS t_err_k2 CASCADE;
+CREATE TABLE t_err_k2(k1 int4, k2 text);  -- text without COLLATE on k2
+INSERT INTO t_err_k2 VALUES (1, 'test');
+\set ON_ERROR_STOP 0
+CREATE INDEX t_err_k2_smol ON t_err_k2 USING smol(k1, k2);
+ERROR:  smol supports fixed-length key types only (attno=2)
+\set ON_ERROR_STOP 1
+DROP TABLE t_err_k2;
+-- Test 3: Invalid INCLUDE column type (variable-length non-text)
+DROP TABLE IF EXISTS t_err_inc CASCADE;
+CREATE TABLE t_err_inc(k int4, inc jsonb);
+INSERT INTO t_err_inc VALUES (1, '{"x": 1}'::jsonb);
+\set ON_ERROR_STOP 0
+CREATE INDEX t_err_inc_smol ON t_err_inc USING smol(k) INCLUDE (inc);
+ERROR:  smol INCLUDE supports fixed-length or text(<=32B) types only (attno=2)
+\set ON_ERROR_STOP 1
+DROP TABLE t_err_inc;
+-- Test 4: Text INCLUDE column that's too long (>32 bytes)
+DROP TABLE IF EXISTS t_err_inc_text CASCADE;
+CREATE TABLE t_err_inc_text(k int4, inc text);
+INSERT INTO t_err_inc_text VALUES (1, repeat('x', 40));
+-- This should succeed during CREATE INDEX but might fail during data validation
+-- if the text is actually stored as >32 bytes
+\set ON_ERROR_STOP 0
+CREATE INDEX t_err_inc_text_smol ON t_err_inc_text USING smol(k) INCLUDE (inc COLLATE "C");
+ERROR:  including column does not support a collation
+\set ON_ERROR_STOP 1
+DROP TABLE IF EXISTS t_err_inc_text CASCADE;
+-- Test 5: Test with int2 keys (covers case 2 in byval switch)
+DROP TABLE IF EXISTS t_int2 CASCADE;
+CREATE UNLOGGED TABLE t_int2(k1 int2, k2 int2);
+INSERT INTO t_int2 SELECT (i % 1000)::int2, (i % 100)::int2 FROM generate_series(1, 10000) i;
+CREATE INDEX t_int2_smol ON t_int2 USING smol(k1, k2);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+-- Query with int2 equality to test k2_eq path for int2
+SELECT count(*) FROM t_int2 WHERE k1 >= 100::int2 AND k2 = 50::int2;
+ count 
+-------
+    90
+(1 row)
+
+DROP INDEX t_int2_smol;
+DROP TABLE t_int2;
+-- Test 6: Test with int4 in two-column (covers case 4 in byval switch)
+DROP TABLE IF EXISTS t_int4_twocol CASCADE;
+CREATE UNLOGGED TABLE t_int4_twocol(k1 int4, k2 int4);
+INSERT INTO t_int4_twocol SELECT (i % 1000)::int4, i::int4 FROM generate_series(1, 10000) i;
+CREATE INDEX t_int4_twocol_smol ON t_int4_twocol USING smol(k1, k2);
+-- Query to test int4 second key paths
+SELECT count(*) FROM t_int4_twocol WHERE k1 >= 500 AND k2 = 5555;
+ count 
+-------
+     1
+(1 row)
+
+DROP INDEX t_int4_twocol_smol;
+DROP TABLE t_int4_twocol;
+-- Test 7: Test rescan without initial bound setup
+DROP TABLE IF EXISTS t_rescan CASCADE;
+CREATE UNLOGGED TABLE t_rescan(k int4);
+INSERT INTO t_rescan SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX t_rescan_smol ON t_rescan USING smol(k);
+-- Multiple rescans to test rescan logic
+BEGIN;
+DECLARE c CURSOR FOR SELECT k FROM t_rescan WHERE k >= 500;
+FETCH 10 FROM c;
+  k  
+-----
+ 500
+ 501
+ 502
+ 503
+ 504
+ 505
+ 506
+ 507
+ 508
+ 509
+(10 rows)
+
+MOVE BACKWARD 5 FROM c;
+FETCH 5 FROM c;
+  k  
+-----
+ 505
+ 506
+ 507
+ 508
+ 509
+(5 rows)
+
+COMMIT;
+DROP INDEX t_rescan_smol;
+DROP TABLE t_rescan;
+-- Test 8: Test with very small table (edge case)
+DROP TABLE IF EXISTS t_small CASCADE;
+CREATE UNLOGGED TABLE t_small(k int4);
+INSERT INTO t_small VALUES (1), (2), (3);
+CREATE INDEX t_small_smol ON t_small USING smol(k);
+SELECT count(*) FROM t_small WHERE k >= 2;
+ count 
+-------
+     2
+(1 row)
+
+DROP INDEX t_small_smol;
+DROP TABLE t_small;
+-- Test 9: Test char (1-byte) type during index build (covers case 1 at line 965)
+DROP TABLE IF EXISTS t_char_build CASCADE;
+CREATE UNLOGGED TABLE t_char_build(k "char");
+-- Insert data to trigger index build with char type
+INSERT INTO t_char_build SELECT (i % 100)::int::text::"char" FROM generate_series(1, 10000) i;
+-- This will exercise DatumGetChar path during index build
+CREATE INDEX t_char_build_smol ON t_char_build USING smol(k);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+SELECT count(*) FROM t_char_build WHERE k >= '5'::"char";
+ count 
+-------
+  5500
+(1 row)
+
+DROP INDEX t_char_build_smol;
+DROP TABLE t_char_build;
