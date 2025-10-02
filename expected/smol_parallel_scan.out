@@ -35,9 +35,9 @@ WHERE k >= 10000;
 SELECT count(*), sum(k)::bigint
 FROM t_para
 WHERE k >= 100000 AND k < 400000;
- count  |     sum      
---------+--------------
- 400001 | 120000300000
+ count  |     sum     
+--------+-------------
+ 300000 | 74999850000
 (1 row)
 
 -- Test with equality on specific range to test parallel claim batches

@@ -7,7 +7,7 @@ PG_CFLAGS=-Wno-declaration-after-statement
 
 # Coverage build flags (gcov-compatible)
 ifeq ($(COVERAGE),1)
-PG_CFLAGS += --coverage -O0
+PG_CFLAGS += --coverage -O0 -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 

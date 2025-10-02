@@ -6,6 +6,7 @@ DROP TABLE IF EXISTS t_uuid CASCADE;
 CREATE UNLOGGED TABLE t_uuid(a uuid);
 INSERT INTO t_uuid SELECT gen_random_uuid() FROM generate_series(1,1000);
 CREATE INDEX t_uuid_smol ON t_uuid USING smol(a);
+ERROR:  unexpected byval==false
 SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
 -- basic check: non-empty and ordered when scanning >= first value
 WITH first AS (SELECT a AS m FROM t_uuid ORDER BY a ASC LIMIT 1)

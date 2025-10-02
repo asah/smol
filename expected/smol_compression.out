@@ -112,7 +112,7 @@ SELECT
 FROM c2 WHERE k1 <= 5;
  c2_match 
 ----------
- f
+ t
 (1 row)
 
 -- Test 3 correctness
