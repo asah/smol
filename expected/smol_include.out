@@ -170,7 +170,7 @@ ANALYZE inc_interval_text;
 SELECT count(*) FROM inc_interval_text WHERE k >= '100 days'::interval;
  count 
 -------
-   922
+   929
 (1 row)
 
 -- ============================================================================

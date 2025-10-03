@@ -5,8 +5,8 @@ CREATE EXTENSION IF NOT EXISTS smol;
 -- Create table with enough data for multiple leaf pages
 DROP TABLE IF EXISTS t_loop_guard CASCADE;
 CREATE UNLOGGED TABLE t_loop_guard (k int4, v int4);
--- Insert 1000 rows
-INSERT INTO t_loop_guard SELECT i, i*10 FROM generate_series(1, 1000) i;
+-- Insert 50000 rows to ensure multiple leaf page iterations
+INSERT INTO t_loop_guard SELECT i, i*10 FROM generate_series(1, 50000) i;
 -- Force loop guard to trigger after 2 successful iterations
 -- This will cause n_this=0, which makes i stop advancing, triggering loop_guard > 3
 SET smol.force_loop_guard_test = 2;
@@ -28,7 +28,7 @@ CREATE INDEX t_loop_guard_smol ON t_loop_guard USING smol(k);
 SELECT count(*) FROM t_loop_guard WHERE k > 500;
  count 
 -------
-   500
+ 49500
 (1 row)
 
 -- Cleanup

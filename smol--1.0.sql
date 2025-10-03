@@ -30,10 +30,17 @@ RETURNS boolean
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION smol_test_validate(oid)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
 COMMENT ON FUNCTION smol_test_error_non_ios(regclass) IS
 'Test function to exercise non-index-only scan error path (for code coverage)';
 COMMENT ON FUNCTION smol_test_no_movement(regclass) IS
 'Test function to exercise NoMovementScanDirection path (for code coverage)';
+COMMENT ON FUNCTION smol_test_validate(oid) IS
+'Test function to call smol_validate() for coverage testing of validation error paths';
 
 -- Create the access method
 CREATE ACCESS METHOD smol TYPE INDEX HANDLER smol_handler;

@@ -58,7 +58,11 @@
       "Bash([ \"$line\" -le 4000 ])",
       "Bash(then echo -n \"Line $line: \")",
       "Bash(fi)",
-      "Bash(ipcrm:*)"
+      "Bash(ipcrm:*)",
+      "Bash(objdump:*)",
+      "Bash(/usr/local/pgsql/lib/pgxs/src/test/regress/pg_regress --inputdir=. --bindir='/usr/local/pgsql/bin' --dbname=contrib_regression smol_parallel_full)",
+      "Bash(COVERAGE=1 make installcheck REGRESS=smol_parallel_full)",
+      "Bash(/usr/local/pgsql/bin/pg_config:*)"
     ],
     "deny": [],
     "ask": []

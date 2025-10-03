@@ -111,6 +111,7 @@ static int smol_cas_fail_every = 0;  /* 0=normal, N=fail every Nth CAS */
 static int smol_growth_threshold_test = 0;  /* 0=normal (8M), >0=override threshold for testing growth */
 static int smol_force_loop_guard_test = 0;  /* 0=off, >0=force n_this=0 after N iterations to test loop guard */
 static int smol_loop_guard_iteration = 0;   /* Counter for loop guard test */
+static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children per internal node to force tall trees */
 /* Note: Parallel CAS retry (line ~1700) proved too difficult to reliably test with synthetic worker coordination */
 
 #define SMOL_ATOMIC_READ_U32(ptr) \
@@ -200,6 +201,17 @@ _PG_init(void)
                             0, /* default: normal operation */
                             0, /* min */
                             1000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.test_max_internal_fanout",
+                            "TEST ONLY: Limit internal node fanout to force tall trees",
+                            "For coverage testing: limit children per internal node (0=unlimited, >0=max children)",
+                            &smol_test_max_internal_fanout,
+                            0, /* default: unlimited */
+                            0, /* min */
+                            10000, /* max */
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
@@ -327,20 +339,32 @@ _PG_init(void)
         for (int i = 0; i < 16; i++)
             Assert(dst_buf[1 + i] == src_buf[1 + i]);
 
-        /* Test smol_copy_small for all switch cases (lines 4318-4333) */
-        int test_lengths[] = {1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33};
-        int num_tests = sizeof(test_lengths) / sizeof(test_lengths[0]);
-
-        for (int test = 0; test < num_tests; test++)
+        /* Test smol_copy_small for all switch cases (lines 4430-4455) */
+        /* Test all cases 1-16 (explicit switch cases) */
+        for (int len = 1; len <= 16; len++)
         {
-            int len = test_lengths[test];
             memset(dst_buf, 0, 64);
             smol_copy_small(dst_buf, src_buf, len);
             for (int i = 0; i < len; i++)
                 Assert(dst_buf[i] == src_buf[i]);
         }
 
-        elog(DEBUG1, "SMOL: Synthetic copy tests passed (lengths 1-16 + 33)");
+        /* Test default case with various sizes that exercise different paths */
+        int default_test_lengths[] = {
+            17, 18, 19, 20, 21, 22, 23, 24, /* 17-24: len >= 16 + tail */
+            25, 26, 27, 28, 29, 30, 31, 32, /* 25-32: larger sizes */
+            33, 34, 35, 36, 40, 48, 50, 60  /* 33+: even larger sizes */
+        };
+        for (int test = 0; test < (int)(sizeof(default_test_lengths) / sizeof(default_test_lengths[0])); test++)
+        {
+            int len = default_test_lengths[test];
+            memset(dst_buf, 0, 64);
+            smol_copy_small(dst_buf, src_buf, len);
+            for (int i = 0; i < len && i < 64; i++)
+                Assert(dst_buf[i] == src_buf[i]);
+        }
+
+        elog(DEBUG1, "SMOL: Synthetic copy tests passed (all sizes 1-60)");
     }
 
     /* Test smol_options() - AM option parsing (always returns NULL for SMOL) */
@@ -820,7 +844,11 @@ smol_handler(PG_FUNCTION_ARGS)
     am->amclusterable = false;
     am->ampredlocks = false;
     am->amcanparallel = true;
+#ifdef SMOL_TEST_COVERAGE
+    am->amcanbuildparallel = true;  /* Enable for coverage testing */
+#else
     am->amcanbuildparallel = false;
+#endif
     am->amcaninclude = true;
     am->amusemaintenanceworkmem = false;
     am->amsummarizing = false;
@@ -2621,6 +2649,19 @@ smol_validate(Oid opclassoid)
     return result;
 }
 
+/*
+ * Test wrapper for smol_validate() - allows direct SQL calls to validation
+ * function for coverage testing of error paths.
+ */
+PG_FUNCTION_INFO_V1(smol_test_validate);
+Datum
+smol_test_validate(PG_FUNCTION_ARGS)
+{
+    Oid opclassoid = PG_GETARG_OID(0);
+    bool result = smol_validate(opclassoid);
+    PG_RETURN_BOOL(result);
+}
+
 /* --- Helpers ----------------------------------------------------------- */
 static void
 smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -2769,6 +2810,9 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
     Page mpage;
     SmolMeta *meta;
     /* removed unused rbuf/rpage locals */
+#ifdef SMOL_TEST_COVERAGE
+    smol_loop_guard_iteration = 0;  /* Reset for each build */
+#endif
     SMOL_LOGF("leaf-write(single) start nkeys=%zu", nkeys);
     /* init meta page if new */
     if (RelationGetNumberOfBlocks(idx) == 0)
@@ -2919,13 +2963,16 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 Size old_i = i;
 #ifdef SMOL_TEST_COVERAGE
                 /* Test coverage: force n_this=0 to trigger loop guard */
-                if (smol_force_loop_guard_test > 0 && smol_loop_guard_iteration >= smol_force_loop_guard_test)
-                {
-                    n_this = 0;  /* Force stall to test loop_guard detection */
-                    smol_force_loop_guard_test = 0;  /* Only trigger once */
-                }
                 if (n_this > 0)
-                    smol_loop_guard_iteration++;
+                {
+                    if (smol_force_loop_guard_test > 0 && smol_loop_guard_iteration >= smol_force_loop_guard_test)
+                    {
+                        n_this = 0;  /* Force stall to test loop_guard detection */
+                        /* Keep forcing stall until loop_guard triggers ERROR */
+                    }
+                    else
+                        smol_loop_guard_iteration++;
+                }
 #endif
                 i += n_this;
                 if (i == old_i)
@@ -3760,6 +3807,7 @@ smol_build_internal_levels(Relation idx,
             Size item_sz = sizeof(BlockNumber) + key_len;
             char *item = (char *) palloc(item_sz);
             Size first_i = i;
+            Size children_added = 0;
             /* add as many children as fit */
             for (; i < cur_n; i++)
             {
@@ -3772,6 +3820,15 @@ smol_build_internal_levels(Relation idx,
                     /* page full: back out to next page */
                     break;
                 }
+                children_added++;
+#ifdef SMOL_TEST_COVERAGE
+                /* For testing: limit fanout to force tall trees */
+                if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
+                {
+                    i++;  /* Move to next child for next page */
+                    break;
+                }
+#endif
             }
             pfree(item);
             MarkBufferDirty(ibuf);
@@ -3838,6 +3895,7 @@ smol_build_internal_levels_bytes(Relation idx,
             Page ipg = BufferGetPage(ibuf);
             Size item_sz = sizeof(BlockNumber) + key_len;
             char *item = (char *) palloc(item_sz);
+            Size children_added = 0;
             for (; i < cur_n; i++)
             {
                 memcpy(item, &cur_blks[i], sizeof(BlockNumber));
@@ -3846,6 +3904,15 @@ smol_build_internal_levels_bytes(Relation idx,
                     break;
                 if (PageAddItem(ipg, (Item) item, item_sz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
                     break;
+                children_added++;
+#ifdef SMOL_TEST_COVERAGE
+                /* For testing: limit fanout to force tall trees */
+                if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
+                {
+                    i++;  /* Move to next child for next page */
+                    break;
+                }
+#endif
             }
             MarkBufferDirty(ibuf);
             next_blks[next_n] = BufferGetBlockNumber(ibuf);

@@ -8,15 +8,19 @@ SET client_min_messages = debug1;
 
 -- Create table with text key and text INCLUDE
 DROP TABLE IF EXISTS t_debug CASCADE;
+SET client_min_messages = warning;  -- Suppress OID messages
 CREATE UNLOGGED TABLE t_debug(k text COLLATE "C", v text COLLATE "C", i int4);
+SET client_min_messages = debug1;
 
 INSERT INTO t_debug VALUES
     ('key001', 'value001', 1),
     ('key002', 'value002', 2),
     ('key003', 'value003', 3);
 
--- Create SMOL index with text INCLUDE columns
+-- Create SMOL index with text INCLUDE columns (suppress OID in logs)
+\set QUIET on
 CREATE INDEX t_debug_smol ON t_debug USING smol(k) INCLUDE (v, i);
+\set QUIET off
 ANALYZE t_debug;
 
 SET enable_seqscan = off;

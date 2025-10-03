@@ -1,0 +1,40 @@
+SET
+DROP EXTENSION
+CREATE EXTENSION
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+psql:sql/smol_easy_coverage.sql:10: ERROR:  smol is read-only: aminsert is not supported
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Seq Scan on t_nokey  (cost=0.00..38.25 rows=753 width=8)
+   Filter: (b > 500)
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+DO
+ROLLBACK
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1000
+psql:sql/smol_easy_coverage.sql:40: ERROR:  smol INCLUDE supports fixed-length or text(<=32B) types only (attno=2)
+ count 
+-------
+   553
+(1 row)
+
+DROP TABLE
+psql:sql/smol_easy_coverage.sql:47: ERROR:  operator family "integer_ops" does not exist for access method "smol"
+psql:sql/smol_easy_coverage.sql:51: ERROR:  operator family "integer_ops" does not exist for access method "smol"
+psql:sql/smol_easy_coverage.sql:53: ERROR:  operator class "int2_ops_test" does not exist for access method "smol"
+psql:sql/smol_easy_coverage.sql:56: ERROR:  operator family "integer_ops" does not exist for access method "smol"
+             ?column?              
+-----------------------------------
+ All easy coverage tests completed
+(1 row)
+

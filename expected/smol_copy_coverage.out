@@ -80,26 +80,26 @@ SELECT i::int8, i::int4
 FROM generate_series(1, 5000) i;
 -- This should trigger progress logging during build
 CREATE INDEX t_progress_smol ON t_progress USING smol(k, v);
-LOG:  [smol] smol_handler:804: enter smol_handler
-LOG:  [smol] smol_handler:804: enter smol_handler
-LOG:  [smol] smol_handler:804: enter smol_handler
-LOG:  [smol] smol_build:876: build start rel=17669 idx=17672
-LOG:  [smol] smol_build_cb_pair:4172: collect pair: tuples=1000
-LOG:  [smol] smol_build_cb_pair:4172: collect pair: tuples=2000
-LOG:  [smol] smol_build_cb_pair:4172: collect pair: tuples=3000
-LOG:  [smol] smol_build_cb_pair:4172: collect pair: tuples=4000
-LOG:  [smol] smol_build_cb_pair:4172: collect pair: tuples=5000
-LOG:  [smol] smol_init_page:2757: init page blk=1 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=2 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=3 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=4 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=5 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=6 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=7 leaf=1 rl=4294967295
-LOG:  [smol] smol_init_page:2757: init page blk=8 leaf=1 rl=4294967295
-LOG:  [smol] smol_mark_heap0_allvisible:2704: mark heap blk0 all-visible
-LOG:  [smol] smol_build:1226: build finish tuples=0 profile: collect=0.280 ms sort=0.037 ms write=-0.317 ms total~0.000 ms
-LOG:  [smol] smol_buildempty:1238: enter smol_buildempty
+LOG:  [smol] smol_handler:802: enter smol_handler
+LOG:  [smol] smol_handler:802: enter smol_handler
+LOG:  [smol] smol_handler:802: enter smol_handler
+LOG:  [smol] smol_build:874: build start rel=17676 idx=17679
+LOG:  [smol] smol_build_cb_pair:4170: collect pair: tuples=1000
+LOG:  [smol] smol_build_cb_pair:4170: collect pair: tuples=2000
+LOG:  [smol] smol_build_cb_pair:4170: collect pair: tuples=3000
+LOG:  [smol] smol_build_cb_pair:4170: collect pair: tuples=4000
+LOG:  [smol] smol_build_cb_pair:4170: collect pair: tuples=5000
+LOG:  [smol] smol_init_page:2755: init page blk=1 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=2 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=3 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=4 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=5 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=6 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=7 leaf=1 rl=4294967295
+LOG:  [smol] smol_init_page:2755: init page blk=8 leaf=1 rl=4294967295
+LOG:  [smol] smol_mark_heap0_allvisible:2702: mark heap blk0 all-visible
+LOG:  [smol] smol_build:1224: build finish tuples=0 profile: collect=0.294 ms sort=0.042 ms write=-0.336 ms total~0.000 ms
+LOG:  [smol] smol_buildempty:1236: enter smol_buildempty
 SET client_min_messages = warning;
 SET smol.debug_log = off;
 -- ============================================================================

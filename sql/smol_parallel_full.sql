@@ -1,0 +1,56 @@
+-- Comprehensive parallel execution test
+-- Covers parallel rescan (lines 2482-2489) and parallel worker (lines 4348-4401)
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Enable parallel execution
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+
+DROP TABLE IF EXISTS t_parallel CASCADE;
+CREATE TABLE t_parallel (k int4, v int4);
+
+-- Insert enough data to trigger parallel operations
+-- Need large dataset for parallel build and scan
+INSERT INTO t_parallel SELECT i, i*10 FROM generate_series(1, 100000) i;
+
+-- Create SMOL index which should use parallel build
+CREATE INDEX t_parallel_smol ON t_parallel USING smol(k);
+
+-- Force parallel index scan with rescan
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t_parallel WHERE k > 5000;
+
+-- Execute nested loop query that should trigger parallel rescan
+-- Need a nested loop where inner side is a parallel index scan that gets rescanned
+SET enable_mergejoin = off;
+SET enable_hashjoin = off;
+SET enable_material = off;  -- Prevent materialization of inner side
+-- Create a small outer table
+DROP TABLE IF EXISTS t_outer;
+CREATE TABLE t_outer (i int4);
+INSERT INTO t_outer VALUES (1), (2), (3);
+-- Force nested loop with parallel index scan on inner side (rescanned for each outer row)
+EXPLAIN (COSTS OFF)
+SELECT t_outer.i, count(*)
+FROM t_outer, t_parallel
+WHERE t_parallel.k > t_outer.i * 10000
+GROUP BY t_outer.i;
+-- Execute the query (should trigger parallel rescan)
+SELECT t_outer.i, count(*)
+FROM t_outer, t_parallel
+WHERE t_parallel.k > t_outer.i * 10000
+GROUP BY t_outer.i
+ORDER BY t_outer.i;
+
+-- Test parallel index-only scan
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM t_parallel WHERE k BETWEEN 10000 AND 20000;
+
+-- Cleanup
+DROP TABLE t_parallel CASCADE;
+DROP TABLE t_outer CASCADE;
