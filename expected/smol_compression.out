@@ -128,7 +128,7 @@ SELECT (SELECT cnt FROM c3_results) = count(*) AS c3_count_match
 FROM c3 WHERE k1 >= 500 AND k2 >= 50;
  c3_count_match 
 ----------------
- f
+ t
 (1 row)
 
 -- Cleanup

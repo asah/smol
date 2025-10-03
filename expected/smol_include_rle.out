@@ -1,0 +1,227 @@
+-- Comprehensive Include-RLE testing (lines 3120-3379, 3143, 3148-3150)
+-- Tests run-length encoding with repeated keys and include values
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- ============================================================================
+-- Test 1: Include-RLE with int64 keys + int4 includes (lines 3120-3169)
+-- High repetition to trigger RLE compression
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_i8_i4 CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_i8_i4 (k int8, v1 int4, v2 int4);
+-- Insert highly repetitive data: same key repeated many times with same includes
+-- This should trigger Include-RLE format (0x8003)
+INSERT INTO t_inc_rle_i8_i4
+SELECT
+    (i / 100)::int8 AS k,          -- Each key repeated 100 times
+    ((i / 100) * 10)::int4 AS v1,  -- Same v1 for each run
+    ((i / 100) * 20)::int4 AS v2   -- Same v2 for each run
+FROM generate_series(1, 10000) i;
+-- Create SMOL index with INCLUDE - should use RLE
+CREATE INDEX t_inc_rle_i8_i4_smol ON t_inc_rle_i8_i4 USING smol(k) INCLUDE (v1, v2);
+-- Verify results
+SELECT count(*) FROM t_inc_rle_i8_i4 WHERE k >= 50;
+ count 
+-------
+  5001
+(1 row)
+
+SELECT sum(v1::int8), sum(v2::int8) FROM t_inc_rle_i8_i4 WHERE k < 10;
+  sum  |  sum  
+-------+-------
+ 45000 | 90000
+(1 row)
+
+-- ============================================================================
+-- Test 2: Include-RLE with different key sizes (lines 3148-3150)
+-- Test int16, int32, int64 key handling in RLE
+-- ============================================================================
+-- Test 2a: int16 keys (line 3150: else { int16 v = (int16) k0; ... })
+DROP TABLE IF EXISTS t_inc_rle_i2 CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_i2 (k int2, v int4);
+INSERT INTO t_inc_rle_i2
+SELECT
+    ((i / 50) % 32767)::int2 AS k,
+    ((i / 50) * 5)::int4 AS v
+FROM generate_series(1, 5000) i;
+CREATE INDEX t_inc_rle_i2_smol ON t_inc_rle_i2 USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_inc_rle_i2 WHERE k >= 100;
+ count 
+-------
+     1
+(1 row)
+
+-- Test 2b: int32 keys (line 3149: int32 v = (int32) k0; ...)
+DROP TABLE IF EXISTS t_inc_rle_i4 CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_i4 (k int4, v int4);
+INSERT INTO t_inc_rle_i4
+SELECT
+    ((i / 75) % 1000000)::int4 AS k,
+    ((i / 75) * 3)::int4 AS v
+FROM generate_series(1, 7500) i;
+CREATE INDEX t_inc_rle_i4_smol ON t_inc_rle_i4 USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_inc_rle_i4 WHERE k >= 5000;
+ count 
+-------
+     0
+(1 row)
+
+-- ============================================================================
+-- Test 3: Include-RLE run detection (lines 3137-3145, 3348-3355)
+-- Test that runs are properly detected when keys match but includes differ
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_break CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_break (k int8, v1 int4, v2 int4);
+-- Insert data where:
+-- - Same key repeated multiple times
+-- - BUT some have different include values (should break the run)
+INSERT INTO t_inc_rle_break VALUES
+    (100, 1, 1),
+    (100, 1, 1),
+    (100, 1, 1),
+    (100, 2, 2),  -- Different includes - breaks run
+    (100, 2, 2),
+    (100, 2, 2),
+    (200, 3, 3),
+    (200, 3, 3),
+    (200, 3, 4);  -- Different v2 - breaks run
+CREATE INDEX t_inc_rle_break_smol ON t_inc_rle_break USING smol(k) INCLUDE (v1, v2);
+-- Verify: should find all 9 rows
+SELECT k, v1, v2 FROM t_inc_rle_break WHERE k >= 100 ORDER BY k, v1, v2;
+  k  | v1 | v2 
+-----+----+----
+ 100 |  1 |  1
+ 100 |  1 |  1
+ 100 |  1 |  1
+ 100 |  2 |  2
+ 100 |  2 |  2
+ 100 |  2 |  2
+ 200 |  3 |  3
+ 200 |  3 |  3
+ 200 |  3 |  4
+(9 rows)
+
+-- ============================================================================
+-- Test 4: Include-RLE with text keys (lines 3329-3379)
+-- Test RLE with variable-length text keys and text includes
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_text CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_text (k text COLLATE "C", v1 text COLLATE "C", v2 int4);
+-- Insert repetitive text data
+INSERT INTO t_inc_rle_text
+SELECT
+    'key' || lpad((i / 100)::text, 5, '0') AS k,
+    'val' || lpad((i / 100)::text, 5, '0') AS v1,
+    ((i / 100) * 7)::int4 AS v2
+FROM generate_series(1, 10000) i;
+-- Create SMOL index - should trigger text Include-RLE (0x8003)
+CREATE INDEX t_inc_rle_text_smol ON t_inc_rle_text USING smol(k) INCLUDE (v1, v2);
+-- Verify results
+SELECT count(*) FROM t_inc_rle_text WHERE k >= 'key00050';
+ count 
+-------
+  5001
+(1 row)
+
+SELECT v1, sum(v2::int8) FROM t_inc_rle_text WHERE k < 'key00010' GROUP BY v1 ORDER BY v1;
+    v1    | sum  
+----------+------
+ val00000 |    7
+ val00001 |  707
+ val00002 | 1407
+ val00003 | 2107
+ val00004 | 2807
+ val00005 | 3507
+ val00006 | 4207
+ val00007 | 4907
+ val00008 | 5607
+ val00009 | 6237
+(10 rows)
+
+-- ============================================================================
+-- Test 5: Include-RLE with large runs (line 3316-3317: > 10000 rows notice)
+-- Create index with >10000 identical rows to trigger NOTICE log
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_huge CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_huge (k int8, v int4);
+-- Insert 15000 rows with same key/value to trigger >10000 notice
+INSERT INTO t_inc_rle_huge
+SELECT
+    (i / 15000)::int8 AS k,  -- Only 1-2 distinct keys
+    100::int4 AS v
+FROM generate_series(1, 15000) i;
+-- This should trigger: "Include-RLE: fitting N rows in M runs" notice
+CREATE INDEX t_inc_rle_huge_smol ON t_inc_rle_huge USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_inc_rle_huge WHERE k = 0;
+ count 
+-------
+ 14999
+(1 row)
+
+-- ============================================================================
+-- Test 6: Mixed RLE and plain formats on same index
+-- Some pages use RLE, some use plain (depends on repetition)
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_mixed CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_mixed (k int8, v1 int4, v2 int4);
+-- Insert mix of repetitive and unique data
+-- First 5000: highly repetitive (should use RLE)
+INSERT INTO t_inc_rle_mixed
+SELECT
+    (i / 100)::int8 AS k,
+    ((i / 100) * 2)::int4 AS v1,
+    ((i / 100) * 3)::int4 AS v2
+FROM generate_series(1, 5000) i;
+-- Next 5000: mostly unique (should use plain format)
+INSERT INTO t_inc_rle_mixed
+SELECT
+    (5000 + i)::int8 AS k,
+    (5000 + i)::int4 AS v1,
+    (5000 + i * 2)::int4 AS v2
+FROM generate_series(1, 5000) i;
+CREATE INDEX t_inc_rle_mixed_smol ON t_inc_rle_mixed USING smol(k) INCLUDE (v1, v2);
+-- Query both regions
+SELECT count(*) FROM t_inc_rle_mixed WHERE k < 50;  -- RLE region
+ count 
+-------
+  4999
+(1 row)
+
+SELECT count(*) FROM t_inc_rle_mixed WHERE k >= 5000;  -- Plain region
+ count 
+-------
+  5000
+(1 row)
+
+-- ============================================================================
+-- Test 7: Include-RLE with multiple include columns (lines 3138-3143)
+-- Test run-ok logic with multiple includes
+-- ============================================================================
+DROP TABLE IF EXISTS t_inc_rle_multi CASCADE;
+CREATE UNLOGGED TABLE t_inc_rle_multi (k int8, v1 int4, v2 int4, v3 int4, v4 int4);
+-- All includes match for runs
+INSERT INTO t_inc_rle_multi
+SELECT
+    (i / 200)::int8 AS k,
+    ((i / 200))::int4 AS v1,
+    ((i / 200) * 2)::int4 AS v2,
+    ((i / 200) * 3)::int4 AS v3,
+    ((i / 200) * 4)::int4 AS v4
+FROM generate_series(1, 10000) i;
+CREATE INDEX t_inc_rle_multi_smol ON t_inc_rle_multi USING smol(k) INCLUDE (v1, v2, v3, v4);
+-- Verify all includes
+SELECT count(*), sum(v1::int8), sum(v2::int8), sum(v3::int8), sum(v4::int8)
+FROM t_inc_rle_multi WHERE k >= 10;
+ count |  sum   |  sum   |  sum   |  sum   
+-------+--------+--------+--------+--------
+  8001 | 236050 | 472100 | 708150 | 944200
+(1 row)
+
+-- Cleanup
+DROP TABLE t_inc_rle_i8_i4 CASCADE;
+DROP TABLE t_inc_rle_i2 CASCADE;
+DROP TABLE t_inc_rle_i4 CASCADE;
+DROP TABLE t_inc_rle_break CASCADE;
+DROP TABLE t_inc_rle_text CASCADE;
+DROP TABLE t_inc_rle_huge CASCADE;
+DROP TABLE t_inc_rle_mixed CASCADE;
+DROP TABLE t_inc_rle_multi CASCADE;

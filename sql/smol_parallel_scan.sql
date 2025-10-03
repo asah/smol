@@ -44,6 +44,24 @@ SELECT count(*), sum(v)::bigint
 FROM t_para
 WHERE k >= 250000;
 
+-- Test parallel batch claiming (lines 2231-2247)
+-- Set batch size > 1 to trigger multi-leaf claiming logic
+SET smol.parallel_claim_batch = 4;
+SELECT count(*), sum(v)::bigint
+FROM t_para
+WHERE k >= 100000;
+SET smol.parallel_claim_batch = 1;
+
+-- Test parallel rescan (lines 2450-2457)
+BEGIN;
+DECLARE c1 CURSOR FOR SELECT count(*) FROM t_para WHERE k >= 50000;
+FETCH 1 FROM c1;
+CLOSE c1;
+DECLARE c1 CURSOR FOR SELECT count(*) FROM t_para WHERE k >= 50000;
+FETCH 1 FROM c1;
+CLOSE c1;
+COMMIT;
+
 -- Reset parallel settings
 SET max_parallel_workers_per_gather = 0;
 SET debug_parallel_query = off;

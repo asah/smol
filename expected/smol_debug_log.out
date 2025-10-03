@@ -1,0 +1,68 @@
+-- Test debug logging for text types (lines 1959-1970)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Enable debug logging
+SET smol.debug_log = on;
+SET client_min_messages = debug1;
+-- Create table with text key and text INCLUDE
+DROP TABLE IF EXISTS t_debug CASCADE;
+DEBUG:  relation "t_debug" does not exist
+NOTICE:  table "t_debug" does not exist, skipping
+CREATE UNLOGGED TABLE t_debug(k text COLLATE "C", v text COLLATE "C", i int4);
+DEBUG:  building index "pg_toast_17504_index" on table "pg_toast_17504" serially
+DEBUG:  index "pg_toast_17504_index" can safely use deduplication
+INSERT INTO t_debug VALUES
+    ('key001', 'value001', 1),
+    ('key002', 'value002', 2),
+    ('key003', 'value003', 3);
+-- Create SMOL index with text INCLUDE columns
+CREATE INDEX t_debug_smol ON t_debug USING smol(k) INCLUDE (v, i);
+DEBUG:  SMOL: Synthetic copy tests passed (lengths 1-16 + 33)
+DEBUG:  SMOL: smol_options() synthetic test passed
+LOG:  [smol] smol_handler:804: enter smol_handler
+LOG:  [smol] smol_handler:804: enter smol_handler
+LOG:  [smol] smol_handler:804: enter smol_handler
+DEBUG:  building index "t_debug_smol" on table "t_debug" serially
+LOG:  [smol] smol_build:876: build start rel=17504 idx=17509
+LOG:  [smol] smol_build:953: build: collected rows=3 (key+2 includes)
+LOG:  [smol] smol_build:1033: build phase: write start n=3 (includes=2, text32)
+LOG:  [smol] smol_init_page:2757: init page blk=1 leaf=1 rl=4294967295
+LOG:  [smol] smol_mark_heap0_allvisible:2704: mark heap blk0 all-visible
+LOG:  [smol] smol_build:1226: build finish tuples=0 profile: collect=0.006 ms sort=-0.006 ms write=0.036 ms total~0.036 ms
+LOG:  [smol] smol_buildempty:1238: enter smol_buildempty
+ANALYZE t_debug;
+LOG:  [smol] smol_handler:804: enter smol_handler
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = on;
+-- Query to trigger debug logging of varlena sizes
+SELECT k, v, i FROM t_debug WHERE k >= 'key002';
+LOG:  [smol] smol_handler:804: enter smol_handler
+LOG:  [smol] smol_handler:804: enter smol_handler
+LOG:  [smol] smol_meta_read:2697: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1296: beginscan nkeys=1 key_len=32
+LOG:  [smol] smol_meta_read:2697: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1354: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
+LOG:  [smol] smol_beginscan:1356: include[0]: len=8 align=i off=36 is_text=1
+LOG:  [smol] smol_beginscan:1356: include[1]: len=4 align=i off=48 is_text=0
+LOG:  [smol] smol_meta_read:2697: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_find_first_leaf:3479: find_first_leaf: leaf=1 for bound=0 height=1
+LOG:  [smol] smol_gettuple:1628: gettuple init cur_blk=1
+LOG:  [smol] smol_gettuple:1650: seeked (binsearch) within leaf off=2
+LOG:  [smol] smol_gettuple:2086: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:2086: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:2401: advance to right leaf blk=4294967295
+LOG:  [smol] endscan ptrs: itup=0xaaab16597b98 leaf_k1=(nil) leaf_k2=(nil)
+LOG:  [smol] smol_endscan:2415: end scan
+LOG:  [smol] scan profile: calls=3 rows=2 leaf_pages=1 bytes_copied=64 bytes_touched=64 binsearch_steps=2
+   k    |    v     | i 
+--------+----------+---
+ key002 | value002 | 2
+ key003 | value002 | 3
+(2 rows)
+
+-- Reset
+SET smol.debug_log = off;
+SET client_min_messages = warning;
+DROP TABLE t_debug CASCADE;

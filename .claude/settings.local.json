@@ -47,7 +47,18 @@
       "WebSearch",
       "Bash(export COVERAGE=1)",
       "Bash(for i in 1 2 3)",
-      "Bash(do echo \"=== Run $i ===\")"
+      "Bash(do echo \"=== Run $i ===\")",
+      "Bash(paste:*)",
+      "Bash(fold:*)",
+      "Bash(for:*)",
+      "Bash(do echo \"=== Line $line ===\")",
+      "Bash(do sed -n \"$linep\" /workspace/smol.c.gcov)",
+      "Bash(do echo:*)",
+      "Bash(do if [ \"$line\" -ge 3000 ])",
+      "Bash([ \"$line\" -le 4000 ])",
+      "Bash(then echo -n \"Line $line: \")",
+      "Bash(fi)",
+      "Bash(ipcrm:*)"
     ],
     "deny": [],
     "ask": []

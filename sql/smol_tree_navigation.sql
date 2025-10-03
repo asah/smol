@@ -1,0 +1,110 @@
+-- Test tree navigation edge cases
+-- Targets lines 3476-3477 (rightmost child), 3791-3793 (internal node realloc),
+-- 3499 (int64 key comparison), 3505 (text key comparison)
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- ============================================================================
+-- Test 1: Tall tree with int64 keys (lines 3476-3477, 3791-3793, 3499)
+-- Need enough data to create 3-4 level tree
+-- Each leaf page holds ~500-1000 keys, so need 500K+ rows for multi-level tree
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_tall_tree CASCADE;
+CREATE UNLOGGED TABLE t_tall_tree (k int8);
+
+-- Insert 1 million rows to force tall tree
+INSERT INTO t_tall_tree
+SELECT i::int8 FROM generate_series(1, 1000000) i;
+
+-- Create index - should build 3-4 level tree
+CREATE INDEX t_tall_tree_smol ON t_tall_tree USING smol(k);
+
+-- Query to navigate tree (triggers smol_find_first_leaf)
+-- Searches for upper bound trigger rightmost child selection (line 3476-3477)
+SELECT k FROM t_tall_tree WHERE k >= 999990 LIMIT 10;
+SELECT k FROM t_tall_tree WHERE k >= 500000 LIMIT 10;
+SELECT k FROM t_tall_tree WHERE k >= 1 LIMIT 10;
+
+-- Query with int64 bound comparison (line 3499)
+SELECT count(*) FROM t_tall_tree WHERE k >= 750000::int8;
+SELECT count(*) FROM t_tall_tree WHERE k <= 250000::int8;
+
+-- ============================================================================
+-- Test 2: Tall tree with text keys (lines 3505 - text key comparison)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_tall_tree_text CASCADE;
+CREATE UNLOGGED TABLE t_tall_tree_text (k text COLLATE "C");
+
+-- Insert 500K text keys to build tall tree
+INSERT INTO t_tall_tree_text
+SELECT 'key' || lpad(i::text, 10, '0')
+FROM generate_series(1, 500000) i;
+
+-- Create index - should build 2-3 level tree
+CREATE INDEX t_tall_tree_text_smol ON t_tall_tree_text USING smol(k);
+
+-- Query to navigate tree with text bounds (line 3505)
+SELECT count(*) FROM t_tall_tree_text WHERE k >= 'key0000250000';
+SELECT count(*) FROM t_tall_tree_text WHERE k >= 'key0000400000';
+SELECT k FROM t_tall_tree_text WHERE k >= 'key0000499990' LIMIT 10;
+
+-- ============================================================================
+-- Test 3: Tall tree with int32 keys (tests 4-byte key path)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_tall_tree_int4 CASCADE;
+CREATE UNLOGGED TABLE t_tall_tree_int4 (k int4);
+
+INSERT INTO t_tall_tree_int4
+SELECT i::int4 FROM generate_series(1, 1000000) i;
+
+CREATE INDEX t_tall_tree_int4_smol ON t_tall_tree_int4 USING smol(k);
+
+-- Query with int32 bounds
+SELECT count(*) FROM t_tall_tree_int4 WHERE k >= 500000::int4;
+SELECT k FROM t_tall_tree_int4 WHERE k >= 999900 LIMIT 10;
+
+-- ============================================================================
+-- Test 4: Tall tree with int16 keys
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_tall_tree_int2 CASCADE;
+CREATE UNLOGGED TABLE t_tall_tree_int2 (k int2);
+
+-- int2 range is -32768 to 32767, so repeat values
+INSERT INTO t_tall_tree_int2
+SELECT (i % 32767)::int2 FROM generate_series(1, 500000) i;
+
+CREATE INDEX t_tall_tree_int2_smol ON t_tall_tree_int2 USING smol(k);
+
+-- Query with int16 bounds
+SELECT count(*) FROM t_tall_tree_int2 WHERE k >= 10000::int2;
+
+-- ============================================================================
+-- Test 5: Tree navigation with internal node reallocation (lines 3787-3793)
+-- Build very wide tree (many siblings) to force internal node array realloc
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_wide_tree CASCADE;
+CREATE UNLOGGED TABLE t_wide_tree (k int8, v int4);
+
+-- Insert data in a pattern that creates many leaf pages at same level
+-- Use ascending order to create clean splits
+INSERT INTO t_wide_tree
+SELECT i::int8, i::int4 FROM generate_series(1, 2000000) i;
+
+CREATE INDEX t_wide_tree_smol ON t_wide_tree USING smol(k) INCLUDE (v);
+
+-- Query to verify tree structure
+SELECT count(*) FROM t_wide_tree WHERE k >= 1000000;
+SELECT count(*) FROM t_wide_tree WHERE k >= 1500000;
+
+-- Cleanup
+DROP TABLE t_tall_tree CASCADE;
+DROP TABLE t_tall_tree_text CASCADE;
+DROP TABLE t_tall_tree_int4 CASCADE;
+DROP TABLE t_tall_tree_int2 CASCADE;
+DROP TABLE t_wide_tree CASCADE;
