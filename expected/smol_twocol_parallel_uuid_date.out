@@ -1,0 +1,104 @@
+-- Test parallel scans with two-column indexes using UUID and DATE (non-INT types)
+-- This targets lines 1710, 1712, 2265, 2267 for non-INT type parallel bounds
+CREATE EXTENSION IF NOT EXISTS smol;
+NOTICE:  extension "smol" already exists, skipping
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_index_scan_size = 0;
+-- ============================================================================
+-- Test 1: UUID two-column parallel scan with bounds
+-- ============================================================================
+DROP TABLE IF EXISTS t_uuid_parallel CASCADE;
+NOTICE:  table "t_uuid_parallel" does not exist, skipping
+CREATE UNLOGGED TABLE t_uuid_parallel (
+    k uuid,
+    v int4
+);
+-- Insert data with deterministic UUIDs
+INSERT INTO t_uuid_parallel
+SELECT
+    gen_random_uuid(),
+    i
+FROM generate_series(1, 50000) i;
+CREATE INDEX idx_uuid_parallel ON t_uuid_parallel USING smol(k, v);
+ANALYZE t_uuid_parallel;
+-- Query with bounds - this will hit line 1710 (else branch for non-INT types)
+-- Since UUID is not INT2/INT4/INT8, it uses PG_INT64_MIN conservative bound
+-- Note: We verify count > 0 rather than exact count because gen_random_uuid() is non-deterministic
+SELECT count(*) > 0 AS has_all_rows FROM t_uuid_parallel WHERE k >= '00000000-0000-0000-0000-000000000000'::uuid;
+ has_all_rows 
+--------------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS has_some_rows FROM t_uuid_parallel WHERE k > '50000000-0000-0000-0000-000000000000'::uuid;
+ has_some_rows 
+---------------
+ t
+(1 row)
+
+-- ============================================================================
+-- Test 2: DATE two-column parallel scan with bounds
+-- ============================================================================
+DROP TABLE IF EXISTS t_date_parallel CASCADE;
+NOTICE:  table "t_date_parallel" does not exist, skipping
+CREATE UNLOGGED TABLE t_date_parallel (
+    k date,
+    v int4
+);
+-- Insert dates spanning several years
+INSERT INTO t_date_parallel
+SELECT
+    '2020-01-01'::date + (i % 1000),
+    i
+FROM generate_series(1, 50000) i;
+CREATE INDEX idx_date_parallel ON t_date_parallel USING smol(k, v);
+ANALYZE t_date_parallel;
+-- Query with bounds - this will hit line 1710 (else branch for non-INT types)
+SELECT count(*) FROM t_date_parallel WHERE k >= '2020-06-01'::date;
+ count 
+-------
+ 42400
+(1 row)
+
+SELECT count(*) FROM t_date_parallel WHERE k > '2021-01-01'::date;
+ count 
+-------
+ 31650
+(1 row)
+
+-- Query without bounds - this will hit line 1712 (else branch for no bounds)
+SELECT count(*) FROM t_date_parallel WHERE v > 25000;
+ count 
+-------
+ 25000
+(1 row)
+
+-- ============================================================================
+-- Test 3: Verify parallel execution is actually happening
+-- ============================================================================
+SET smol.parallel_claim_batch = 3;
+-- These should use parallel workers
+SELECT count(*) FROM t_uuid_parallel;
+ count 
+-------
+ 50000
+(1 row)
+
+SELECT count(*) FROM t_date_parallel;
+ count 
+-------
+ 50000
+(1 row)
+
+-- Cleanup
+DROP TABLE t_uuid_parallel CASCADE;
+DROP TABLE t_date_parallel CASCADE;
+-- Note: Single-column UUID/DATE indexes are not tested here because
+-- single-column indexes currently only support byval types (INT2/INT4/INT8).
+-- UUID (16-byte) and DATE (non-byval 4-byte) require two-column format.
+-- Lines 2261, 2263 would need different non-INT byval types to cover.

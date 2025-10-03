@@ -1,0 +1,21 @@
+-- Test text32 key exceeds max bytes error (line 4619)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+DROP TABLE IF EXISTS t_longtext CASCADE;
+CREATE TABLE t_longtext (k text COLLATE "C");
+-- Insert a text value that's exactly 33 bytes (exceeds 32 byte limit)
+INSERT INTO t_longtext VALUES (repeat('x', 33));
+-- Try to create index - should fail with error from line 4619
+\set ON_ERROR_STOP off
+CREATE INDEX t_longtext_idx ON t_longtext USING smol(k);
+ERROR:  smol text32 key exceeds 32 bytes
+\set ON_ERROR_STOP on
+-- Also test with even longer text
+TRUNCATE t_longtext;
+INSERT INTO t_longtext VALUES (repeat('y', 100));
+\set ON_ERROR_STOP off
+CREATE INDEX t_longtext_idx2 ON t_longtext USING smol(k);
+ERROR:  smol text32 key exceeds 32 bytes
+\set ON_ERROR_STOP on
+-- Cleanup
+DROP TABLE t_longtext CASCADE;

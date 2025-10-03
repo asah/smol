@@ -1,0 +1,47 @@
+-- Test empty table index creation (line 3101)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Test 1: Empty int4 table
+DROP TABLE IF EXISTS t_empty_int CASCADE;
+CREATE TABLE t_empty_int (k int4);
+CREATE INDEX t_empty_int_idx ON t_empty_int USING smol(k);
+SELECT count(*) FROM t_empty_int;
+ count 
+-------
+     0
+(1 row)
+
+-- Test 2: Empty text table (covers line 3101 in text build path)
+DROP TABLE IF EXISTS t_empty_text CASCADE;
+CREATE TABLE t_empty_text (k text COLLATE "C");
+CREATE INDEX t_empty_text_idx ON t_empty_text USING smol(k);
+SELECT count(*) FROM t_empty_text;
+ count 
+-------
+     0
+(1 row)
+
+-- Test 3: Empty two-column table
+DROP TABLE IF EXISTS t_empty_pair CASCADE;
+CREATE TABLE t_empty_pair (k int4, v int4);
+CREATE INDEX t_empty_pair_idx ON t_empty_pair USING smol(k, v);
+SELECT count(*) FROM t_empty_pair;
+ count 
+-------
+     0
+(1 row)
+
+-- Test 4: Empty table with INCLUDE columns (should cover line 3101)
+DROP TABLE IF EXISTS t_empty_inc CASCADE;
+CREATE TABLE t_empty_inc (k int4, v1 int4, v2 text);
+CREATE INDEX t_empty_inc_idx ON t_empty_inc USING smol(k) INCLUDE (v1, v2);
+SELECT count(*) FROM t_empty_inc;
+ count 
+-------
+     0
+(1 row)
+
+-- Cleanup
+DROP TABLE t_empty_int CASCADE;
+DROP TABLE t_empty_text CASCADE;
+DROP TABLE t_empty_pair CASCADE;

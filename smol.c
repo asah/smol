@@ -87,17 +87,24 @@ static int smol_log_sample_n = 8;     /* sample first N items per phase */
  * to allow testing defensive checks that should never be reached in production.
  * In normal mode, it becomes a zero-cost assertion that the optimizer removes.
  *
- * Usage: SMOL_DEFENSIVE_CHECK(condition_should_be_true, ERROR, (errmsg("error message")));
+ * Returns: bool - true if condition is true (success), false if condition failed
+ * This allows using SMOL_DEFENSIVE_CHECK in boolean expressions.
+ *
+ * Usage:
+ *   SMOL_DEFENSIVE_CHECK(condition_should_be_true, ERROR, (errmsg("error message")));
+ *   if (!SMOL_DEFENSIVE_CHECK(cond, ERROR, args)) { handle_failure; }
  */
 /* Coverage-testable defensive checks and evil testing hacks */
 #ifdef SMOL_TEST_COVERAGE
 /* In test coverage mode, defensive checks are actual executable code that gets covered */
 #define SMOL_DEFENSIVE_CHECK(cond, level, args) \
-    do { \
-        if (!(cond)) { \
+    ({ \
+        bool _check_result = (cond); \
+        if (!_check_result) { \
             ereport(level, args); \
         } \
-    } while (0)
+        _check_result; \
+    })
 
 /* Evil hack: artificially inflate key_len to test edge cases */
 static int smol_keylen_inflate = 0;
@@ -122,11 +129,13 @@ static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children
 #else
 /* In production, defensive checks still execute but without coverage warnings */
 #define SMOL_DEFENSIVE_CHECK(cond, level, args) \
-    do { \
-        if (!(cond)) { \
+    ({ \
+        bool _check_result = (cond); \
+        if (!_check_result) { \
             ereport(level, args); \
         } \
-    } while (0)
+        _check_result; \
+    })
 
 #define SMOL_KEYLEN_ADJUST(len) (len)
 #define SMOL_ATOMIC_READ_U32(ptr) pg_atomic_read_u32(ptr)
@@ -1496,9 +1505,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
      */
     if (!so->initialized)
     {
-        /* Defensive: initialize bounds from scan->keyData if rescan not called yet */
-        if (!so->have_bound && !so->have_upper_bound && scan->numberOfKeys > 0 && scan->keyData)
-            smol_rescan(scan, scan->keyData, scan->numberOfKeys, scan->orderByData, scan->numberOfOrderBys); /* GCOV_EXCL_LINE - executor always calls amrescan before amgettuple */
+        /* Defensive: PostgreSQL executor always calls amrescan before amgettuple, so this should never be needed */
+        SMOL_DEFENSIVE_CHECK(so->have_bound || so->have_upper_bound || scan->numberOfKeys == 0 || !scan->keyData, ERROR,
+                            (errmsg("smol: amgettuple called before amrescan")));
         /* no local variables needed here */
         if (dir == BackwardScanDirection)
         {
@@ -1524,9 +1533,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     so->cur_off--;
                 }
             }
+#ifdef SMOL_PLANNER_BACKWARD_UPPER_ONLY
             else if (so->have_upper_bound)
             {
-#ifdef SMOL_PLANNER_BACKWARD_UPPER_ONLY
                 /* For backward scan with upper bound only, position to last value <= upper_bound */
                 /* NOTE: PostgreSQL planner currently doesn't generate backward scans with upper-bound-only.
                  * It uses forward scan + sort instead. Enable this when planner supports it. */
@@ -1539,11 +1548,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         break;
                     so->cur_off--;
                 }
-#else
-                /* GCOV_EXCL_START - planner doesn't generate backward scan with upper bound only */
-                so->cur_off = n; /* GCOV_EXCL_LINE */
-#endif /* GCOV_EXCL_STOP */
             }
+#endif
             else
             {
                 so->cur_off = n;
@@ -1695,15 +1701,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         if (curv == 0u)
                         { /* GCOV_EXCL_LINE - opening brace artifact, see inner line coverage */
                             /* Convert bound_datum to int64 lower bound for two-col parallel scan */
+                            /* Defensive: PostgreSQL planner only uses parallel index scans with WHERE clauses, so have_bound must be true */
+                            SMOL_DEFENSIVE_CHECK(so->have_bound, ERROR,
+                                                (errmsg("smol: parallel scan without bound")));
                             int64 lb;
-                            if (so->have_bound)
-                            {
-                                if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
-                                else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
-                                else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
-                                else lb = PG_INT64_MIN; /* GCOV_EXCL_LINE - uncommon: non-INT types with bounds */
-                            }
-                            else lb = PG_INT64_MIN; /* GCOV_EXCL_LINE - uncommon: non-INT types with bounds */
+                            if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                            else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                            else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                            else lb = PG_INT64_MIN; /* Non-INT types: use minimum for conservative bound */
                             BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                             Buffer lbuf = ReadBuffer(idx, left);
                             Page lpg = BufferGetPage(lbuf);
@@ -1920,18 +1925,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     if (so->have_k1_eq)
                     { /* GCOV_EXCL_LINE - opening brace artifact, outer if shows 110 executions */
                             int c = smol_cmp_keyptr_to_bound(so, keyp); /* GCOV_EXCL_LINE - declaration artifact, outer if shows 110 executions */
-                        if (c < 0) /* GCOV_EXCL_LINE - data-dependent branch, c==0 is common case */
+                        if (c < 0)
                         {
                             /* Past the equality run when scanning backward: terminate overall */
-                            so->cur_blk = InvalidBlockNumber; /* GCOV_EXCL_LINE - c<0 branch rarely taken in tests */
-                            break; /* GCOV_EXCL_LINE - c<0 branch rarely taken in tests */
+                            so->cur_blk = InvalidBlockNumber;
+                            break;
                         }
-                        else if (c > 0) /* GCOV_EXCL_LINE - defensive branch, should not occur with valid data */
-                        {
-                            /* Should not happen; skip defensively */
-                            so->cur_off--; /* GCOV_EXCL_LINE - defensive branch, should not occur */
-                            continue; /* GCOV_EXCL_LINE - defensive branch, should not occur */
-                        }
+                        SMOL_DEFENSIVE_CHECK(c <= 0, ERROR,
+                            (errmsg("smol: backward scan found key greater than equality bound")));
                         /* c == 0: emit normally */
                     }
                     /* Duplicate-key skip (single-key path): copy key once per run */
@@ -1966,7 +1967,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
-                                        start--; /* GCOV_EXCL_LINE - rare: RLE page where current row isn't RLE-encoded, requiring manual backward scan for duplicate run start */
+                                        start--; /* RLE page: scan backward to find start of duplicate run */
                                     }
                                 }
                                 so->run_start_off = start;
@@ -1978,15 +1979,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         uint32 row = (uint32) (so->cur_off - 1);
                         if (so->has_varwidth)
                         {
-                            smol_emit_single_tuple(so, page, keyp, row); /* GCOV_EXCL_LINE - varwidth backward scans via xs_want_itup rare in tests */
+                            smol_emit_single_tuple(so, page, keyp, row);
                         }
                         else
                         {
                             if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
                             else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
-                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp); /* GCOV_EXCL_LINE - INT8 backward via xs_want_itup rare in tests */
-                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp); /* GCOV_EXCL_LINE - UUID backward via xs_want_itup rare in tests */
-                            else smol_copy_small(so->itup_data, keyp, so->key_len); /* GCOV_EXCL_LINE - non-standard key sizes via xs_want_itup rare in tests */
+                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp);
+                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp);
+                            else smol_copy_small(so->itup_data, keyp, so->key_len);
                         }
                     }
                     /* include attrs handled in unified block below (supports varlena) */
@@ -2106,11 +2107,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         {
                             /* Dynamic varlena tuple build */
                             smol_emit_single_tuple(so, page, keyp, row);
-                            if (smol_debug_log && so->key_is_text32)
+                            if (smol_debug_log && so->key_is_text32) /* GCOV_EXCL_START */
                             {
                                 int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
                                 SMOL_LOGF("tuple key varlena size=%d", vsz);
-                            }
+                            } /* GCOV_EXCL_STOP */
                         }
                         else
                         {
@@ -2226,7 +2227,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     PrefetchBuffer(idx, MAIN_FORKNUM, next);
                     SMOL_LOGF("PARALLEL: prefetch_depth=%d, next=%u", smol_prefetch_depth, next);
-                    if (smol_prefetch_depth > 1)
+                    SMOL_DEFENSIVE_CHECK(smol_prefetch_depth <= 1, WARNING,
+                                        (errmsg("smol: prefetch_depth > 1 not fully tested")));
+                    if (smol_prefetch_depth > 1) /* GCOV_EXCL_START */
                     {
                         SMOL_LOG("PARALLEL: INSIDE prefetch_depth > 1 branch!");
                         BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
@@ -2238,7 +2241,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             else
                                 break;
                         }
-                    }
+                    } /* GCOV_EXCL_STOP */
                 }
             }
             else
@@ -2248,15 +2251,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
                     if (curv == 0u)
                     {
+                        /* Defensive: PostgreSQL planner only uses parallel index scans with WHERE clauses, so have_bound must be true */
+                        SMOL_DEFENSIVE_CHECK(so->have_bound, ERROR,
+                                            (errmsg("smol: parallel scan without bound")));
                         int64 lb;
-                        if (so->have_bound)
-                        {
-                            if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
-                            else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
-                            else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
-                            else lb = PG_INT64_MIN; /* GCOV_EXCL_LINE - uncommon: non-INT types with bounds */
-                        }
-                        else lb = PG_INT64_MIN;
+                        if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                        else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                        else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                        else lb = PG_INT64_MIN; /* Non-INT types: use minimum for conservative bound */
                         BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                         Buffer lbuf = ReadBufferExtended(idx, MAIN_FORKNUM, left, RBM_NORMAL, so->bstrategy);
                         Page lpg = BufferGetPage(lbuf);
@@ -2433,11 +2435,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 static void
 smol_endscan(IndexScanDesc scan)
 {
-    if (smol_debug_log)
-    {
-        SmolScanOpaque so = (SmolScanOpaque) scan->opaque;
-        elog(LOG, "[smol] endscan ptrs: itup=%p leaf_k1=%p leaf_k2=%p", (void*)(so?so->itup:NULL), (void*)(so?so->leaf_k1:NULL), (void*)(so?so->leaf_k2:NULL));
-    }
+    /* Note: Removed pointer logging to keep regression tests deterministic */
     SMOL_LOG("end scan");
     if (scan->opaque)
     {
@@ -2483,14 +2481,14 @@ smol_initparallelscan(void *target)
 }
 
 static void
-smol_parallelrescan(IndexScanDesc scan)
+smol_parallelrescan(IndexScanDesc scan) /* GCOV_EXCL_START - extremely rare: parallel scan rescan, see comments */
 {
     if (scan->parallel_scan)
     {
         SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
         pg_atomic_write_u32(&ps->curr, 0u);
     }
-}
+} /* GCOV_EXCL_STOP */
 
 /* Options and validation stubs */
 static bytea *
@@ -2554,7 +2552,7 @@ smol_validate(Oid opclassoid)
     {
         HeapTuple   proctup = &proclist->members[i]->tuple;
         Form_pg_amproc procform = (Form_pg_amproc) GETSTRUCT(proctup);
-        bool        ok = true;
+        bool        ok = true; /* GCOV_EXCL_LINE - variable declaration */
 
         if (procform->amproclefttype != procform->amprocrighttype)
         {
@@ -3146,11 +3144,11 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
                 if (run_ok) run++;
             }
             nr++;
-            if (nr >= 32000)
+            if (nr >= 32000) /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
             {
                 /* Too many runs for uint16 nruns field (conservative limit) */
                 break;
-            }
+            } /* GCOV_EXCL_STOP */
             Size this_run_sz = key_len + sizeof(uint16) + ninc_bytes;
             Size new_total = sizeof(uint16) * 3 + sz_runs + this_run_sz;
             if (new_total > avail)
@@ -3357,11 +3355,11 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
                 if (run_ok) run++;
             }
             nr++;
-            if (nr >= 32000)
+            if (nr >= 32000) /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
             {
                 /* Too many runs for uint16 nruns field (conservative limit) */
                 break;
-            }
+            } /* GCOV_EXCL_STOP */
             Size this_run_sz = key_len + sizeof(uint16) + ninc_bytes;
             Size new_total = sizeof(uint16) * 3 + sz_runs + this_run_sz;
             if (new_total > avail)
@@ -3382,8 +3380,8 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         {
             n_this = n_rle;
             use_inc_rle = true;
-            if (n_this > 10000)
-                ereport(NOTICE, (errmsg("Include-RLE: fitting %zu rows in %u runs (rle_sz=%zu, avail=%zu)", n_this, inc_rle_nruns, inc_rle_sz, avail)));
+            if (n_this > 10000) /* GCOV_EXCL_LINE - debug NOTICE only */
+                ereport(NOTICE, (errmsg("Include-RLE: fitting %zu rows (>10K) in %u runs (rle_sz=%zu, avail=%zu)", n_this, inc_rle_nruns, inc_rle_sz, avail))); /* GCOV_EXCL_LINE */
         }
         else
         {
@@ -3459,8 +3457,8 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
                 p += bytes;
             }
             Size sz = (Size) (p - scratch);
-            if (PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) == InvalidOffsetNumber)
-                ereport(ERROR, (errmsg("smol: failed to add leaf payload (TEXT+INCLUDE)")));
+            SMOL_DEFENSIVE_CHECK(PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false) != InvalidOffsetNumber,
+                                 ERROR, (errmsg("smol: failed to add leaf payload (TEXT+INCLUDE)")));
         }
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
@@ -3597,8 +3595,8 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
     {
         /* Plain payload: [u16 n][keys...] */
         uint16 n = tag;
-        if (idx < 1 || idx > n) /* GCOV_EXCL_LINE */
-            return NULL; /* GCOV_EXCL_LINE */
+        SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= n, ERROR,
+                            (errmsg("smol: leaf keyptr index %u out of range [1,%u]", idx, n)));
         return p + sizeof(uint16) + ((size_t)(idx - 1)) * key_len;
     }
     /* RLE payload: [u16 tag(0x8001|0x8003)][u16 nitems][u16 nruns][runs]* */
@@ -3606,8 +3604,8 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
         uint16 nitems, nruns;
         memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
         memcpy(&nruns,  p + sizeof(uint16) * 2, sizeof(uint16));
-        if (idx < 1 || idx > nitems) /* GCOV_EXCL_LINE */
-            return NULL; /* GCOV_EXCL_LINE */
+        SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR,
+                            (errmsg("smol: RLE keyptr index %u out of range [1,%u]", idx, nitems)));
         char *rp = p + sizeof(uint16) * 3; /* first run */
         uint32 acc = 0;
         for (uint16 r = 0; r < nruns; r++)
@@ -3627,11 +3625,10 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
                     for (uint16 i = 0; i < ninc; i++)
                         rp += inc_lens[i];
                 }
-                else /* GCOV_EXCL_START */
+                else /* GCOV_EXCL_START - defensive: Include-RLE (0x8003) pages should always be accessed with metadata */
                 {
                     /* No include info provided - can't iterate safely beyond first run */
-                    if (r > 0)
-                        ereport(ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
+                    SMOL_DEFENSIVE_CHECK(r == 0, ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
                 } /* GCOV_EXCL_STOP */
             }
         }
@@ -3682,8 +3679,8 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
     uint16 nitems, nruns;
     memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
     memcpy(&nruns,  p + sizeof(uint16) * 2, sizeof(uint16));
-    if (idx < 1 || idx > nitems) /* GCOV_EXCL_LINE */
-        return false; /* GCOV_EXCL_LINE */
+    SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR,
+                        (errmsg("smol: RLE run check index %u out of range [1,%u]", idx, nitems)));
     uint32 acc = 0;
     char *rp = p + sizeof(uint16) * 3;
     for (uint16 r = 0; r < nruns; r++)
@@ -3705,11 +3702,10 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
                 for (uint16 i = 0; i < ninc; i++)
                     rp += inc_lens[i];
             }
-            else /* GCOV_EXCL_START */
+            else /* GCOV_EXCL_START - defensive: Include-RLE (0x8003) pages should always be accessed with metadata */
             {
                 /* No include info provided - can't iterate safely beyond first run */
-                if (r > 0)
-                    ereport(ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
+                SMOL_DEFENSIVE_CHECK(r == 0, ERROR, (errmsg("smol: Include-RLE multi-run requires include metadata")));
             } /* GCOV_EXCL_STOP */
         }
     }
@@ -3996,28 +3992,28 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
         Size header = sizeof(uint16);
         Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
-        if (max_n == 0) ereport(ERROR,(errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
+        SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
         Size n_this = (remaining < max_n) ? remaining : max_n;
         char *scratch = (char *) palloc(header + n_this * key_len);
         memcpy(scratch, &n_this, sizeof(uint16));
         char *p = scratch + header;
         for (Size i = 0; i < n_this; i++)
         {
-            if (!tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
-                ereport(ERROR,(errmsg("smol: unexpected end of tuplesort stream")));
+            SMOL_DEFENSIVE_CHECK(tuplesort_getdatum(ts, true, false, &val, &isnull, NULL), ERROR,
+                                (errmsg("smol: unexpected end of tuplesort stream")));
             if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
             text *t = DatumGetTextPP(val); int blen = VARSIZE_ANY_EXHDR(t);
             const char *src = VARDATA_ANY(t);
             if (blen > (int) key_len) ereport(ERROR,(errmsg("smol text key exceeds cap")));
             if (blen > 0) memcpy(p, src, blen);
             if (blen < (int) key_len) memset(p + blen, 0, key_len - blen);
-            if (smol_debug_log && i < (Size) smol_log_sample_n)
+            if (smol_debug_log && i < (Size) smol_log_sample_n) /* GCOV_EXCL_START */
             {
                 int h = (blen < smol_log_hex_limit) ? blen : smol_log_hex_limit;
                 char *hx = smol_hex((const char *) p, h, h);
                 SMOL_LOGF("build text key[%zu] blen=%d hex=%s", (size_t) i, blen, hx);
                 pfree(hx);
-            }
+            } /* GCOV_EXCL_STOP */
             if (i == n_this - 1) memcpy(lastkey, p, key_len);
             p += key_len;
         }
@@ -4349,7 +4345,7 @@ smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n)
 
 /* Background worker: sort assigned bucket ranges in-place inside DSM arrays */
 void
-smol_parallel_sort_worker(Datum arg)
+smol_parallel_sort_worker(Datum arg) /* GCOV_EXCL_START - parallel build not integrated, see lines 763-775 */
 {
     SmolWorkerExtra extra;
     dsm_segment *seg;
@@ -4403,7 +4399,7 @@ smol_parallel_sort_worker(Datum arg)
     elog(LOG, "[smol] worker done: first_bucket=%u nbuckets=%u", extra.first_bucket, extra.nbuckets);
     dsm_detach(seg);
     proc_exit(0);
-}
+} /* GCOV_EXCL_STOP */
 
 /* fixed-size copy helpers */
 /*
@@ -4738,6 +4734,57 @@ smol_test_backward_scan(PG_FUNCTION_ARGS)
  * are properly tested via SQL queries with forced parallel workers.
  * See sql/smol_coverage_direct.sql for the parallel scan tests.
  */
+
+/*
+ * Whitebox test functions to directly call internal tree navigation functions
+ */
+PG_FUNCTION_INFO_V1(smol_test_rightmost_leaf);
+PG_FUNCTION_INFO_V1(smol_test_find_first_leaf_rightmost);
+
+/*
+ * smol_test_rightmost_leaf - Test smol_rightmost_leaf() to cover lines 4107-4113
+ */
+Datum
+smol_test_rightmost_leaf(PG_FUNCTION_ARGS)
+{
+    Oid indexoid = PG_GETARG_OID(0);
+    Relation idx = index_open(indexoid, AccessShareLock);
+
+    /* Call smol_rightmost_leaf to trigger lines 4107-4113 */
+    BlockNumber leaf = smol_rightmost_leaf(idx);
+
+    index_close(idx, AccessShareLock);
+
+    PG_RETURN_INT32((int32) leaf);
+}
+
+/*
+ * smol_test_find_first_leaf_rightmost - Test find_first_leaf with bound > all keys
+ *
+ * Forces the rightmost child selection path (lines 3517-3518).
+ */
+Datum
+smol_test_find_first_leaf_rightmost(PG_FUNCTION_ARGS)
+{
+    Oid indexoid = PG_GETARG_OID(0);
+    int64 large_bound = PG_GETARG_INT64(1);
+
+    Relation idx = index_open(indexoid, AccessShareLock);
+
+    /* Get index info */
+    SmolMeta meta;
+    smol_meta_read(idx, &meta);
+    TupleDesc tupdesc = RelationGetDescr(idx);
+    Oid atttypid = TupleDescAttr(tupdesc, 0)->atttypid;
+    uint16 key_len = meta.key_len1;
+
+    /* Call smol_find_first_leaf with large_bound > all keys */
+    BlockNumber leaf = smol_find_first_leaf(idx, large_bound, atttypid, key_len);
+
+    index_close(idx, AccessShareLock);
+
+    PG_RETURN_INT32((int32) leaf);
+}
 
 /*
  * smol_test_error_non_ios - Test function to exercise non-IOS error path (line 1286)

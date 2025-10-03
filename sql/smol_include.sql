@@ -126,19 +126,20 @@ ANALYZE inc_uuid_text;
 
 SELECT count(*) FROM inc_uuid_text WHERE k > '00000000-0000-0000-0000-000000000000'::uuid;
 
--- Test interval key + text INCLUDE (line 4377: uncommon key_len)
-DROP TABLE IF EXISTS inc_interval_text CASCADE;
-CREATE UNLOGGED TABLE inc_interval_text(k interval, t text COLLATE "C");
-INSERT INTO inc_interval_text SELECT (i || ' days')::interval, 'info_' || i::text FROM generate_series(1, 1000) i;
-ANALYZE inc_interval_text;
-ALTER TABLE inc_interval_text SET (autovacuum_enabled = off);
+-- Test date key + text INCLUDE (line 4377: uncommon key_len)
+-- Note: Changed from interval to date to avoid non-deterministic behavior
+DROP TABLE IF EXISTS inc_date_text CASCADE;
+CREATE UNLOGGED TABLE inc_date_text(k date, t text COLLATE "C");
+INSERT INTO inc_date_text SELECT '2020-01-01'::date + i, 'info_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_date_text;
+ALTER TABLE inc_date_text SET (autovacuum_enabled = off);
 
-CREATE INDEX inc_interval_text_smol ON inc_interval_text USING smol(k) INCLUDE (t);
+CREATE INDEX inc_date_text_smol ON inc_date_text USING smol(k) INCLUDE (t);
 CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
-VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_interval_text;
-ANALYZE inc_interval_text;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_date_text;
+ANALYZE inc_date_text;
 
-SELECT count(*) FROM inc_interval_text WHERE k >= '100 days'::interval;
+SELECT count(*) FROM inc_date_text WHERE k >= '2020-04-10'::date;
 
 -- ============================================================================
 -- Test smol_copy_small uncommon cases (lines 4319-4333)

@@ -197,6 +197,19 @@ SELECT count(*) FROM t_prefetch;
 (1 row)
 
 SELECT sum(a) FROM t_prefetch WHERE a > 50000;
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
     sum     
 ------------
  3750025000

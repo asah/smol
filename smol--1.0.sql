@@ -35,12 +35,26 @@ RETURNS boolean
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION smol_test_rightmost_leaf(regclass)
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION smol_test_find_first_leaf_rightmost(regclass, bigint)
+RETURNS integer
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
 COMMENT ON FUNCTION smol_test_error_non_ios(regclass) IS
 'Test function to exercise non-index-only scan error path (for code coverage)';
 COMMENT ON FUNCTION smol_test_no_movement(regclass) IS
 'Test function to exercise NoMovementScanDirection path (for code coverage)';
 COMMENT ON FUNCTION smol_test_validate(oid) IS
 'Test function to call smol_validate() for coverage testing of validation error paths';
+COMMENT ON FUNCTION smol_test_rightmost_leaf(regclass) IS
+'Whitebox test: directly call smol_rightmost_leaf() to cover lines 4107-4113';
+COMMENT ON FUNCTION smol_test_find_first_leaf_rightmost(regclass, bigint) IS
+'Whitebox test: call smol_find_first_leaf() with bound > all keys to cover lines 3517-3518';
 
 -- Create the access method
 CREATE ACCESS METHOD smol TYPE INDEX HANDLER smol_handler;
