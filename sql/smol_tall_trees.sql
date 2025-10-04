@@ -13,28 +13,41 @@ CREATE EXTENSION IF NOT EXISTS smol;
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_very_tall CASCADE;
-CREATE UNLOGGED TABLE t_very_tall (k int8);
+CREATE UNLOGGED TABLE t_very_tall (k int4, i1 int4, i2 int4, i3 int4, i4 int4, i5 int4, i6 int4, i7 int4, i8 int4, i9 int4, i10 int4, i11 int4, i12 int4, i13 int4, i14 int4, i15 int4, i16 int4);
 
--- Insert 5 million rows to force tall tree (height 3)
--- Each leaf holds ~500-1000 int64 keys, so:
--- - 1K rows = 1-2 leaves (height 1)
--- - 500K rows = ~500-1000 leaves (height 2)
--- - 5M rows = ~5000-10000 leaves (height 3)
+-- Insert rows with 16 INCLUDE columns to reduce tuples per leaf
+-- With 16 int4 INCLUDE columns (64 bytes), each tuple is ~68 bytes
+-- Page is 8KB, so ~120 tuples per leaf (vs 2000 for key-only)
+-- 1200 rows = ~10 leaves (height 2), so backward scan of 10 tuples from end will need to cross leaf
 INSERT INTO t_very_tall
-SELECT i::int8 FROM generate_series(1, 5000000) i;
+SELECT i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
+FROM generate_series(1, 1200) i;
 
-CREATE INDEX t_very_tall_smol ON t_very_tall USING smol(k);
+CREATE INDEX t_very_tall_smol ON t_very_tall USING smol(k) INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16);
 
 -- Backward scan triggers smol_prev_leaf navigation (lines 4067-4086)
 -- This should navigate the tall tree structure
-SELECT k FROM t_very_tall WHERE k <= 4999990 ORDER BY k DESC LIMIT 10;
+-- Use cursor with FETCH BACKWARD to trigger BackwardScanDirection across multiple pages
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;  -- Disable parallel scan to trigger smol_prev_leaf
+
+-- Use smol_test_backward_scan to directly test backward scan which calls smol_gettuple
+-- with BackwardScanDirection. This will scan backwards from the rightmost leaf, crossing
+-- leaf boundaries and triggering smol_prev_leaf
+-- First try without bound (scans all backwards from end)
+SELECT smol_test_backward_scan('t_very_tall_smol'::regclass);
+-- Then try with bound
+SELECT smol_test_backward_scan('t_very_tall_smol'::regclass, 40000);
 
 -- Query rightmost values (triggers rightmost leaf navigation lines 4042-4050)
-SELECT k FROM t_very_tall WHERE k >= 4999990 ORDER BY k LIMIT 10;
+SELECT k FROM t_very_tall WHERE k >= 49990 ORDER BY k LIMIT 10;
 
 -- Additional queries to ensure tree navigation is exercised
-SELECT count(*) FROM t_very_tall WHERE k >= 2500000;
-SELECT count(*) FROM t_very_tall WHERE k <= 2500000;
+SELECT count(*) FROM t_very_tall WHERE k >= 25000;
+SELECT count(*) FROM t_very_tall WHERE k <= 25000;
 
 -- ============================================================================
 -- Test 2: 1-byte byval key type (lines 3495)

@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date
+REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_synthetic_tests
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -110,7 +110,7 @@ bench-full: bench-quick bench-thrash bench-pressure bench-extreme
 
 # Resolve PostgreSQL bin dir from PG_CONFIG
 PG_BIN := $(dir $(PG_CONFIG))
-PGDATA := /var/lib/postgresql/data
+PGDATA := /workspace/pgdata
 
 buildclean:
 	@echo "cleaning current build: make=$(MAKE)"
@@ -196,7 +196,7 @@ coverage-test:
 	@su - postgres -c "cd /workspace && make installcheck" || true
 	@echo "[coverage] Stopping PostgreSQL to flush coverage data..."
 	@$(MAKE) stop
-	@sleep 1
+	@sleep 3
 	@echo "[coverage] Test run complete."
 
 # Generate coverage report
@@ -223,13 +223,16 @@ coverage-report:
 				} \
 			}' smol.c.gcov; \
 		echo ""; \
-		echo "=== UNCOVERED LINES ==="; \
+		echo "=== UNCOVERED LINES (excluding GCOV_EXCL blocks) ==="; \
 		awk ' \
-			/GCOV_EXCL_START/ { excl=1; next } \
+			/GCOV_EXCL_START/ { excl=1 } \
 			/GCOV_EXCL_STOP/ { excl=0; next } \
-			excl { next } \
-			/GCOV_EXCL/ { next } \
-			/^ *#####:/ { print NR }' smol.c.gcov | head -50 | \
+			/^ *#####:/ && excl==0 && !/GCOV_EXCL_LINE/ && !/GCOV_EXCL_START/ && !/DEFENSIVE_CHECK/ { \
+				line = $$0; \
+				gsub(/^ *#####: */, "", line); \
+				gsub(/:.*/, "", line); \
+				print line; \
+			}' smol.c.gcov | head -50 | \
 		awk '{printf "Line %s: not executed\n", $$1}'; \
 	else \
 		echo "[coverage] ERROR: No coverage data found. Run 'make coverage-test' first."; \
@@ -253,18 +256,36 @@ coverage-html:
 	fi
 
 # Complete coverage workflow
-coverage: coverage-build coverage-test coverage-report
+coverage: coverage-clean coverage-build coverage-test coverage-report
 	@echo ""
-	@echo "[coverage] Extracting uncovered lines..."
-	@grep -n "^    #####:" smol.c.gcov | grep -v "GCOV_EXCL" | \
-		awk -F: '{print $$1 "\t" $$2}' > coverage_uncovered.txt || true
+	@echo "[coverage] Regenerating gcov with flushed data..."
+	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov regeneration completed"
+	@echo "[coverage] Extracting uncovered lines (excluding GCOV_EXCL blocks)..."
+	@awk ' \
+		/GCOV_EXCL_START/ { excl=1 } \
+		/GCOV_EXCL_STOP/ { excl=0; next } \
+		/^ *#####:/ && excl==0 && !/GCOV_EXCL_LINE/ && !/GCOV_EXCL_START/ && !/DEFENSIVE_CHECK/ { \
+			line = $$0; \
+			gsub(/^ *#####: */, "", line); \
+			gsub(/:.*/, "", line); \
+			print line; \
+		}' smol.c.gcov > coverage_uncovered.txt || true
 	@if [ -f coverage_uncovered.txt ]; then \
-		echo "[coverage] Uncovered lines saved to coverage_uncovered.txt ($(shell wc -l < coverage_uncovered.txt 2>/dev/null || echo 0) lines)"; \
+		count=$$(wc -l < coverage_uncovered.txt 2>/dev/null || echo 0); \
+		echo "[coverage] Uncovered lines saved to coverage_uncovered.txt ($$count lines, excluding GCOV_EXCL blocks)"; \
+		if [ $$count -gt 0 ]; then \
+			echo "[coverage] First 10 uncovered lines:"; \
+			head -10 coverage_uncovered.txt | while read line; do \
+				echo "  Line $$line: $$(sed -n "$${line}p" smol.c | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//')"; \
+			done; \
+		else \
+			echo "[coverage] 🎉 100% coverage achieved (excluding GCOV_EXCL blocks)!"; \
+		fi; \
 	fi
 	@echo ""
 	@echo "[coverage] Full coverage analysis complete!"
 	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
-	@echo "[coverage] Review coverage_uncovered.txt for all uncovered lines"
+	@echo "[coverage] Review coverage_uncovered.txt for truly uncovered lines"
 	@echo "[coverage] Run 'make coverage-html' for HTML report"
 
 

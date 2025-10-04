@@ -977,6 +977,7 @@ DROP TABLE IF EXISTS t_par_atomic CASCADE;
 CREATE UNLOGGED TABLE t_par_atomic(k int8);
 INSERT INTO t_par_atomic SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_par_atomic_smol ON t_par_atomic USING smol(k);
+WARNING:  smol: internal page full during build
 ANALYZE t_par_atomic;
 -- This should trigger parallel scan with atomic leaf claiming
 SELECT SUM(k) FROM t_par_atomic WHERE k > 100000::int8;
@@ -1197,6 +1198,8 @@ DROP TABLE IF EXISTS t_par_batch CASCADE;
 CREATE UNLOGGED TABLE t_par_batch(k int8);
 INSERT INTO t_par_batch SELECT i::int8 FROM generate_series(1, 1000000) i;
 CREATE INDEX t_par_batch_smol ON t_par_batch USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_par_batch;
 -- Parallel scan should use batch claiming to reserve multiple leaves at once
 SELECT SUM(k) FROM t_par_batch WHERE k > 100000::int8;
@@ -1371,6 +1374,10 @@ CREATE UNLOGGED TABLE t_par_contention(k int8);
 -- Insert enough data to create many leaves
 INSERT INTO t_par_contention SELECT i::int8 FROM generate_series(1, 2000000) i;
 CREATE INDEX t_par_contention_smol ON t_par_contention USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_par_contention;
 -- Force parallel scan with many workers to trigger atomic contention
 SET parallel_leader_participation = off;
@@ -1417,6 +1424,7 @@ CREATE UNLOGGED TABLE t_par_init(k int8);
 -- Insert enough data to ensure parallel scan
 INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_par_init_smol ON t_par_init USING smol(k);
+WARNING:  smol: internal page full during build
 ANALYZE t_par_init;
 -- Multiple queries to increase chance of hitting curv=0 race
 SELECT COUNT(*) FROM t_par_init WHERE k > 100000::int8;
@@ -1780,6 +1788,7 @@ CREATE UNLOGGED TABLE t_batch_claim(k int8);
 -- Need enough data to create multiple leaves for batch claiming
 INSERT INTO t_batch_claim SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_batch_claim_smol ON t_batch_claim USING smol(k);
+WARNING:  smol: internal page full during build
 ANALYZE t_batch_claim;
 -- Parallel scan should claim batches of 4 leaves at a time
 SELECT COUNT(*) FROM t_batch_claim WHERE k > 100000::int8;

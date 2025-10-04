@@ -293,3 +293,9 @@ CREATE OPERATOR CLASS text_ops
         OPERATOR        4       >= ,
         OPERATOR        5       >  ,
         FUNCTION        1       bttextcmp(text,text);
+
+-- Test function to run synthetic tests for coverage (only available in coverage builds)
+CREATE OR REPLACE FUNCTION smol_test_run_synthetic()
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;

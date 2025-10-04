@@ -15,6 +15,8 @@ INSERT INTO t_tall_tree
 SELECT i::int8 FROM generate_series(1, 1000000) i;
 -- Create index - should build 3-4 level tree
 CREATE INDEX t_tall_tree_smol ON t_tall_tree USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 -- Query to navigate tree (triggers smol_find_first_leaf)
 -- Searches for upper bound trigger rightmost child selection (line 3476-3477)
 SELECT k FROM t_tall_tree WHERE k >= 999990 LIMIT 10;

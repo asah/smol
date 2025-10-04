@@ -2,6 +2,7 @@
 postgres/
 
 # temp dirs
+pgdata/
 results/
 sampledata/
 
