@@ -30,36 +30,34 @@ dbuild:
 dstart:
 	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
 	echo "[docker] Creating docker instance 'smol' from image 'smol'"
-	docker run -m 4GB -d --name smol -v "$$PWD":/workspace -w /workspace smol sleep infinity
+	docker run -m 4GB -d --name smol -v "$$PWD":/home/postgres smol sleep infinity
 	echo "[docker] Container 'smol' is ready. building..."
-	docker exec smol make build
+	docker exec -u postgres -w /home/postgres smol make build
 	echo "[docker] starting postgresql..."
-	docker exec smol make start
-	echo "[docker] symlinking /workspace to /home/postgres..."
-	docker exec -w /home/postgres smol bash -c "/bin/ln -s /workspace/* ."
+	docker exec -u postgres -w /home/postgres smol make start
 	echo "[docker] done/ready."
 
 # jump into the docker instance e.g. to run top
 dexec:
-	docker exec -e OPENAI_API_KEY="$(OPENAI_API_KEY)" -it smol bash
+	docker exec -e OPENAI_API_KEY="$(OPENAI_API_KEY)" -it -w /home/postgres smol bash
 
 # jump into the docker instance e.g. to run top
 dpsql:
 	docker exec -it -u postgres smol psql
 
 # jump into the docker and run codex - note long startup time while it reads
-dcodex:
-	docker exec smol bash -c "mkdir -p /root/.codex"
-	docker cp .codex/config.toml smol:/root/.codex/config.toml
-	echo -e "{\n \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\"\n}\n" > .codex/auth.json
-	docker cp .codex/auth.json smol:/root/.codex/auth.json
-	docker exec -e OPENAI_API_KEY="$(OPENAI_API_KEY)" -it smol bash -c "codex -a never --sandbox danger-full-access \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read AGENTS.md and do what it says.\""
+#dcodex:
+#	docker exec smol bash -c "mkdir -p /root/.codex"
+#	docker cp .codex/config.toml smol:/root/.codex/config.toml
+#	echo -e "{\n \"OPENAI_API_KEY\": \"$(OPENAI_API_KEY)\"\n}\n" > .codex/auth.json
+#	docker cp .codex/auth.json smol:/root/.codex/auth.json
+#	docker exec -e OPENAI_API_KEY="$(OPENAI_API_KEY)" -it smol bash -c "codex -a never --sandbox danger-full-access \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read AGENTS.md and do what it says.\""
 
 
 dclaude:
-	docker exec smol bash -c "mkdir -p /root/.claude"
-	docker cp $(HOME)/.claude/.credentials.json smol:/root/.claude/.credentials.json
-	docker exec  -it smol bash -c "claude --allowedTools 'Bash:*,ReadFile:*,WriteFile:(/workspace),DeleteFile:(/workspace),git,grep,ls,python,bash,psql,su,make' --model claude-sonnet-4-5-20250929 \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read *.md, smol.c, sql/*, bench/*. Read AGENTS.md and do what it says.\""
+	docker exec -u postgres smol bash -c "mkdir -p .claude"
+	docker cp $(HOME)/.claude/.credentials.json smol:/home/postgres/.claude/.credentials.json
+	docker exec -u postgres -w /home/postgres  -it smol bash -c "claude --allowedTools 'Bash:*,ReadFile:*,WriteFile:(/workspace),DeleteFile:(/workspace),git,grep,ls,python,bash,psql,su,make' --model claude-sonnet-4-5-20250929 \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read *.md, smol.c, sql/*, bench/*. Read AGENTS.md and do what it says.\""
 
 # ---------------------------------------------------------------------------
 # Benchmarks
@@ -69,7 +67,7 @@ dclaude:
 bench-quick: start
 	@echo "[bench] Running quick benchmark suite (SMOL vs BTREE)..."
 	@mkdir -p results
-	@su - postgres -c "cd /workspace && /usr/local/pgsql/bin/psql -f bench/quick.sql" | tee results/bench-quick-$(shell date +%Y%m%d-%H%M%S).log
+	@/usr/local/pgsql/bin/psql -f bench/quick.sql | tee results/bench-quick-$(shell date +%Y%m%d-%H%M%S).log
 	@echo "[bench] Quick benchmark complete. See results/ for output."
 
 bench-thrash: start
@@ -77,7 +75,7 @@ bench-thrash: start
 	@mkdir -p results
 	@echo "[bench] This test shows SMOL fits in cache while BTREE requires disk I/O"
 	@echo "[bench] Expected: BTREE reads ~1900 blocks from disk, SMOL reads 0"
-	@su - postgres -c "cd /workspace && /usr/local/pgsql/bin/psql -f bench/thrash_clean.sql" | tee results/bench-thrash-$(shell date +%Y%m%d-%H%M%S).log
+	@/usr/local/pgsql/bin/psql -f bench/thrash_clean.sql | tee results/bench-thrash-$(shell date +%Y%m%d-%H%M%S).log
 	@echo "[bench] Thrash test complete. See THRASH_TEST_SUMMARY.md for interpretation."
 
 bench-pressure: start
@@ -85,7 +83,7 @@ bench-pressure: start
 	@mkdir -p results
 	@echo "[bench] This test uses EXPLAIN (ANALYZE, BUFFERS) to show I/O differences"
 	@echo "[bench] Expected runtime: 3-5 minutes"
-	@su - postgres -c "cd /workspace && /usr/local/pgsql/bin/psql -f bench/buffer_pressure.sql" | tee results/bench-pressure-$(shell date +%Y%m%d-%H%M%S).log
+	@/usr/local/pgsql/bin/psql -f bench/buffer_pressure.sql | tee results/bench-pressure-$(shell date +%Y%m%d-%H%M%S).log
 	@echo "[bench] Buffer pressure test complete. Check results/ for detailed I/O statistics."
 
 bench-extreme: start
@@ -95,7 +93,7 @@ bench-extreme: start
 	@echo "[bench] 20M rows with only 1000 distinct keys → massive compression!"
 	@echo "[bench] Expected: SMOL 8-10x smaller than BTREE"
 	@echo "[bench] Expected runtime: 4-6 minutes"
-	@su - postgres -c "cd /workspace && /usr/local/pgsql/bin/psql -v shared_buffers=64MB -f bench/extreme_pressure.sql" | tee results/bench-extreme-$(shell date +%Y%m%d-%H%M%S).log
+	@/usr/local/pgsql/bin/psql -v shared_buffers=64MB -f bench/extreme_pressure.sql | tee results/bench-extreme-$(shell date +%Y%m%d-%H%M%S).log
 	@echo "[bench] Extreme pressure test complete. Check results/ for compression and thrashing data."
 
 bench-full: bench-quick bench-thrash bench-pressure bench-extreme
@@ -110,7 +108,7 @@ bench-full: bench-quick bench-thrash bench-pressure bench-extreme
 
 # Resolve PostgreSQL bin dir from PG_CONFIG
 PG_BIN := $(dir $(PG_CONFIG))
-PGDATA := /workspace/pgdata
+PGDATA := /home/postgres/pgdata
 
 buildclean:
 	@echo "cleaning current build: make=$(MAKE)"
@@ -133,38 +131,36 @@ deldata:
 	  /bin/rm -fr $(PGDATA)
 
 start:
-	@# chmod to fix perms for the postgres user - stupid hack
-	chmod 777 /workspace;
 	@echo "Starting PostgreSQL in container (initdb if needed)"
 	@set -euo pipefail; \
 	  if [ ! -s $(PGDATA)/PG_VERSION ]; then \
-	    su - postgres -c "$(PG_BIN)initdb -D $(PGDATA)"; \
+	    $(PG_BIN)initdb -D $(PGDATA); \
 	  fi; \
           echo "tuning postgresql.conf for the current env"; \
 	  ./tune_pg.sh $(PGDATA)/postgresql.conf; \
 	  sed -i 's/^#*shared_buffers = .*$$/shared_buffers = 64MB/' $(PGDATA)/postgresql.conf; \
 	  chown postgres $(PGDATA)/postgresql.conf $(PGDATA)/postgresql.conf.bak*; \
-	  if su - postgres -c "$(PG_BIN)pg_ctl -D $(PGDATA) status" >/dev/null 2>&1; then \
+	  if $(PG_BIN)pg_ctl -D $(PGDATA) status >/dev/null 2>&1; then \
 	    echo "PostgreSQL already running"; \
 	  else \
-	    su - postgres -c "$(PG_BIN)pg_ctl -D $(PGDATA) -l /tmp/pg.log -w start"; \
+	    $(PG_BIN)pg_ctl -D $(PGDATA) -l /tmp/pg.log -w start; \
 	  fi; \
 	  echo "Waiting for server readiness..."; \
-	  su - postgres -c 'i=0; until $(PG_BIN)/pg_isready -h /tmp -p 5432 -d postgres -q || [ $$i -ge 60 ]; do sleep 1; i=$$((i+1)); done; [ $$i -lt 60 ]'; \
+	  i=0; until $(PG_BIN)/pg_isready -h /tmp -p 5432 -d postgres -q || [ $$i -ge 60 ]; do sleep 1; i=$$((i+1)); done; [ $$i -lt 60 ]; \
 	  echo "server ready."
 
 stop:
 	@echo "Stopping PostgreSQL in container"
-	-@su - postgres -c "$(PG_BIN)pg_ctl -D $(PGDATA) -m fast -w stop" >/dev/null 2>&1 || true
+	$(PG_BIN)pg_ctl -D $(PGDATA) -m fast -w stop >/dev/null 2>&1 || true
 
 # Interactive psql inside the container (run as postgres)
 psql:
-	@su - postgres -c "$(PG_BIN)psql"
+	$(PG_BIN)psql
 
 pgcheck: build start
 	@echo "Running regression tests (installcheck)"
 	@set -euo pipefail; \
-	  su - postgres -c "cd /workspace && make installcheck"; \
+	  $(MAKE) installcheck; \
 	  $(MAKE) stop
 
 # ---------------------------------------------------------------------------
@@ -193,7 +189,7 @@ coverage-test:
 	@sleep 1
 	@$(MAKE) start
 	@echo "[coverage] Running regression tests with coverage..."
-	@su - postgres -c "cd /workspace && make installcheck" || true
+	@$(MAKE) installcheck || true
 	@echo "[coverage] Stopping PostgreSQL to flush coverage data..."
 	@$(MAKE) stop
 	@sleep 3

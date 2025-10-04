@@ -10,8 +10,7 @@ Run Policy (Mandatory)
   run targets directly as `make <target>` (this agent can also run inside the `smol` container via `make dcodex`).
   Bare targets work inside or outside Docker.
 - psql usage inside Docker: connect as the `postgres` OS user. From host, use `make dpsql`. Inside
-  the container, use `make psql` or `su - postgres -c "/usr/local/pgsql/bin/psql"`. Running `psql`
-  as `root` will fail with `FATAL: role "root" does not exist`.
+  the container, use `make psql` or just run `psql` directly. You are running as user `postgres`.
 
 ## Goals & Constraints
 - Ordered semantics; read‑only index. Enforce read-only at the AM level
@@ -298,7 +297,7 @@ Profiling smol_gettuple
 - Quick recovery inside container:
   - Kill stuck backends/postmaster if needed: `ps -ef | grep postgres`, then `kill -9 <backend> <postmaster>`.
   - Remove stale IPC files: `rm -f /tmp/.s.PGSQL.5432 /tmp/.s.PGSQL.5432.lock`.
-- Start fresh cluster if wedged: `rm -rf /var/lib/postgresql/data && make start` (Makefile re-runs initdb).
+- Start fresh cluster if wedged: `rm -rf /home/postgres/pgdata && make start` (Makefile re-runs initdb).
 - For ad-hoc smoke tests (to avoid pg_regress), run minimal correctness via psql as `postgres` without expected-error checks.
 - Build path implementation rules: use radix sort for int2/int4/int8 keys and for (k1,k2) pairs; keep two-col collections in parallel arrays to avoid struct copies.
 - While writing leaves, compute and store each leaf’s high key; build the root from these cached highkeys—do not re-read leaves to fetch tail keys.

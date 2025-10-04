@@ -136,7 +136,7 @@ Usage
   are supported, but see notes below on deterministic correctness testing.
 
 Tests
-- Run regression tests: `make install && make start && su - postgres bash -c "cd /workspace && make installcheck" && make stop`
+- Run regression tests: `make install && make start && make installcheck && make stop`
 - Code coverage: `make coverage` (builds with instrumentation, runs tests, generates report)
   - Coverage report: `smol.c.gcov` (line-by-line) and `COVERAGE_REPORT.md` (analysis)
   - HTML report: `make coverage-html` (requires lcov)
@@ -176,5 +176,5 @@ Development policy
 psql in Docker
 - Always connect as the `postgres` OS user inside the container.
 - From host: run `make dpsql` to open psql as `postgres` in the `smol` container.
-- Inside container: run `make psql` or `su - postgres -c "/usr/local/pgsql/bin/psql"`.
+- Inside container: run `make psql` or just `psql` directly (you are running as user `postgres`).
 - If you run `psql` as `root`, PostgreSQL will error with `FATAL: role "root" does not exist`.

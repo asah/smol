@@ -2,8 +2,9 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
--- Enable debug logging
+-- Enable debug logging (but disable profiling for deterministic output)
 SET smol.debug_log = on;
+SET smol.profile = off;
 SET client_min_messages = debug1;
 
 -- Create table with text key and text INCLUDE

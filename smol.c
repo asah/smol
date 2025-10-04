@@ -460,9 +460,7 @@ PG_FUNCTION_INFO_V1(smol_handler);
 PG_FUNCTION_INFO_V1(smol_test_backward_scan);
 PG_FUNCTION_INFO_V1(smol_test_error_non_ios);
 PG_FUNCTION_INFO_V1(smol_test_no_movement);
-#ifdef SMOL_TEST_COVERAGE
 PG_FUNCTION_INFO_V1(smol_test_run_synthetic);
-#endif
 
 /* --- Minimal prototypes for IndexAmRoutine --- */
 static IndexBuildResult *smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo);
@@ -578,6 +576,10 @@ typedef struct SmolScanOpaqueData
     bool        have_k2_eq;
     int64       k2_eq;
 
+    /* Scankeys for runtime filtering (all predicates) */
+    ScanKey     runtime_keys;
+    int         n_runtime_keys;
+
     /* type/width info (leading key always present; second key optional) */
     Oid         atttypid;       /* INT2OID/INT4OID/INT8OID */
     Oid         atttypid2;      /* second column type if 2-col, else InvalidOid */
@@ -686,6 +688,7 @@ static int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const cha
 static inline int smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp);
 static bytea *smol_options(Datum reloptions, bool validate);
 static bool smol_validate(Oid opclassoid);
+static bool smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so);
 static void smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n);
 static uint16 smol_leaf_nitems(Page page);
 static char *smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len);
@@ -1369,6 +1372,8 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->have_k1_eq = false;
     so->bound_strict = false;
     so->chunk_left = 0;
+    so->runtime_keys = NULL;
+    so->n_runtime_keys = 0;
     so->atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
     so->atttypid2 = (RelationGetDescr(index)->natts >= 2) ? TupleDescAttr(RelationGetDescr(index), 1)->atttypid : InvalidOid;
     /* read meta */
@@ -1462,9 +1467,6 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         so->key_is_text32 = key_is_text;
     }
     so->prof_enabled = smol_profile_log;
-#ifdef SMOL_TEST_COVERAGE
-    so->prof_enabled = true; /* Enable profiling in coverage builds to test prof_* code paths */
-#endif
     so->prof_calls = 0;
     so->prof_rows = 0;
     so->prof_pages = 0;
@@ -1498,8 +1500,20 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
     so->have_k1_eq = false;
     so->have_k2_eq = false;
     so->chunk_left = 0;
+
+    /* Store all scankeys for runtime filtering */
+    if (so->runtime_keys)
+        pfree(so->runtime_keys);
+    so->runtime_keys = NULL;
+    so->n_runtime_keys = 0;
+
     if (keys && nkeys > 0)
     {
+        /* Copy scankeys for later filtering */
+        so->runtime_keys = (ScanKey) palloc(sizeof(ScanKeyData) * nkeys);
+        memcpy(so->runtime_keys, keys, sizeof(ScanKeyData) * nkeys);
+        so->n_runtime_keys = nkeys;
+
         for (int i = 0; i < nkeys; i++)
         {
             ScanKey sk = &keys[i];
@@ -1532,6 +1546,89 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
             }
         }
     }
+}
+
+/*
+ * smol_test_runtime_keys
+ * Test scan keys that SMOL doesn't handle natively against the materialized tuple.
+ * Returns true if all keys pass, false otherwise.
+ *
+ * SMOL natively handles:
+ * - Attribute 1 (leading key): All range predicates (>=, >, =, <=, <)
+ * - Attribute 2 (second key): Equality only (=)
+ *
+ * We need to recheck:
+ * - Attribute 2 (second key): Range predicates (>=, >, <=, <)
+ */
+static bool
+smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so)
+{
+    if (so->n_runtime_keys == 0)
+        return true;
+
+    /* Only test keys that SMOL doesn't handle natively */
+    bool need_test = false;
+    for (int i = 0; i < so->n_runtime_keys; i++)
+    {
+        ScanKey key = &so->runtime_keys[i];
+        /* Need to test if it's attribute 2 with non-equality strategy */
+        if (key->sk_attno == 2 && key->sk_strategy != BTEqualStrategyNumber)
+        {
+            need_test = true;
+            break;
+        }
+    }
+
+    if (!need_test)
+        return true; /* All keys are handled natively by SMOL */
+
+    /* Extract values from the prebuilt tuple */
+    Datum *values = (Datum *) palloc(scan->xs_itupdesc->natts * sizeof(Datum));
+    bool *isnull = (bool *) palloc(scan->xs_itupdesc->natts * sizeof(bool));
+
+    index_deform_tuple(so->itup, scan->xs_itupdesc, values, isnull);
+
+    /* Test each scankey that needs rechecking */
+    for (int i = 0; i < so->n_runtime_keys; i++)
+    {
+        ScanKey key = &so->runtime_keys[i];
+
+        /* Skip keys that SMOL handles natively */
+        if (key->sk_attno == 1)
+            continue; /* SMOL handles all attribute 1 predicates */
+        if (key->sk_attno == 2 && key->sk_strategy == BTEqualStrategyNumber)
+            continue; /* SMOL handles attribute 2 equality */
+
+        int attno = key->sk_attno - 1; /* 1-based to 0-based */
+
+        if (attno < 0 || attno >= scan->xs_itupdesc->natts)
+            continue;
+
+        /* NULL handling */
+        if (isnull[attno])
+        {
+            pfree(values);
+            pfree(isnull);
+            return false; /* SMOL doesn't support NULLs */
+        }
+
+        /* Evaluate the scankey */
+        bool result = DatumGetBool(FunctionCall2Coll(&key->sk_func,
+                                                      key->sk_collation,
+                                                      values[attno],
+                                                      key->sk_argument));
+
+        if (!result)
+        {
+            pfree(values);
+            pfree(isnull);
+            return false;
+        }
+    }
+
+    pfree(values);
+    pfree(isnull);
+    return true;
 }
 
 static bool
@@ -1945,6 +2042,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 else if (so->key_len2 == 8) smol_copy8(so->itup_data + so->itup_off2, k2p);
                 else if (so->key_len2 == 16) smol_copy16(so->itup_data + so->itup_off2, k2p);
                 else smol_copy_small(so->itup_data + so->itup_off2, k2p, so->key_len2);
+
+                /* Test runtime keys before returning */
+                if (!smol_test_runtime_keys(scan, so))
+                {
+                    so->leaf_i++;
+                    continue; /* Skip this tuple, doesn't match all keys */
+                }
+
                 scan->xs_itup = so->itup; ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                 so->leaf_i++;
                 if (so->prof_enabled) { so->prof_rows++; so->prof_bytes += (uint64)(so->key_len + so->key_len2); }
@@ -2066,8 +2171,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             so->prof_bytes += (uint64) so->key_len; /* GCOV_EXCL_LINE */
                         so->prof_touched += (uint64) so->key_len; /* GCOV_EXCL_LINE - profiling in backward xs_want_itup path rare */
                     }
-                        if (scan->xs_want_itup)
-                            scan->xs_itup = so->itup;
+
+                    /* Test runtime keys before returning */
+                    if (!smol_test_runtime_keys(scan, so))
+                    {
+                        so->cur_off--;
+                        continue; /* Skip this tuple */
+                    }
+
+                    if (scan->xs_want_itup)
+                        scan->xs_itup = so->itup;
                     ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                     so->cur_off--;
                     if (so->prof_enabled) so->prof_rows++;
@@ -2255,6 +2368,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             so->prof_bytes += (uint64) so->key_len;
                         so->prof_touched += (uint64) so->key_len;
                     }
+
+                    /* Test runtime keys before returning */
+                    if (!smol_test_runtime_keys(scan, so))
+                    {
+                        so->cur_off++;
+                        continue; /* Skip this tuple */
+                    }
+
                     if (scan->xs_want_itup)
                         scan->xs_itup = so->itup;
                     ItemPointerSet(&(scan->xs_heaptid), 0, 1);
@@ -2500,6 +2621,8 @@ smol_endscan(IndexScanDesc scan)
             pfree(so->itup);
         if (so->bstrategy)
             FreeAccessStrategy(so->bstrategy);
+        if (so->runtime_keys)
+            pfree(so->runtime_keys);
         if (so->prof_enabled)
             elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu",
                  (unsigned long) so->prof_calls,
@@ -4943,17 +5066,18 @@ smol_test_no_movement(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(result);
 }
 
-#ifdef SMOL_TEST_COVERAGE
 /*
  * smol_test_run_synthetic - Explicitly run synthetic tests for coverage
  *
  * This allows us to call the synthetic tests from SQL to ensure they're
  * covered by gcov, since _PG_init() may not reliably flush coverage data.
+ * When not in coverage mode, this is a no-op.
  */
 Datum
 smol_test_run_synthetic(PG_FUNCTION_ARGS)
 {
+#ifdef SMOL_TEST_COVERAGE
     smol_run_synthetic_tests();
+#endif
     PG_RETURN_BOOL(true);
 }
-#endif
