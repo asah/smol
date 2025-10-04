@@ -1,0 +1,101 @@
+-- Test backward scans with varwidth keys and various key sizes
+-- Targets uncovered lines in backward scan paths
+
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- ============================================================================
+-- Test 1: Backward scan with TEXT32 (varwidth) key
+-- Targets line 1982: has_varwidth path in backward scan
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_backward_text CASCADE;
+CREATE UNLOGGED TABLE t_backward_text (k text COLLATE "C", v int4);
+
+-- Insert data with duplicates to trigger RLE
+INSERT INTO t_backward_text
+SELECT 'key_' || lpad((i % 100)::text, 5, '0'), i
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX idx_backward_text ON t_backward_text USING smol(k) INCLUDE (v);
+ANALYZE t_backward_text;
+
+-- Backward scan with varwidth key
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+-- Backward scan (ORDER BY DESC) with varwidth text key
+SELECT k, v FROM t_backward_text WHERE k >= 'key_00050' ORDER BY k DESC LIMIT 10;
+
+-- Test with equality bound (targets lines 1931-1932: have_k1_eq termination
+-- Note: This test may not reliably hit lines 1931-1932 without specific scan setup
+SELECT k FROM t_backward_text WHERE k = 'key_00042' ORDER BY k DESC LIMIT 5;
+
+-- ============================================================================
+-- Test 2: Backward scan with INT8 key (key_len == 8)
+-- Targets line 1988: key_len == 8 copy path in backward scan
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_backward_int8 CASCADE;
+CREATE UNLOGGED TABLE t_backward_int8 (k int8);
+
+INSERT INTO t_backward_int8
+SELECT i::int8
+FROM generate_series(1, 1000) i;
+
+CREATE INDEX idx_backward_int8 ON t_backward_int8 USING smol(k);
+ANALYZE t_backward_int8;
+
+-- Backward scan with int8 (key_len == 8)
+SELECT k FROM t_backward_int8 WHERE k >= 500 ORDER BY k DESC LIMIT 10;
+
+-- ============================================================================
+-- Test 3: Skip UUID single-column (not byval, not supported for single-column)
+-- Instead use DATE which is int4 internally (key_len == 4, already covered by existing tests)
+-- For key_len == 16, we would need a two-column index with UUID, but that's complex
+-- Let's focus on char (key_len == 1) for smol_copy_small
+-- ============================================================================
+
+-- ============================================================================
+-- Test 4: Backward scan with CHAR key (key_len == 1)
+-- Targets line 1990: smol_copy_small for uncommon key lengths
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_backward_char CASCADE;
+CREATE UNLOGGED TABLE t_backward_char (k "char");
+
+-- Insert valid char values (0-127)
+INSERT INTO t_backward_char
+SELECT (i % 128)::"char"
+FROM generate_series(1, 1000) i;
+
+CREATE INDEX idx_backward_char ON t_backward_char USING smol(k);
+ANALYZE t_backward_char;
+
+-- Backward scan with char (key_len == 1, hits line 1990 smol_copy_small)
+SELECT k FROM t_backward_char WHERE k >= 'A'::"char" ORDER BY k DESC LIMIT 10;
+
+-- ============================================================================
+-- Test 5: RLE backward scan finding start of run (line 1970)
+-- Need: RLE page + backward scan + duplicates not encoded in RLE metadata
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_backward CASCADE;
+CREATE UNLOGGED TABLE t_rle_backward (k int4);
+
+-- Insert many duplicates to create RLE page
+INSERT INTO t_rle_backward
+SELECT (i % 10)::int4
+FROM generate_series(1, 10000) i;
+
+CREATE INDEX idx_rle_backward ON t_rle_backward USING smol(k);
+ANALYZE t_rle_backward;
+
+-- Backward scan that will traverse RLE runs
+SELECT k FROM t_rle_backward WHERE k >= 5 ORDER BY k DESC LIMIT 50;
+
+-- Cleanup
+DROP TABLE t_backward_text CASCADE;
+DROP TABLE t_backward_int8 CASCADE;
+DROP TABLE t_backward_char CASCADE;
+DROP TABLE t_rle_backward CASCADE;
