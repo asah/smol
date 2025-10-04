@@ -3,16 +3,26 @@
 ## Quick Start
 
 ```bash
-make bench-quick      # 30 seconds - smoke test
-make bench-thrash     # 2 minutes - cache efficiency demo ⭐ RECOMMENDED
-make bench-pressure   # 5 minutes - detailed I/O analysis
+# NEW: Pretty benchmark runner with color output & CSV
+make bench            # Quick suite (3 tests, ~30s) ⭐ RECOMMENDED
+make bench-full       # Comprehensive suite (~2-5 min)
+make bench-thrash     # Cache efficiency test (large dataset)
+make bench-repeats    # Run with 5 repetitions
+
+# Legacy SQL benchmarks (raw output)
+make bench-pressure   # Buffer pressure test (20M rows)
+make bench-extreme    # Extreme compression test
 ```
 
+**Output**: Pretty color-coded console output + CSV files saved to `results/`
+
 All benchmarks compare SMOL vs BTREE indexes and report:
-- Index build time
-- Index size on disk
-- Query execution time
-- Buffer I/O statistics (when using EXPLAIN BUFFERS)
+- Index build time & size on disk
+- Query execution time with speedup ratios
+- Compression ratios (how much smaller SMOL is)
+- Buffer I/O statistics (when available)
+
+Run `make bench-help` for full command reference. See `bench/README.md` for detailed documentation.
 
 ---
 

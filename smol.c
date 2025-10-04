@@ -638,6 +638,12 @@ typedef struct SmolScanOpaqueData
     char        run_key[16];    /* store up to 16 bytes of fixed-length key */
     int16       run_text_klen;  /* cached varlena key length for current run (text32) */
     bool        page_is_plain;  /* true when current page is plain (not RLE) - set once per page */
+    /* Cached INCLUDE column base pointers for plain pages (performance optimization) */
+    char       *plain_inc_base[16]; /* base pointer for each INCLUDE column on plain pages */
+    bool        plain_inc_cached;   /* true when plain_inc_base[] is valid for current page */
+    /* Cached INCLUDE column pointers for current RLE run (performance optimization) */
+    char       *rle_run_inc_ptr[16]; /* pointer to INCLUDE values for current run on RLE pages */
+    bool        rle_run_inc_cached;  /* true when rle_run_inc_ptr[] is valid for current run */
     /* Prebuilt varlena blobs reused within run (text) */
     bool        run_key_built;
     int16       run_key_vl_len; /* bytes in run_key_vl (VARHDR+payload) */
@@ -1987,6 +1993,33 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             so->page_is_plain = !smol_leaf_is_rle(page);
         else
             so->page_is_plain = false;
+
+        /* Initialize INCLUDE column pointer cache for plain pages (performance optimization)
+         * For plain-layout pages with INCLUDE columns, compute base pointers once per page
+         * instead of recomputing them for every tuple. This eliminates ~200K redundant calls
+         * to smol1_inc_ptr_any() for workloads returning many rows with INCLUDE columns.
+         * Plain format: [u16 n][keys][inc1 block][inc2 block]... (no tag, n < 0x8000)
+         * RLE formats use tags 0x8001 or 0x8003 at the start. */
+        so->plain_inc_cached = false;
+        if (!so->two_col && so->ninclude > 0)
+        {
+            ItemId iid = PageGetItemId(page, FirstOffsetNumber);
+            char *base = (char *) PageGetItem(page, iid);
+            uint16 tag; memcpy(&tag, base, sizeof(uint16));
+            /* Plain format has no tag - first u16 is the count n (< 0x8000) */
+            if (tag != 0x8001u && tag != 0x8003u)
+            {
+                uint16 n = tag; /* First u16 is count, not a tag */
+                char *p = base + sizeof(uint16) + (size_t) n * so->key_len;
+                for (uint16 ii = 0; ii < so->ninclude; ii++)
+                {
+                    so->plain_inc_base[ii] = p;
+                    p += (size_t) n * so->inc_len[ii];
+                }
+                so->plain_inc_cached = true;
+            }
+        }
+
         if (so->two_col)
         {
             if (so->leaf_i < so->leaf_n)
@@ -2250,6 +2283,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                             break;
                                         end++;
                                     }
+                                    so->rle_run_inc_cached = false; /* Non-RLE page, no caching */
+                                }
+                                else
+                                {
+                                    /* RLE bounds found - TODO: cache INCLUDE pointers (disabled due to correctness bug) */
+                                    so->rle_run_inc_cached = false;
                                 }
                                 so->run_start_off = start; /* not used in forward path */
                                 so->run_end_off = end;
@@ -2291,7 +2330,17 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 uint16 n2 = n;
                                 for (uint16 ii=0; ii<so->ninclude; ii++)
                                 {
-                                    char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+                                    char *ip;
+                                    /* Use cached pointers when available (fast paths) */
+                                    if (so->plain_inc_cached)
+                                        /* Plain page: base pointer + row offset */
+                                        ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
+                                    else if (so->rle_run_inc_cached)
+                                        /* RLE page with cached run: INCLUDE values constant within run */
+                                        ip = so->rle_run_inc_ptr[ii];
+                                    else
+                                        /* Slow path: compute pointer dynamically */
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
                                     char *dst = so->itup_data + so->inc_offs[ii];
 				    /* common cases first */
                                     if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
@@ -3948,6 +3997,7 @@ smol_run_reset(SmolScanOpaque so)
     so->run_end_off = InvalidOffsetNumber;
     so->run_key_len = 0;
     so->run_inc_evaluated = false;
+    so->rle_run_inc_cached = false;
 }
 
 

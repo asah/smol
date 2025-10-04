@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_synthetic_tests
+REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_plain_include_cache smol_synthetic_tests
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -60,24 +60,62 @@ dclaude:
 	docker exec -u postgres -w /home/postgres  -it smol bash -c "claude --allowedTools 'Bash:*,ReadFile:*,WriteFile:(/workspace),DeleteFile:(/workspace),git,grep,ls,python,bash,psql,su,make' --model claude-sonnet-4-5-20250929 \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read *.md, smol.c, sql/*, bench/*. Read AGENTS.md and do what it says.\""
 
 # ---------------------------------------------------------------------------
-# Benchmarks
+# Benchmarks - Pretty output with Python runner + legacy SQL benchmarks
 # ---------------------------------------------------------------------------
-.PHONY: bench-quick bench-thrash bench-pressure bench-extreme bench-full
+.PHONY: bench bench-quick bench-full bench-thrash bench-repeats
+.PHONY: bench-pressure bench-extreme bench-legacy
 
+# Main benchmark targets using Python runner (pretty output)
 bench-quick: start
-	@echo "[bench] Running quick benchmark suite (SMOL vs BTREE)..."
-	@mkdir -p results
-	@/usr/local/pgsql/bin/psql -f bench/quick.sql | tee results/bench-quick-$(shell date +%Y%m%d-%H%M%S).log
-	@echo "[bench] Quick benchmark complete. See results/ for output."
+	@echo "$(shell tput bold)Running quick benchmark suite...$(shell tput sgr0)"
+	@python3 bench/bench_runner.py --quick
+
+bench-full: start
+	@echo "$(shell tput bold)Running full comprehensive benchmark suite...$(shell tput sgr0)"
+	@python3 bench/bench_runner.py --full
 
 bench-thrash: start
-	@echo "[bench] Running thrash test (demonstrates cache efficiency with shared_buffers=64MB)..."
-	@mkdir -p results
-	@echo "[bench] This test shows SMOL fits in cache while BTREE requires disk I/O"
-	@echo "[bench] Expected: BTREE reads ~1900 blocks from disk, SMOL reads 0"
-	@/usr/local/pgsql/bin/psql -f bench/thrash_clean.sql | tee results/bench-thrash-$(shell date +%Y%m%d-%H%M%S).log
-	@echo "[bench] Thrash test complete. See THRASH_TEST_SUMMARY.md for interpretation."
+	@echo "$(shell tput bold)Running thrashing test...$(shell tput sgr0)"
+	@python3 bench/bench_runner.py --thrash
 
+bench-repeats: start
+	@echo "$(shell tput bold)Running benchmark with 5 repetitions...$(shell tput sgr0)"
+	@python3 bench/bench_runner.py --quick --repeats 5
+
+# Convenience alias
+bench: bench-quick
+
+# Help target for benchmarks
+bench-help:
+	@echo ""
+	@echo "$(shell tput bold)SMOL Benchmark Suite$(shell tput sgr0)"
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo ""
+	@echo "$(shell tput bold)Quick Start:$(shell tput sgr0)"
+	@echo "  make bench              # Run quick benchmark (alias for bench-quick)"
+	@echo "  make bench-quick        # Quick suite (3 tests, ~30s)"
+	@echo "  make bench-full         # Full comprehensive suite (~2-5 min)"
+	@echo "  make bench-thrash       # Cache efficiency test (large dataset)"
+	@echo "  make bench-repeats      # Quick suite with 5 repetitions"
+	@echo ""
+	@echo "$(shell tput bold)Output:$(shell tput sgr0)"
+	@echo "  • Pretty console output with color-coded performance"
+	@echo "  • CSV files saved to results/ directory"
+	@echo "  • Speedup ratios and compression statistics"
+	@echo ""
+	@echo "$(shell tput bold)Legacy SQL Benchmarks:$(shell tput sgr0)"
+	@echo "  make bench-pressure     # Buffer pressure test (20M rows)"
+	@echo "  make bench-extreme      # Extreme compression test"
+	@echo "  make bench-legacy       # Both legacy tests"
+	@echo ""
+	@echo "$(shell tput bold)Direct Python Usage:$(shell tput sgr0)"
+	@echo "  python3 bench/bench_runner.py --quick"
+	@echo "  python3 bench/bench_runner.py --full --repeats 10"
+	@echo ""
+	@echo "See bench/README.md for detailed documentation"
+	@echo ""
+
+# Legacy SQL-based benchmarks (kept for compatibility)
 bench-pressure: start
 	@echo "[bench] Running buffer pressure test (20M rows, demonstrates cache efficiency)..."
 	@mkdir -p results
@@ -96,8 +134,8 @@ bench-extreme: start
 	@/usr/local/pgsql/bin/psql -v shared_buffers=64MB -f bench/extreme_pressure.sql | tee results/bench-extreme-$(shell date +%Y%m%d-%H%M%S).log
 	@echo "[bench] Extreme pressure test complete. Check results/ for compression and thrashing data."
 
-bench-full: bench-quick bench-thrash bench-pressure bench-extreme
-	@echo "[bench] Full benchmark suite complete."
+bench-legacy: bench-pressure bench-extreme
+	@echo "[bench] Legacy benchmark suite complete."
 
 # ---------------------------------------------------------------------------
 # Inside-container targets

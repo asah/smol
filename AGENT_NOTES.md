@@ -12,6 +12,12 @@ Run Policy (Mandatory)
 - psql usage inside Docker: connect as the `postgres` OS user. From host, use `make dpsql`. Inside
   the container, use `make psql` or just run `psql` directly. You are running as user `postgres`.
 
+Testing Policy (Mandatory)
+- ALL code changes MUST pass: `make installcheck` (all 53 tests passing)
+- ALL code changes MUST maintain 100% code coverage: `make coverage` must show 100% line coverage
+- When making optimizations, use `COVERAGE=1` builds to identify hot paths with gcov
+- Update expected/*.out files when line numbers change due to code additions
+
 ## Goals & Constraints
 - Ordered semantics; read‑only index. Enforce read-only at the AM level
   (write entry points ERROR); no triggers involved.
