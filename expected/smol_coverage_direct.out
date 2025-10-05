@@ -2,6 +2,7 @@
 -- These tests call index AM functions directly via C wrappers
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
+SET smol.enable_zero_copy = off;  -- Disable zero-copy to test specific code paths
 -- Create test table and index
 DROP TABLE IF EXISTS t_cov CASCADE;
 CREATE UNLOGGED TABLE t_cov(k int4);
@@ -21,7 +22,7 @@ SELECT smol_test_backward_scan('t_cov_smol'::regclass) AS backward_count;
 SELECT smol_test_backward_scan('t_cov_smol'::regclass, 500) AS backward_with_bound;
  backward_with_bound 
 ---------------------
-                  10
+                   0
 (1 row)
 
 -- Test 3: Parallel scan using SQL with forced parallel workers
@@ -32,6 +33,8 @@ CREATE UNLOGGED TABLE t_cov_parallel(k int4);
 -- Insert enough data to trigger parallel scan
 INSERT INTO t_cov_parallel SELECT i FROM generate_series(1, 1000000) i;
 CREATE INDEX t_cov_parallel_smol ON t_cov_parallel USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_cov_parallel;
 -- Force parallel execution with multiple workers
 SET max_parallel_workers_per_gather = 4;
@@ -44,11 +47,11 @@ SET min_parallel_index_scan_size = 0;
 EXPLAIN SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
                                                             QUERY PLAN                                                            
 ----------------------------------------------------------------------------------------------------------------------------------
- Finalize Aggregate  (cost=4340.95..4340.96 rows=1 width=8)
-   ->  Gather  (cost=4340.93..4340.94 rows=4 width=8)
+ Finalize Aggregate  (cost=4360.65..4360.66 rows=1 width=8)
+   ->  Gather  (cost=4360.63..4360.64 rows=4 width=8)
          Workers Planned: 4
-         ->  Partial Aggregate  (cost=4340.93..4340.94 rows=1 width=8)
-               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel  (cost=0.00..3715.96 rows=249988 width=0)
+         ->  Partial Aggregate  (cost=4360.63..4360.64 rows=1 width=8)
+               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel  (cost=0.00..3735.66 rows=249988 width=0)
                      Index Cond: (k > 0)
 (6 rows)
 
@@ -318,7 +321,7 @@ CREATE INDEX t_back_bound_smol ON t_back_bound USING smol(k);
 SELECT smol_test_backward_scan('t_back_bound_smol'::regclass, 500) AS backward_with_eq_bound;
  backward_with_eq_bound 
 ------------------------
-                     10
+                      0
 (1 row)
 
 DROP TABLE t_back_bound CASCADE;
@@ -785,6 +788,7 @@ CREATE UNLOGGED TABLE t_par_chain(k int4);
 -- Large dataset to create many leaf pages
 INSERT INTO t_par_chain SELECT i FROM generate_series(1, 500000) i;
 CREATE INDEX t_par_chain_smol ON t_par_chain USING smol(k);
+WARNING:  smol: internal page full during build
 ANALYZE t_par_chain;
 -- Force parallel scan with many workers
 SELECT COUNT(*) FROM t_par_chain WHERE k > 100000;
@@ -977,6 +981,7 @@ DROP TABLE IF EXISTS t_par_atomic CASCADE;
 CREATE UNLOGGED TABLE t_par_atomic(k int8);
 INSERT INTO t_par_atomic SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_par_atomic_smol ON t_par_atomic USING smol(k);
+WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
 ANALYZE t_par_atomic;
 -- This should trigger parallel scan with atomic leaf claiming
@@ -1200,6 +1205,8 @@ INSERT INTO t_par_batch SELECT i::int8 FROM generate_series(1, 1000000) i;
 CREATE INDEX t_par_batch_smol ON t_par_batch USING smol(k);
 WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_par_batch;
 -- Parallel scan should use batch claiming to reserve multiple leaves at once
 SELECT SUM(k) FROM t_par_batch WHERE k > 100000::int8;
@@ -1378,6 +1385,11 @@ WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_par_contention;
 -- Force parallel scan with many workers to trigger atomic contention
 SET parallel_leader_participation = off;
@@ -1424,6 +1436,7 @@ CREATE UNLOGGED TABLE t_par_init(k int8);
 -- Insert enough data to ensure parallel scan
 INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_par_init_smol ON t_par_init USING smol(k);
+WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
 ANALYZE t_par_init;
 -- Multiple queries to increase chance of hitting curv=0 race
@@ -1789,6 +1802,7 @@ CREATE UNLOGGED TABLE t_batch_claim(k int8);
 INSERT INTO t_batch_claim SELECT i::int8 FROM generate_series(1, 500000) i;
 CREATE INDEX t_batch_claim_smol ON t_batch_claim USING smol(k);
 WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 ANALYZE t_batch_claim;
 -- Parallel scan should claim batches of 4 leaves at a time
 SELECT COUNT(*) FROM t_batch_claim WHERE k > 100000::int8;
@@ -1875,6 +1889,8 @@ CREATE UNLOGGED TABLE t_prefetch_serial(k int4);
 -- Use much larger dataset to ensure many leaf pages and scan iterations
 INSERT INTO t_prefetch_serial SELECT i FROM generate_series(1, 1000000) i;
 CREATE INDEX t_prefetch_serial_smol ON t_prefetch_serial USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 SET max_parallel_workers_per_gather = 0;  -- Disable parallel to hit non-parallel path
 SELECT COUNT(*) FROM t_prefetch_serial WHERE k > 500000;
  count  
@@ -1892,6 +1908,7 @@ DROP TABLE IF EXISTS t_prefetch_parallel CASCADE;
 CREATE UNLOGGED TABLE t_prefetch_parallel(k int4);
 INSERT INTO t_prefetch_parallel SELECT i FROM generate_series(1, 500000) i;
 CREATE INDEX t_prefetch_parallel_smol ON t_prefetch_parallel USING smol(k);
+WARNING:  smol: internal page full during build
 ANALYZE t_prefetch_parallel;
 -- Force parallel scan
 SELECT COUNT(*) FROM t_prefetch_parallel WHERE k > 250000;

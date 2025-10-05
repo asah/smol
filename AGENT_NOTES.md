@@ -3,20 +3,11 @@
 This file summarizes the hard‑won details needed to work on the `smol`
 PostgreSQL 18 index access method in this repo.
 
-Run Policy (Mandatory)
-- One container name only: `smol`. Always build and test using
-  a single Docker container named `smol`; reuse it across runs.
-- Preferred: use Docker helpers to ensure a clean PG18 toolchain. Build the image with `make dbuild`, then
-  run targets directly as `make <target>` (this agent can also run inside the `smol` container via `make dcodex`).
-  Bare targets work inside or outside Docker.
-- psql usage inside Docker: connect as the `postgres` OS user. From host, use `make dpsql`. Inside
-  the container, use `make psql` or just run `psql` directly. You are running as user `postgres`.
-
-Testing Policy (Mandatory)
-- ALL code changes MUST pass: `make installcheck` (all 53 tests passing)
-- ALL code changes MUST maintain 100% code coverage: `make coverage` must show 100% line coverage
-- When making optimizations, use `COVERAGE=1` builds to identify hot paths with gcov
-- Update expected/*.out files when line numbers change due to code additions
+Working Notes
+- User-facing overview lives in `README.md`.
+- Benchmarking docs and usage are consolidated in `BENCHMARKING.md`.
+- Coverage workflow, philosophy, and troubleshooting are in `COVERAGE.md`.
+- Use Docker helpers if you prefer a clean PG18 toolchain, or run bare `make` targets locally; always connect as OS user `postgres` when using psql in the container (`make dpsql`).
 
 ## Goals & Constraints
 - Ordered semantics; read‑only index. Enforce read-only at the AM level

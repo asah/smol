@@ -137,22 +137,8 @@ Usage
 
 Tests
 - Run regression tests: `make install && make start && make installcheck && make stop`
-- Code coverage: `make coverage` (builds with instrumentation, runs tests, generates report)
-  - Coverage report: `smol.c.gcov` (line-by-line) and `COVERAGE_REPORT.md` (analysis)
-  - HTML report: `make coverage-html` (requires lcov)
-  - Current coverage: ~39% (core functionality fully tested, see COVERAGE_REPORT.md)
+- Coverage workflow and troubleshooting: see `COVERAGE.md`
 
-Deterministic Correctness Check (Multi‑Column Regression)
-- Some workloads (e.g., `GROUP BY a` on an index defined as SMOL(b,a)) can pick SMOL even without
-  a leading‑key qual. To verify correctness deterministically:
-  1. Choose `mode(a)` from a stable slice of the table, e.g., the first 100k rows by `ctid`.
-  2. Compare `SELECT a, count(*) FROM t GROUP BY a` between:
-     - Baseline (seqscan only), and
-     - Forced SMOL IOS (drop the BTREE index, set `enable_seqscan=off`, and set
-       `max_parallel_workers_per_gather=0` for single-worker), using an md5 over ordered results.
-  3. Compare `SELECT count(*) FROM t WHERE a = :mode` under the same toggles.
-- SMOL’s two‑column reader uses a per‑leaf cache and memcpy of both attrs per row, ensuring correctness
-  while remaining allocation‑free per row. Multi‑level descent is supported for height≥2.
  
 
 Operator Classes

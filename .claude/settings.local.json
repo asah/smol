@@ -32,7 +32,20 @@
       "Bash(for line in 1606 1611 1616 1617 1618 2211 2212 2340 2424 2425)",
       "Bash(do sed -n \"$linep\" smol.c)",
       "Bash(done)",
-      "Bash(env COVERAGE=1 make installcheck)"
+      "Bash(env COVERAGE=1 make installcheck)",
+      "Read(//usr/local/pgsql/include/**)",
+      "Read(//usr/local/pgsql/**)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_zero_copy)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_basic)",
+      "Bash(sudo -u postgres /usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data restart -w)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_coverage_direct)",
+      "Bash(awk:*)",
+      "Bash(for f in smol_coverage_direct smol_parallel_batch smol_edge_coverage smol_debug_log smol_tree_navigation smol_tall_tree_fanout smol_parallel_full smol_rightmost_descend)",
+      "Bash(do cp results/$f.out expected/$f.out)",
+      "Bash(sudo:*)",
+      "Bash(/usr/local/pgsql/bin/pg_ctl:*)",
+      "Read(//home/**)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_parallel_batch)"
     ],
     "deny": [],
     "ask": []

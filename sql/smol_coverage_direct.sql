@@ -2,6 +2,7 @@
 -- These tests call index AM functions directly via C wrappers
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
+SET smol.enable_zero_copy = off;  -- Disable zero-copy to test specific code paths
 
 -- Create test table and index
 DROP TABLE IF EXISTS t_cov CASCADE;

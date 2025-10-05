@@ -22,7 +22,7 @@ All benchmarks compare SMOL vs BTREE indexes and report:
 - Compression ratios (how much smaller SMOL is)
 - Buffer I/O statistics (when available)
 
-Run `make bench-help` for full command reference. See `bench/README.md` for detailed documentation.
+Run `make bench-help` for full command reference. Details are consolidated here.
 
 ---
 

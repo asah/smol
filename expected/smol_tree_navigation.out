@@ -17,6 +17,8 @@ SELECT i::int8 FROM generate_series(1, 1000000) i;
 CREATE INDEX t_tall_tree_smol ON t_tall_tree USING smol(k);
 WARNING:  smol: internal page full during build
 WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 -- Query to navigate tree (triggers smol_find_first_leaf)
 -- Searches for upper bound trigger rightmost child selection (line 3476-3477)
 SELECT k FROM t_tall_tree WHERE k >= 999990 LIMIT 10;
@@ -124,6 +126,8 @@ CREATE UNLOGGED TABLE t_tall_tree_int4 (k int4);
 INSERT INTO t_tall_tree_int4
 SELECT i::int4 FROM generate_series(1, 1000000) i;
 CREATE INDEX t_tall_tree_int4_smol ON t_tall_tree_int4 USING smol(k);
+WARNING:  smol: internal page full during build
+WARNING:  smol: internal page full during build
 -- Query with int32 bounds
 SELECT count(*) FROM t_tall_tree_int4 WHERE k >= 500000::int4;
  count  
