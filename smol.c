@@ -2009,7 +2009,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 }
                 else
                 {
-                    so->cur_blk = smol_find_first_leaf(idx, 0 /*unused*/ , so->atttypid, so->key_len);
+                    /* Single-threaded scan: seek to first leaf containing bound
+                     * For equality queries (k = value), this seeks directly to the page containing value
+                     * instead of starting at leftmost leaf and scanning sequentially */
+                    int64 lb = 0;  /* Default for unbounded scans: start at leftmost leaf */
+                    if (so->have_bound)
+                    {
+                        if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                        else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                        else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                        else lb = 0;  /* Non-INT types: fall back to leftmost leaf (generic bounds check at tuple level) */
+                    }
+                    so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
                     SMOL_LOGF("gettuple init cur_blk=%u", so->cur_blk);
@@ -2143,7 +2154,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 }
                 else
                 {
-                    so->cur_blk = smol_find_first_leaf(idx, 0, so->atttypid, so->key_len);
+                    /* Two-column single-threaded scan: seek to first leaf containing bound */
+                    int64 lb = 0;  /* Default for unbounded scans */
+                    if (so->have_bound)
+                    {
+                        if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                        else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                        else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                        else lb = 0;
+                    }
+                    so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                     so->cur_group = 0;
                     so->pos_in_group = 0;
                     so->initialized = true;

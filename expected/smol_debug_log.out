@@ -35,20 +35,20 @@ SET enable_indexonlyscan = on;
 SELECT k, v, i FROM t_debug WHERE k >= 'key002';
 LOG:  [smol] smol_handler:1075: enter smol_handler
 LOG:  [smol] smol_handler:1075: enter smol_handler
-LOG:  [smol] smol_meta_read:3258: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_meta_read:3278: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
 LOG:  [smol] smol_beginscan:1585: beginscan nkeys=1 key_len=32
-LOG:  [smol] smol_meta_read:3258: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_meta_read:3278: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
 LOG:  [smol] smol_beginscan:1643: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
 LOG:  [smol] smol_beginscan:1645: include[0]: len=8 align=i off=36 is_text=1
 LOG:  [smol] smol_beginscan:1645: include[1]: len=4 align=i off=48 is_text=0
-LOG:  [smol] smol_meta_read:3258: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_find_first_leaf:4124: find_first_leaf: leaf=1 for bound=0 height=1
-LOG:  [smol] smol_gettuple:2015: gettuple init cur_blk=1
-LOG:  [smol] smol_gettuple:2045: seeked (binsearch) within leaf off=2
-LOG:  [smol] smol_gettuple:2562: tuple key varlena size=10
-LOG:  [smol] smol_gettuple:2562: tuple key varlena size=10
-LOG:  [smol] smol_gettuple:2963: advance to right leaf blk=4294967295
-LOG:  [smol] smol_endscan:2973: end scan
+LOG:  [smol] smol_meta_read:3278: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_find_first_leaf:4144: find_first_leaf: leaf=1 for bound=0 height=1
+LOG:  [smol] smol_gettuple:2026: gettuple init cur_blk=1
+LOG:  [smol] smol_gettuple:2056: seeked (binsearch) within leaf off=2
+LOG:  [smol] smol_gettuple:2582: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:2582: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:2983: advance to right leaf blk=4294967295
+LOG:  [smol] smol_endscan:2993: end scan
    k    |    v     | i 
 --------+----------+---
  key002 | value002 | 2
