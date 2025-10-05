@@ -50,7 +50,10 @@
       "Bash(apt-get:*)",
       "Bash(apt-get install:*)",
       "Bash(for:*)",
-      "Bash(pg_ctl:*)"
+      "Bash(pg_ctl:*)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_debug_log)",
+      "Bash(find:*)",
+      "Bash(timeout 120 python3 bench/bench_runner.py --full)"
     ],
     "deny": [],
     "ask": []

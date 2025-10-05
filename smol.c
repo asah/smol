@@ -771,6 +771,10 @@ typedef struct SmolScanOpaqueData
     bool        run_key_built;
     int16       run_key_vl_len; /* bytes in run_key_vl (VARHDR+payload) */
     char        run_key_vl[VARHDRSZ + 32];
+
+    /* Adaptive prefetching for bounded scans (slow-start to avoid over-prefetching) */
+    uint16      pages_scanned;     /* total pages successfully scanned (not skipped) */
+    uint16      adaptive_prefetch_depth; /* current prefetch depth (grows with scan progress) */
     bool        run_inc_built[16];
     int16       run_inc_vl_len[16];
     char        run_inc_vl[16][VARHDRSZ + 32];
@@ -1674,6 +1678,9 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_bsteps = 0;
     so->run_key_built = false;
     for (int i=0;i<16;i++){ so->run_inc_built[i]=false; so->run_inc_vl_len[i]=0; }
+    /* Initialize adaptive prefetch counters */
+    so->pages_scanned = 0;
+    so->adaptive_prefetch_depth = 0;
     scan->opaque = so;
     return scan;
 }
@@ -2820,25 +2827,73 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
         else
         {
+            /* Increment pages_scanned for adaptive prefetch tracking (non-parallel path) */
+            if (dir != BackwardScanDirection && so->pages_scanned < 65535)
+                so->pages_scanned++;
+
             /* Read rightlink BEFORE releasing buffer */
             op = smol_page_opaque(page);
             next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
-            /* Prefetch the next leaf (forward scans) to overlap I/O */
+
+            /* Adaptive prefetching with slow-start for bounded scans
+             * Avoids over-prefetching for equality lookups and narrow ranges
+             * while ramping up for larger scans */
             if (dir != BackwardScanDirection && BlockNumberIsValid(next))
             {
-                PrefetchBuffer(idx, MAIN_FORKNUM, next);
-                SMOL_LOGF("NON-PARALLEL: prefetch_depth=%d, next=%u", smol_prefetch_depth, next);
-                if (smol_prefetch_depth > 1)
+                /* Determine effective prefetch depth using adaptive slow-start */
+                int effective_depth;
+
+                if (so->have_k1_eq)
                 {
-                    SMOL_LOG("NON-PARALLEL: INSIDE prefetch_depth > 1 branch!");
-                    BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
-                    for (int d=2; d<=smol_prefetch_depth; d++)
+                    /* Equality lookups: No prefetch at all for first 2 pages, then minimal
+                     * This eliminates 496-page prefetch waste for single-row queries */
+                    if (so->pages_scanned < 2)
+                        effective_depth = 0;  /* No prefetch for first 2 pages */
+                    else if (so->pages_scanned < 5)
+                        effective_depth = 1;  /* Minimal prefetch if scan continues */
+                    else
+                        effective_depth = Min(2, smol_prefetch_depth); /* Cap at 2 for equality */
+                }
+                else if (so->have_upper_bound)
+                {
+                    /* Bounded range queries: Slow-start ramp
+                     * Start conservatively, increase as we confirm scan is large */
+                    if (so->pages_scanned < 3)
+                        effective_depth = 0;  /* No prefetch for first 3 pages (test range size) */
+                    else if (so->pages_scanned < 8)
+                        effective_depth = 1;  /* Minimal prefetch for narrow ranges */
+                    else if (so->pages_scanned < 20)
+                        effective_depth = 2;  /* Moderate prefetch for medium ranges */
+                    else if (so->pages_scanned < 50)
+                        effective_depth = 4;  /* Growing confidence */
+                    else
+                        effective_depth = Min((int)(so->pages_scanned / 10), smol_prefetch_depth);
+                }
+                else
+                {
+                    /* Unbounded forward scans: Use full prefetch depth immediately
+                     * These benefit from aggressive prefetching */
+                    effective_depth = smol_prefetch_depth;
+                }
+
+                /* Prefetch with computed depth */
+                if (effective_depth > 0)
+                {
+                    PrefetchBuffer(idx, MAIN_FORKNUM, next);
+                    SMOL_LOGF("NON-PARALLEL: adaptive_prefetch_depth=%d pages_scanned=%u next=%u",
+                              effective_depth, so->pages_scanned, next);
+
+                    if (effective_depth > 1)
                     {
-                        BlockNumber pb = next + (BlockNumber) (d-1);
-                        if (pb < nblocks)
-                            PrefetchBuffer(idx, MAIN_FORKNUM, pb);
-                        else
-                            break;
+                        BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
+                        for (int d = 2; d <= effective_depth; d++)
+                        {
+                            BlockNumber pb = next + (BlockNumber) (d - 1);
+                            if (pb < nblocks)
+                                PrefetchBuffer(idx, MAIN_FORKNUM, pb);
+                            else
+                                break;
+                        }
                     }
                 }
             }

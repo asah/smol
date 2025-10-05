@@ -90,8 +90,9 @@ class Benchmark:
                  includes=2, warm=True, workers=0):
         """Run a single benchmark case"""
 
-        # Create table
-        table_name = f"bench_{case_id}"
+        # Create table (sanitize case_id for SQL identifiers)
+        safe_case_id = case_id.replace('.', '_').replace('-', '_')
+        table_name = f"bench_{safe_case_id}"
         idx_name = f"{table_name}_{engine}"
 
         print(f"  {colorize('▸', Colors.OKBLUE)} {case_id:8s} {engine:5s} "
@@ -124,7 +125,11 @@ class Benchmark:
         build_ms = run_sql_timing(create_idx_sql)
 
         # Get index size
-        size_bytes = int(run_sql(f"SELECT pg_relation_size('{idx_name}');"))
+        size_result = run_sql(f"SELECT pg_relation_size('{idx_name}');")
+        if not size_result or not size_result.strip():
+            print(f"\n{colorize('✗ Error:', Colors.FAIL)} Index '{idx_name}' does not exist or query failed")
+            return None
+        size_bytes = int(size_result)
         size_mb = size_bytes / (1024 * 1024)
 
         # Configure query
@@ -224,8 +229,11 @@ class Benchmark:
         # Test different selectivities
         self.print_subheader("Selectivity Tests (1M rows, unique keys)")
         for sel in [0.001, 0.01, 0.1, 0.5, 1.0]:
-            self.run_case(f's{sel}', 'btree', 1000000, 'unique', sel, 2, True)
-            self.run_case(f's{sel}', 'smol', 1000000, 'unique', sel, 2, True)
+            result_btree = self.run_case(f's{sel}', 'btree', 1000000, 'unique', sel, 2, True)
+            result_smol = self.run_case(f's{sel}', 'smol', 1000000, 'unique', sel, 2, True)
+            if result_btree is None or result_smol is None:
+                print(f"{colorize(f'⚠ Skipping selectivity test for sel={sel}', Colors.WARNING)}")
+                continue
 
         # Test duplicate patterns
         self.print_subheader("Duplicate Pattern Tests (1M rows)")
