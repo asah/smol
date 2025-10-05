@@ -46,6 +46,8 @@
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "portability/instr_time.h"
+#include "utils/selfuncs.h"
+#include "optimizer/cost.h"
 /* Parallel build support */
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -813,6 +815,7 @@ static BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
 static int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
 static int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, uint16 key_len, bool key_byval, Datum bound);
 static inline int smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp);
+static inline bool smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool *stop_scan_out);
 static bytea *smol_options(Datum reloptions, bool validate);
 static bool smol_validate(Oid opclassoid);
 static bool smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so);
@@ -899,6 +902,73 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
 #else
     return 0; /* GCOV_EXCL_LINE - unreachable without SMOL_PLANNER_BACKWARD_UPPER */
 #endif
+}
+
+/* Page-level bounds checking: returns true if page might have matching tuples
+ * This optimization dramatically improves range scans with upper bounds (BETWEEN) by:
+ * 1. Stopping scan early when all future pages > upper_bound
+ * 2. Checking equality bounds to stop when past the equal value
+ *
+ * Note: Lower bounds (>=, >) are NOT checked here because SMOL uses smol_find_first_leaf()
+ * to seek directly to the starting page, then binary searches within that page. All pages
+ * from the starting point forward are guaranteed to have keys >= lower_bound.
+ *
+ * For query "WHERE k BETWEEN 10000 AND 20000" on 1M rows:
+ * - Before: Scans from 10000 to end of index (scanning 980K irrelevant rows)
+ * - After: Stops at first page where min_key > 20000
+ * - Speedup: Dramatic reduction for BETWEEN queries
+ */
+static inline bool
+smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool *stop_scan_out)
+{
+    *stop_scan_out = false;
+
+    /* No upper bounds: all pages match (lower bounds handled by initial seek) */
+    if (!so->have_upper_bound && !so->have_k1_eq)
+        return true;
+
+    /* Empty page: skip */
+    if (nitems == 0)
+        return false;
+
+    /* Get first key on page for bounds checking */
+    char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude);
+
+    /* For zero-copy pages, skip IndexTuple header to get actual key data */
+    if (so->page_is_zerocopy)
+    {
+        first_key += sizeof(IndexTupleData);
+    }
+
+    /* Upper bound check: if first key exceeds upper bound, stop entire scan
+     * Since keys are sorted across pages (via rightlinks), if first_key > upper_bound
+     * then ALL future pages will also exceed upper_bound */
+    if (so->have_upper_bound)
+    {
+        int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
+        if (so->upper_bound_strict ? (c >= 0) : (c > 0))
+        {
+            /* first_key > upper_bound → past end of range, stop scan */
+            *stop_scan_out = true;
+            return false;
+        }
+    }
+
+    /* Equality bound check: if first key exceeds the equality value, stop scan
+     * For queries like "WHERE k = 50000", once we see a key > 50000, we're done */
+    if (so->have_k1_eq)
+    {
+        int c = smol_cmp_keyptr_to_bound(so, first_key);
+        if (c > 0)
+        {
+            /* first_key > equality_bound → past the equal value, stop scan */
+            *stop_scan_out = true;
+            return false;
+        }
+    }
+
+    /* Page might have matching tuples, process it */
+    return true;
 }
 
 static inline char *smol12_row_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
@@ -2774,6 +2844,50 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Pre-pin next leaf and rebuild cache for two-col */
             Buffer nbuf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
             Page np = BufferGetPage(nbuf);
+
+            /* Page-level bounds checking: stop scan early for BETWEEN and equality queries
+             * Only applies to single-column indexes with forward scans that have upper bounds or equality */
+            if (!so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq))
+            {
+                uint16 n_check = smol_leaf_nitems(np);
+
+                if (n_check > 0)
+                {
+                    /* Detect page format for zero-copy bounds checking */
+                    ItemId iid_check = PageGetItemId(np, FirstOffsetNumber);
+                    char *base_check = (char *) PageGetItem(np, iid_check);
+                    uint16 tag_check; memcpy(&tag_check, base_check, sizeof(uint16));
+                    bool page_is_zerocopy_check = (tag_check == SMOL_TAG_ZEROCOPY);
+
+                    /* Temporarily set format for bounds checking */
+                    bool saved_zerocopy = so->page_is_zerocopy;
+                    so->page_is_zerocopy = page_is_zerocopy_check;
+
+                    bool stop_scan = false;
+                    bool matches = smol_page_matches_scan_bounds(so, np, n_check, &stop_scan);
+
+                    /* Restore original format flag */
+                    so->page_is_zerocopy = saved_zerocopy;
+
+                    if (!matches)
+                    {
+                        /* Page doesn't match bounds */
+                        ReleaseBuffer(nbuf);
+                        if (stop_scan)
+                        {
+                            /* Past upper bound, stop entire scan */
+                            so->have_pin = false;
+                            so->cur_buf = InvalidBuffer;
+                            so->cur_blk = InvalidBlockNumber;
+                            return false;
+                        }
+                        /* Page below lower bound, skip to next page */
+                        so->cur_blk = InvalidBlockNumber;
+                        continue;
+                    }
+                }
+            }
+
             if (so->two_col)
             {
                 so->leaf_n = smol12_leaf_nrows(np);
@@ -3092,48 +3206,33 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                   Selectivity *indexSelectivity, double *indexCorrelation,
                   double *indexPages)
 {
-    (void) loop_count;
-    IndexOptInfo *idx = path->indexinfo;
-    double pages = (idx->pages > 0 ? idx->pages : 1);
-    double tuples = (idx->tuples > 0 ? idx->tuples : 1);
-    double qual_selec = 0.5;     /* default */
-    double cpu_per_tuple = smol_cost_tup;
-    double page_cost = smol_cost_page;
-    double nscan;
+    GenericCosts costs;
 
-    /* Heuristic selectivity: favor equality/range on leading key */
-    bool have_leading = false;
-    bool likely_eq = false;
-    if (path->indexclauses != NIL)
+    /* Use genericcostestimate for standard index cost calculation with parallel support */
+    MemSet(&costs, 0, sizeof(costs));
+    genericcostestimate(root, path, loop_count, &costs);
+
+    /* Apply SMOL-specific adjustments */
+    /* SMOL has lower per-page I/O cost than random access indexes like BTREE
+     * due to sequential leaf traversal via rightlinks (contiguous I/O pattern).
+     * Adjust costs if smol_cost_page is configured lower than default. */
+    if (smol_cost_page < 1.0 && costs.spc_random_page_cost > 0.0)
     {
-        ListCell *lc;
-        foreach(lc, path->indexclauses)
-        {
-            IndexClause *ic = (IndexClause *) lfirst(lc);
-            if (ic && ic->indexcol == 0)
-            {
-                have_leading = true;
-                /* If exactly one clause on leading key, assume equality-selective */
-                likely_eq = true;
-                break;
-            }
-        }
-        if (have_leading)
-            qual_selec = likely_eq ? smol_selec_eq : smol_selec_range;
-        else
-            qual_selec = 0.5; /* scan without leading key is undesirable */
+        /* Scale down the I/O cost portion proportionally */
+        double io_adjustment = smol_cost_page;
+        Cost io_cost = costs.numIndexPages * costs.spc_random_page_cost;
+        Cost cpu_cost = costs.indexTotalCost - io_cost;
+        costs.indexTotalCost = (io_cost * io_adjustment) + cpu_cost;
     }
 
-    nscan = tuples * qual_selec;
-    *indexStartupCost = 0.0;
-    *indexPages = pages;
-    *indexCorrelation = 0.5;
-    *indexSelectivity = (Selectivity) qual_selec;
-    *indexTotalCost = (pages * page_cost) + (nscan * cpu_per_tuple);
+    /* SMOL has slightly higher per-tuple CPU cost due to format detection overhead,
+     * but genericcostestimate already accounts for this via cpu_index_tuple_cost GUC */
 
-    /* Discourage scans with no leading-key quals strongly */
-    if (!have_leading)
-        *indexTotalCost += 1e6;
+    *indexStartupCost = costs.indexStartupCost;
+    *indexTotalCost = costs.indexTotalCost;
+    *indexSelectivity = costs.indexSelectivity;
+    *indexCorrelation = costs.indexCorrelation;
+    *indexPages = costs.numIndexPages;
 }
 
 /* VACUUM/cleanup stub: SMOL is read-only; nothing to reclaim. */

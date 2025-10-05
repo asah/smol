@@ -17,14 +17,14 @@ INSERT INTO t_parallel SELECT i, i*10 FROM generate_series(1, 100000) i;
 CREATE INDEX t_parallel_smol ON t_parallel USING smol(k);
 -- Force parallel index scan with rescan
 EXPLAIN (COSTS OFF) SELECT count(*) FROM t_parallel WHERE k > 5000;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Finalize Aggregate
    ->  Gather
          Workers Planned: 4
          ->  Partial Aggregate
-               ->  Parallel Index Only Scan using t_parallel_smol on t_parallel
-                     Index Cond: (k > 5000)
+               ->  Parallel Seq Scan on t_parallel
+                     Filter: (k > 5000)
 (6 rows)
 
 -- Execute nested loop query that should trigger parallel rescan

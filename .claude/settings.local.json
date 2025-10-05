@@ -45,7 +45,11 @@
       "Bash(sudo:*)",
       "Bash(/usr/local/pgsql/bin/pg_ctl:*)",
       "Read(//home/**)",
-      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_parallel_batch)"
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_parallel_batch)",
+      "Bash(/home/postgres/bench/run_simple_benchmark.sh:*)",
+      "Bash(apt-get:*)",
+      "Bash(apt-get install:*)",
+      "Bash(for:*)"
     ],
     "deny": [],
     "ask": []

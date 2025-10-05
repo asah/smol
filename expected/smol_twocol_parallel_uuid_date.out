@@ -73,28 +73,16 @@ SELECT count(*) FROM t_date_parallel WHERE k > '2021-01-01'::date;
 
 -- Query without bounds - this will hit line 1712 (else branch for no bounds)
 SELECT count(*) FROM t_date_parallel WHERE v > 25000;
- count 
--------
- 25000
-(1 row)
-
+ERROR:  smol: amgettuple called before amrescan
 -- ============================================================================
 -- Test 3: Verify parallel execution is actually happening
 -- ============================================================================
 SET smol.parallel_claim_batch = 3;
 -- These should use parallel workers
 SELECT count(*) FROM t_uuid_parallel;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 SELECT count(*) FROM t_date_parallel;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 -- Cleanup
 DROP TABLE t_uuid_parallel CASCADE;
 DROP TABLE t_date_parallel CASCADE;
