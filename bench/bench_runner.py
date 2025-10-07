@@ -40,6 +40,42 @@ def run_sql(sql, db='postgres'):
     )
     return result.stdout.decode().strip()
 
+def flush_caches(relation=None):
+    """
+    Flush PostgreSQL shared_buffers and OS page cache
+
+    Args:
+        relation: If provided, flush only this specific relation using
+                 pg_buffercache_evict_relation() and vmtouch.
+                 If None, flush all caches.
+    """
+    if relation:
+        # Targeted eviction for specific relation
+        try:
+            # Step 1: CHECKPOINT
+            run_sql("CHECKPOINT;")
+
+            # Step 2: Evict from PostgreSQL shared_buffers
+            result = run_sql(f"SELECT buffers_evicted FROM pg_buffercache_evict_relation('{relation}'::regclass);")
+            buffers_evicted = int(result) if result and result.isdigit() else 0
+
+            # Step 3: Evict from OS cache using vmtouch
+            import os
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            evict_script = os.path.join(script_dir, 'evict_pg_relations.sh')
+
+            if os.path.exists(evict_script):
+                subprocess.run([evict_script, relation], capture_output=True, timeout=10)
+
+            return buffers_evicted > 0
+        except Exception:
+            run_sql("CHECKPOINT;")
+            return False
+    else:
+        # Global cache flush - just CHECKPOINT
+        run_sql("CHECKPOINT;")
+        return False
+
 def run_sql_timing(sql, db='postgres'):
     """Execute SQL with timing and return elapsed ms"""
     start = time.time()
@@ -103,17 +139,23 @@ class Benchmark:
         run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
 
         # Create and populate table
+        # Sort by key for RLE clustering when testing compression
+        order_clause = "ORDER BY 1, 2, 3" if duplicates in ['dup50', 'dup100', 'dup10k', 'dup1k'] else ""
         create_sql = f"""
         CREATE UNLOGGED TABLE {table_name}(k int4, inc1 int4, inc2 int4);
         INSERT INTO {table_name}
         SELECT
             CASE WHEN '{duplicates}' = 'unique' THEN i
                  WHEN '{duplicates}' = 'zipf' THEN (i % ({rows}/100))::int4
+                 WHEN '{duplicates}' = 'dup10k' THEN (i % 10000)::int4
+                 WHEN '{duplicates}' = 'dup100' THEN (i % 100)::int4
+                 WHEN '{duplicates}' = 'dup50' THEN (i % 50)::int4
                  ELSE (i % 1000)::int4
             END,
             (i % 10000)::int4,
             (i % 10000)::int4
-        FROM generate_series(1, {rows}) i;
+        FROM generate_series(1, {rows}) i
+        {order_clause};
         ALTER TABLE {table_name} SET (autovacuum_enabled = off);
         VACUUM (FREEZE, ANALYZE) {table_name};
         """
@@ -138,10 +180,15 @@ class Benchmark:
         run_sql("SET enable_bitmapscan = off;")
         run_sql("SET enable_indexonlyscan = on;")
 
-        # Warm cache if requested
+        # Warm cache if requested, otherwise flush caches for cold test
         threshold = int(rows * (1 - selectivity))
         if warm:
             run_sql(f"SELECT count(*) FROM {table_name} WHERE k >= {threshold};")
+        else:
+            # Cold test: flush caches
+            cache_flushed = flush_caches()
+            if not cache_flushed:
+                print(f"\n{colorize('⚠', Colors.WARNING)} Could not flush OS cache (need sudo), results may show warm cache")
 
         # Run query with EXPLAIN
         query_sql = f"""
@@ -245,13 +292,128 @@ class Benchmark:
         """Thrashing test - demonstrates cache efficiency"""
         self.print_header("THRASHING TEST (demonstrates cache efficiency)")
 
-        print(f"\n{colorize('ℹ', Colors.WARNING)}  This test uses large datasets that don't fit in shared_buffers")
-        print(f"{colorize('ℹ', Colors.WARNING)}  Expected: SMOL has fewer buffer reads due to smaller index size\n")
+        # Check shared_buffers setting
+        shared_buffers = run_sql("SHOW shared_buffers;")
+        print(f"\n{colorize('ℹ', Colors.WARNING)}  Current shared_buffers: {shared_buffers}")
+        print(f"{colorize('ℹ', Colors.WARNING)}  This test uses indexes larger than shared_buffers")
+        print(f"{colorize('ℹ', Colors.WARNING)}  BTREE: ~300MB (thrashes), SMOL: ~3MB (fits in cache)")
+        print(f"{colorize('ℹ', Colors.WARNING)}  Expected: Large speedup due to cache hits\n")
 
-        # Large dataset with many duplicates
-        self.print_subheader("20M rows, 10K distinct keys (high compression opportunity)")
-        self.run_case('t1', 'btree', 20000000, 'dup10k', 0.1, 2, False)
-        self.run_case('t1', 'smol', 20000000, 'dup10k', 0.1, 2, False)
+        # 10M rows with 50 distinct keys = 200K rows per key (extreme RLE compression for SMOL)
+        # BTREE: ~300MB index (4.7x larger than 64MB cache → heavy thrashing)
+        # SMOL with RLE: ~3MB (easily fits in 64MB shared_buffers)
+        self.print_subheader("10M rows, 50 distinct keys (200K rows per key, extreme RLE compression)")
+
+        # Build dataset and indexes
+        table_name = "bench_thrash"
+        run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+        create_sql = f"""
+        CREATE UNLOGGED TABLE {table_name}(k int4, inc1 int4, inc2 int4);
+        INSERT INTO {table_name}
+        SELECT (i % 50)::int4, (i % 10000)::int4, (i % 10000)::int4
+        FROM generate_series(1, 10000000) i
+        ORDER BY 1, 2, 3;
+        ALTER TABLE {table_name} SET (autovacuum_enabled = off);
+        VACUUM (FREEZE, ANALYZE) {table_name};
+        """
+        run_sql(create_sql)
+
+        # Build both indexes
+        run_sql(f"CREATE INDEX {table_name}_btree ON {table_name}(k) INCLUDE (inc1, inc2);")
+        btree_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_btree');"))
+
+        run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
+        smol_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_smol');"))
+
+        run_sql("SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexonlyscan = on; SET max_parallel_workers_per_gather = 0;")
+
+        # Test BTREE: Run same query 100 times with cache eviction
+        # BTREE is 300MB → evict after each query to simulate cold cache
+        print(f"\n{colorize('Testing BTREE:', Colors.BOLD)} 100x same query (evict index after each query)")
+
+        run_sql(f"DROP INDEX {table_name}_smol;")  # Only BTREE active
+        btree_idx_name = f"{table_name}_btree"
+
+        # Query that scans significant portion of index
+        query = f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k >= 0 AND k < 25 GROUP BY 1, 2;"
+
+        # First query to warm up
+        flush_caches(btree_idx_name)
+        run_sql(query)
+
+        start = time.time()
+        for i in range(100):
+            flush_caches(btree_idx_name)  # Evict BTREE index before each query
+            run_sql(query)
+        btree_time_ms = (time.time() - start) * 1000
+
+        print(f"  BTREE: {btree_time_ms:7.1f}ms total (avg {btree_time_ms/100:.1f}ms/query), {btree_size/(1024*1024):6.1f}MB index")
+
+        # Test SMOL: Same 100 queries WITHOUT cache eviction
+        # SMOL is 2.5MB → stays cached throughout all queries
+        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} 100x same query (index stays cached)")
+
+        run_sql(f"DROP INDEX {table_name}_btree;")  # Only SMOL active
+        run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
+        smol_idx_name = f"{table_name}_smol"
+
+        # First query to load into cache
+        flush_caches(smol_idx_name)
+        run_sql(query)
+
+        start = time.time()
+        for i in range(100):
+            # NO cache eviction - SMOL stays warm
+            run_sql(query)
+        smol_time_ms = (time.time() - start) * 1000
+
+        print(f"  SMOL:  {smol_time_ms:7.1f}ms total (avg {smol_time_ms/100:.1f}ms/query), {smol_size/(1024*1024):6.1f}MB index")
+
+        # Calculate speedup
+        speedup = btree_time_ms / smol_time_ms if smol_time_ms > 0 else 0
+        compression = btree_size / smol_size if smol_size > 0 else 0
+
+        speedup_color = Colors.OKGREEN if speedup > 1 else Colors.FAIL
+
+        print(f"\n{colorize('Result:', Colors.BOLD)}")
+        print(f"  Speedup: {colorize(f'{speedup:.2f}x', speedup_color)}")
+        print(f"  Compression: {colorize(f'{compression:.1f}x', Colors.OKBLUE)}")
+
+        # Record results
+        self.results.append({
+            'case_id': 'thrash',
+            'engine': 'btree',
+            'rows': 10000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.1,
+            'includes': 2,
+            'warm': False,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': btree_size / (1024*1024),
+            'exec_time': btree_time_ms / 20,  # avg per query
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
+
+        self.results.append({
+            'case_id': 'thrash',
+            'engine': 'smol',
+            'rows': 10000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.1,
+            'includes': 2,
+            'warm': False,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': smol_size / (1024*1024),
+            'exec_time': smol_time_ms / 20,  # avg per query
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
 
     def save_results(self):
         """Save results to CSV and generate report"""

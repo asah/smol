@@ -53,7 +53,15 @@
       "Bash(pg_ctl:*)",
       "Bash(env COVERAGE=1 make installcheck REGRESS=smol_debug_log)",
       "Bash(find:*)",
-      "Bash(timeout 120 python3 bench/bench_runner.py --full)"
+      "Bash(timeout 120 python3 bench/bench_runner.py --full)",
+      "Bash(head:*)",
+      "Bash(while read f)",
+      "Bash(do echo \"=== $f ===\")",
+      "Read(//usr/local/**)",
+      "Bash(COVERAGE=1 make installcheck REGRESS=smol_benchmark_quick)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_benchmark_quick)",
+      "Bash(/home/postgres/bench/flush_cache.sh:*)",
+      "Bash(vmtouch:*)"
     ],
     "deny": [],
     "ask": []

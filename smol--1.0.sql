@@ -4,6 +4,22 @@ RETURNS index_am_handler
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
 
+-- Inspection function to analyze SMOL index structure
+CREATE FUNCTION smol_inspect(regclass,
+    OUT total_pages int4,
+    OUT leaf_pages int4,
+    OUT zerocopy_pages int4,
+    OUT key_rle_pages int4,
+    OUT inc_rle_pages int4,
+    OUT zerocopy_pct numeric,
+    OUT compression_pct numeric)
+RETURNS record
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION smol_inspect(regclass) IS
+'Inspect SMOL index structure: returns page counts and format percentages (zero-copy vs RLE compression)';
+
 -- Test functions for coverage (call AM functions directly to bypass planner)
 CREATE FUNCTION smol_test_backward_scan(regclass)
 RETURNS integer

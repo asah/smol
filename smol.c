@@ -12,6 +12,7 @@
 
 #include "access/amapi.h"
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/itup.h"
 #include "access/relscan.h"
 #include "access/table.h"
@@ -22,6 +23,7 @@
 #include "catalog/index.h"
 #include "access/xlogdefs.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "port/atomics.h"
@@ -5476,6 +5478,123 @@ smol_test_backward_scan(PG_FUNCTION_ARGS)
  * are properly tested via SQL queries with forced parallel workers.
  * See sql/smol_coverage_direct.sql for the parallel scan tests.
  */
+
+/*
+ * smol_inspect - Inspect SMOL index structure and return statistics
+ *
+ * Returns a row with:
+ *   total_pages int4       - Total number of pages in the index
+ *   leaf_pages int4        - Number of leaf pages
+ *   zerocopy_pages int4    - Number of pages using zero-copy format
+ *   key_rle_pages int4     - Number of pages using key RLE compression
+ *   inc_rle_pages int4     - Number of pages using INCLUDE RLE compression
+ *   zerocopy_pct numeric   - Percentage of leaf pages using zero-copy
+ *   compression_pct numeric - Percentage of leaf pages using RLE (key or include)
+ */
+PG_FUNCTION_INFO_V1(smol_inspect);
+
+Datum
+smol_inspect(PG_FUNCTION_ARGS)
+{
+    Oid         indexoid = PG_GETARG_OID(0);
+    Relation    idx;
+    TupleDesc   tupdesc;
+    Datum       values[7];
+    bool        nulls[7];
+    HeapTuple   tuple;
+    BlockNumber nblocks;
+    BlockNumber blkno;
+    int32       total_pages = 0;
+    int32       leaf_pages = 0;
+    int32       zerocopy_pages = 0;
+    int32       key_rle_pages = 0;
+    int32       inc_rle_pages = 0;
+    Buffer      buf;
+    Page        page;
+    uint16      tag;
+
+    /* Open the index */
+    idx = index_open(indexoid, AccessShareLock);
+
+    /* Get total pages */
+    nblocks = RelationGetNumberOfBlocks(idx);
+    total_pages = nblocks;
+
+    /* Scan all pages to classify them */
+    for (blkno = 1; blkno < nblocks; blkno++)  /* Skip meta page 0 */
+    {
+        buf = ReadBuffer(idx, blkno);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        page = BufferGetPage(buf);
+
+        /* Check if it's a leaf page using opaque data */
+        if (PageGetSpecialSize(page) == sizeof(SmolPageOpaqueData))
+        {
+            SmolPageOpaqueData *opaque = (SmolPageOpaqueData *) PageGetSpecialPointer(page);
+            if (opaque->flags & SMOL_F_LEAF)
+            {
+                /* Leaf page - read format tag */
+                ItemId iid = PageGetItemId(page, FirstOffsetNumber);
+                if (iid != NULL && ItemIdIsNormal(iid))
+                {
+                    char *data = (char *) PageGetItem(page, iid);
+                    memcpy(&tag, data, sizeof(uint16));
+
+                    leaf_pages++;
+
+                    /* Check format tags - note that plain format has no tag, just nitems as uint16 */
+                    if (tag == SMOL_TAG_ZEROCOPY)
+                        zerocopy_pages++;
+                    else if (tag == SMOL_TAG_KEY_RLE)
+                        key_rle_pages++;
+                    else if (tag == SMOL_TAG_INC_RLE)
+                        inc_rle_pages++;
+                    /* If tag < 0x8000, it's plain format (nitems stored as first uint16) */
+                    else if (tag < 0x8000)
+                        zerocopy_pages++;  /* Plain format is treated as zero-copy at runtime */
+                }
+            }
+        }
+
+        UnlockReleaseBuffer(buf);
+    }
+
+    index_close(idx, AccessShareLock);
+
+    /* Build return tuple */
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("function returning record called in context that cannot accept type record")));
+
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    memset(nulls, 0, sizeof(nulls));
+
+    values[0] = Int32GetDatum(total_pages);
+    values[1] = Int32GetDatum(leaf_pages);
+    values[2] = Int32GetDatum(zerocopy_pages);
+    values[3] = Int32GetDatum(key_rle_pages);
+    values[4] = Int32GetDatum(inc_rle_pages);
+
+    /* Calculate percentages */
+    if (leaf_pages > 0)
+    {
+        double zerocopy_pct = (100.0 * zerocopy_pages) / leaf_pages;
+        double compression_pct = (100.0 * (key_rle_pages + inc_rle_pages)) / leaf_pages;
+
+        values[5] = DirectFunctionCall1(float8_numeric, Float8GetDatum(zerocopy_pct));
+        values[6] = DirectFunctionCall1(float8_numeric, Float8GetDatum(compression_pct));
+    }
+    else
+    {
+        values[5] = DirectFunctionCall1(float8_numeric, Float8GetDatum(0.0));
+        values[6] = DirectFunctionCall1(float8_numeric, Float8GetDatum(0.0));
+    }
+
+    tuple = heap_form_tuple(tupdesc, values, nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
 
 /*
  * Whitebox test functions to directly call internal tree navigation functions

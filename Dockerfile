@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libicu-dev \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
-    locales sudo less jq emacs gcovr \
+    locales sudo less jq emacs gcovr vmtouch \
   && pip3 install slack_sdk matplotlib --break-system-packages \
   && rm -rf /var/lib/apt/lists/*
 
@@ -37,6 +37,8 @@ RUN useradd -m -s /bin/bash -d /home/postgres postgres \
   && mkdir -p /home/postgres/pgdata /var/run/postgresql /usr/local/pgsql \
   && chown -R postgres:postgres /var/run/postgresql /usr/local/pgsql \
   && echo "PATH=$PATH:/usr/local/pgsql/bin" >> /home/postgres/.bashrc
+  && echo "postgres ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-postgres-nopasswd \
+  && chmod 0440 /etc/sudoers.d/90-postgres-nopasswd
 
 USER postgres
 WORKDIR /home/postgresql
