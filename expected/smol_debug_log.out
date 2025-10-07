@@ -33,22 +33,22 @@ SET enable_indexonlyscan = on;
 -- The debug log will show varlena sizes and scan behavior, but
 -- we've disabled logging during CREATE INDEX to avoid non-deterministic OIDs/timing
 SELECT k, v, i FROM t_debug WHERE k >= 'key002';
-LOG:  [smol] smol_handler:1079: enter smol_handler
-LOG:  [smol] smol_handler:1079: enter smol_handler
-LOG:  [smol] smol_meta_read:3333: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_beginscan:1589: beginscan nkeys=1 key_len=32
-LOG:  [smol] smol_meta_read:3333: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_beginscan:1647: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
-LOG:  [smol] smol_beginscan:1649: include[0]: len=8 align=i off=36 is_text=1
-LOG:  [smol] smol_beginscan:1649: include[1]: len=4 align=i off=48 is_text=0
-LOG:  [smol] smol_meta_read:3333: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_find_first_leaf:4199: find_first_leaf: leaf=1 for bound=0 height=1
-LOG:  [smol] smol_gettuple:2033: gettuple init cur_blk=1
-LOG:  [smol] smol_gettuple:2063: seeked (binsearch) within leaf off=2
-LOG:  [smol] smol_gettuple:2589: tuple key varlena size=10
-LOG:  [smol] smol_gettuple:2589: tuple key varlena size=10
-LOG:  [smol] smol_gettuple:3038: advance to right leaf blk=4294967295
-LOG:  [smol] smol_endscan:3048: end scan
+LOG:  [smol] smol_handler:1087: enter smol_handler
+LOG:  [smol] smol_handler:1087: enter smol_handler
+LOG:  [smol] smol_meta_read:3427: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1683: beginscan nkeys=1 key_len=32
+LOG:  [smol] smol_meta_read:3427: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1741: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
+LOG:  [smol] smol_beginscan:1743: include[0]: len=8 align=i off=36 is_text=1
+LOG:  [smol] smol_beginscan:1743: include[1]: len=4 align=i off=48 is_text=0
+LOG:  [smol] smol_meta_read:3427: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_find_first_leaf:4293: find_first_leaf: leaf=1 for bound=0 height=1
+LOG:  [smol] smol_gettuple:2127: gettuple init cur_blk=1
+LOG:  [smol] smol_gettuple:2157: seeked (binsearch) within leaf off=2
+LOG:  [smol] smol_gettuple:2683: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:2683: tuple key varlena size=10
+LOG:  [smol] smol_gettuple:3132: advance to right leaf blk=4294967295
+LOG:  [smol] smol_endscan:3142: end scan
    k    |    v     | i 
 --------+----------+---
  key002 | value002 | 2

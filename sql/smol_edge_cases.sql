@@ -13,15 +13,15 @@ INSERT INTO t_3col VALUES (1, 2, 3);
 CREATE INDEX t_3col_smol ON t_3col USING smol(a, b, c);
 \set ON_ERROR_STOP 1
 
--- Test 2: Two-column + INCLUDE (not supported)
+-- Test 2: Two-column + INCLUDE (now supported)
 DROP TABLE IF EXISTS t_2col_inc CASCADE;
 CREATE TABLE t_2col_inc(k1 int, k2 int, inc1 int);
 INSERT INTO t_2col_inc VALUES (1, 2, 3);
 
--- Should fail: INCLUDE not supported with two-column indexes
-\set ON_ERROR_STOP 0
+-- This should now succeed
 CREATE INDEX t_2col_inc_smol ON t_2col_inc USING smol(k1, k2) INCLUDE (inc1);
-\set ON_ERROR_STOP 1
+-- Verify it was created
+SELECT COUNT(*) > 0 AS index_exists FROM pg_indexes WHERE indexname = 't_2col_inc_smol';
 
 -- Test 3: Too many INCLUDE columns (>16)
 DROP TABLE IF EXISTS t_many_inc CASCADE;

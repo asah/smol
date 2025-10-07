@@ -1062,10 +1062,16 @@ static void smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, boo
 /* Single-key + INCLUDE collection (generic fixed-length include attrs) */
 typedef struct CollectIncCtx {
     /* key collection: either int64 (fixed-width ints) or fixed-size bytes for text32 */
-    int64 **pk;           /* when !key_is_text32 */
-    char  **pkbytes;      /* when key_is_text32 */
+    int64 **pk;           /* when !key_is_text32 && nkeyatts==1 */
+    char  **pkbytes;      /* when key_is_text32 && nkeyatts==1 */
     uint16 key_len;       /* 8/16/32 for text */
     bool   key_is_text32; /* key is TEXTOID packed to key_len */
+    /* two-key collection */
+    int nkeyatts;         /* 1 or 2 */
+    char **pk1buf;        /* first key buffer for 2-key */
+    char **pk2buf;        /* second key buffer for 2-key */
+    uint16 key_len2;      /* length of second key */
+    bool byval1, byval2;  /* pass-by-value flags for 2-key */
     /* include buffers (pointers-to-pointers so we can grow/assign) */
     char **pi[16];
     uint16 ilen[16]; bool ibyval[16]; bool itext[16];
@@ -1188,15 +1194,13 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 ereport(ERROR, (errmsg("smol supports fixed-length key types only (attno=2)")));
             key_len2 = (uint16) typlen;
         }
-        if (ninclude > 0)
-            ereport(ERROR, (errmsg("smol INCLUDE columns currently supported only for single-key indexes")));
     }
     /* ninclude is computed from natts (uint16) minus nkeyatts (int16), result cannot be negative */
     Assert(ninclude >= 0);
 
-    if (nkeyatts == 1 && ninclude > 0)
+    if (ninclude > 0)
     {
-        /* Single-key with INCLUDE (fixed-width ints or text) */
+        /* INCLUDE columns (fixed-width ints or text) - supports single or multi-key indexes */
         int inc_count = ninclude;
         uint16 inc_lens[16]; bool inc_byval[16]; bool inc_is_text[16];
         if (inc_count > 16)
@@ -1222,11 +1226,22 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         int64 *karr = NULL;
         char *incarr[16]; memset(incarr, 0, sizeof(incarr));
         CollectIncCtx cctx; memset(&cctx, 0, sizeof(cctx));
-        char *kbytes = NULL;
+        char *kbytes = NULL, *k1buf = NULL, *k2buf = NULL;
+        cctx.nkeyatts = nkeyatts;
         cctx.pk = &karr;
         cctx.pkbytes = &kbytes;
         cctx.key_is_text32 = (atttypid == TEXTOID);
         cctx.key_len = key_len;
+        /* Setup two-key fields if needed */
+        if (nkeyatts == 2)
+        {
+            cctx.pk1buf = &k1buf;
+            cctx.pk2buf = &k2buf;
+            cctx.key_len2 = key_len2;
+            int16 l; bool bv; char al;
+            get_typlenbyvalalign(atttypid, &l, &bv, &al); cctx.byval1 = bv;
+            get_typlenbyvalalign(atttypid2, &l, &bv, &al); cctx.byval2 = bv;
+        }
         for (int i=0;i<inc_count;i++){ cctx.pi[i] = &incarr[i]; cctx.ilen[i] = inc_lens[i]; cctx.ibyval[i] = inc_byval[i]; cctx.itext[i] = inc_is_text[i]; }
         cctx.pcap=&cap; cctx.pcount=&n; cctx.incn=inc_count;
         table_index_build_scan(heap, index, indexInfo, true, true, smol_build_cb_inc, (void *) &cctx, NULL);
@@ -1269,59 +1284,136 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         /* Build permutation via radix sort */
         if (n > 0)
         {
-            uint32 *idx = (uint32 *) palloc(n * sizeof(uint32));
-            for (Size i = 0; i < n; i++) idx[i] = (uint32) i;
             char *sinc[16]; for (int i=0;i<inc_count;i++) sinc[i] = (char *) palloc(((Size) n) * inc_lens[i]);
-            if (!cctx.key_is_text32)
+
+            if (nkeyatts == 2)
             {
-                /* radix sort by int64 key */
-                uint64 *norm = (uint64 *) palloc(n * sizeof(uint64));
-                uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
-                for (Size i = 0; i < n; i++) norm[i] = smol_norm64(karr[i]);
-                smol_radix_sort_idx_u64(norm, idx, tmp, n);
-                pfree(norm); pfree(tmp);
-                /* Apply permutation */
-                int64 *sk = (int64 *) palloc(n * sizeof(int64));
-                for (Size i = 0; i < n; i++)
-                {
-                    uint32 j = idx[i]; sk[i] = karr[j];
-                    for (int c = 0; c < inc_count; c++)
-                        memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
-                }
-                pfree(idx);
-                SMOL_LOGF("build phase: write start n=%zu (includes=%d)", (size_t) n, inc_count);
-                smol_build_tree1_inc_from_sorted(index, sk, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
-                for (int i=0;i<inc_count;i++) pfree(sinc[i]);
-                pfree(sk);
-            }
-            else
-            {
-                /* Text32: sort by binary memcmp on fixed-size keys */
-                /* n * key_len */
-                /* qsort indices by key bytes */
-                g_k1buf = kbytes; g_key_len1 = key_len; /* reuse globals for simple cmp */
-                qsort(idx, n, sizeof(uint32), smol_qsort_cmp_bytes);
-                /* Apply permutation */
-                char *skeys = (char *) palloc(((Size) n) * key_len);
+                /* Two-key path: sort pairs then write with INCLUDE */
+                /* Use index-based sort (qsort) to easily apply permutation to INCLUDE columns */
+                FmgrInfo cmp1, cmp2; Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation; Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
+                fmgr_info_copy(&cmp1, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
+                fmgr_info_copy(&cmp2, index_getprocinfo(index, 2, 1), CurrentMemoryContext);
+                uint32 *idx = (uint32 *) palloc(n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
+                /* set global comparator context */
+                g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
+                qsort(idx, n, sizeof(uint32), smol_pair_qsort_cmp);
+                INSTR_TIME_SET_CURRENT(t_sort_end);
+                /* Apply permutation to INCLUDE columns */
                 for (Size i = 0; i < n; i++)
                 {
                     uint32 j = idx[i];
-                    memcpy(skeys + ((size_t) i * key_len), kbytes + ((size_t) j * key_len), key_len);
                     for (int c = 0; c < inc_count; c++)
                         memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
                 }
+                /* init meta if new */
+                if (RelationGetNumberOfBlocks(index) == 0)
+                {
+                    Buffer mb = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+                    LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
+                    SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->inc_count=inc_count;
+                    for (int i=0;i<inc_count;i++) { m->inc_len[i]=inc_lens[i]; }
+                    MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
+                }
+                /* Write leaves in two-key + INCLUDE layout */
+                Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
+                while (i < n)
+                {
+                    Buffer buf = smol_extend(index); Page page = BufferGetPage(buf); smol_init_page(buf, true, InvalidBlockNumber);
+                    Size fs = PageGetFreeSpace(page); Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
+                    Size header = sizeof(uint16);
+                    Size perrow = (Size) key_len + (Size) key_len2;
+                    for (int c=0;c<inc_count;c++) perrow += inc_lens[c];
+                    Size maxn = (avail > header) ? ((avail - header) / perrow) : 0; Size rem = n - i; Size n_this = (rem < maxn) ? rem : maxn;
+                    if (n_this == 0) ereport(ERROR,(errmsg("smol: two-col+INCLUDE row too large for page")));
+                    memcpy(scratch, &n_this, sizeof(uint16)); char *p = scratch + sizeof(uint16);
+                    /* Use index permutation to access sorted data */
+                    for (Size j=0;j<n_this;j++)
+                    {
+                        uint32 id = idx[i+j];
+                        memcpy(p, k1buf + (size_t) id * key_len, key_len); p += key_len;
+                        memcpy(p, k2buf + (size_t) id * key_len2, key_len2); p += key_len2;
+                        for (int c=0;c<inc_count;c++) { memcpy(p, sinc[c] + (size_t) (i+j) * inc_lens[c], inc_lens[c]); p += inc_lens[c]; }
+                    }
+                    Size sz = (Size) (p - scratch);
+                    OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
+                    Assert(off != InvalidOffsetNumber); (void) off;
+                    MarkBufferDirty(buf); BlockNumber cur = BufferGetBlockNumber(buf); UnlockReleaseBuffer(buf);
+                    if (BlockNumberIsValid(prev)) { Buffer pb = ReadBuffer(index, prev); LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE); Page pp=BufferGetPage(pb); smol_page_opaque(pp)->rightlink=cur; MarkBufferDirty(pb); UnlockReleaseBuffer(pb);} prev = cur; i += n_this;
+                }
+                Buffer mb = ReadBuffer(index, 0); LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); SmolMeta *m = smol_meta_ptr(pg); m->root_blkno = 1; m->height = 1; MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
                 pfree(idx);
-                SMOL_LOGF("build phase: write start n=%zu (includes=%d, text32)", (size_t) n, inc_count);
-                smol_build_text_inc_from_sorted(index, (const char *) skeys, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
+                pfree(scratch);
                 for (int i=0;i<inc_count;i++) pfree(sinc[i]);
-                pfree(skeys);
-                pfree(kbytes);
+                if (k1buf) pfree(k1buf);
+                if (k2buf) pfree(k2buf);
+            }
+            else  /* nkeyatts == 1 */
+            {
+                uint32 *idx = (uint32 *) palloc(n * sizeof(uint32));
+                for (Size i = 0; i < n; i++) idx[i] = (uint32) i;
+                if (!cctx.key_is_text32)
+                {
+                    /* radix sort by int64 key */
+                    uint64 *norm = (uint64 *) palloc(n * sizeof(uint64));
+                    uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
+                    for (Size i = 0; i < n; i++) norm[i] = smol_norm64(karr[i]);
+                    smol_radix_sort_idx_u64(norm, idx, tmp, n);
+                    pfree(norm); pfree(tmp);
+                    /* Apply permutation */
+                    int64 *sk = (int64 *) palloc(n * sizeof(int64));
+                    for (Size i = 0; i < n; i++)
+                    {
+                        uint32 j = idx[i]; sk[i] = karr[j];
+                        for (int c = 0; c < inc_count; c++)
+                            memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
+                    }
+                    pfree(idx);
+                    SMOL_LOGF("build phase: write start n=%zu (includes=%d)", (size_t) n, inc_count);
+                    smol_build_tree1_inc_from_sorted(index, sk, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
+                    for (int i=0;i<inc_count;i++) pfree(sinc[i]);
+                    pfree(sk);
+                }
+                else
+                {
+                    /* Text32: sort by binary memcmp on fixed-size keys */
+                    /* n * key_len */
+                    /* qsort indices by key bytes */
+                    g_k1buf = kbytes; g_key_len1 = key_len; /* reuse globals for simple cmp */
+                    qsort(idx, n, sizeof(uint32), smol_qsort_cmp_bytes);
+                    /* Apply permutation */
+                    char *skeys = (char *) palloc(((Size) n) * key_len);
+                    for (Size i = 0; i < n; i++)
+                    {
+                        uint32 j = idx[i];
+                        memcpy(skeys + ((size_t) i * key_len), kbytes + ((size_t) j * key_len), key_len);
+                        for (int c = 0; c < inc_count; c++)
+                            memcpy(sinc[c] + ((size_t) i * inc_lens[c]), incarr[c] + ((size_t) j * inc_lens[c]), inc_lens[c]);
+                    }
+                    pfree(idx);
+                    SMOL_LOGF("build phase: write start n=%zu (includes=%d, text32)", (size_t) n, inc_count);
+                    smol_build_text_inc_from_sorted(index, (const char *) skeys, (const char * const *) sinc, n, key_len, inc_count, inc_lens);
+                    for (int i=0;i<inc_count;i++) pfree(sinc[i]);
+                    pfree(skeys);
+                    pfree(kbytes);
+                }
             }
         }
         else
         {
             /* Empty index: still call build functions to initialize metapage if needed */
-            if (!cctx.key_is_text32)
+            if (nkeyatts == 2)
+            {
+                /* Initialize empty two-key INCLUDE index */
+                if (RelationGetNumberOfBlocks(index) == 0)
+                {
+                    Buffer mb = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+                    LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
+                    SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->inc_count=inc_count;
+                    for (int i=0;i<inc_count;i++) { m->inc_len[i]=inc_lens[i]; }
+                    MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
+                }
+            }
+            else if (!cctx.key_is_text32)
             {
                 smol_build_tree1_inc_from_sorted(index, NULL, NULL, 0, key_len, inc_count, inc_lens);
             }
@@ -5303,13 +5395,21 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
     cur = MAXALIGN(cur);
     so->itup->t_info = (unsigned short) (cur | (so->has_varwidth ? INDEX_VAR_MASK : 0));
 }
-/* Callback to collect single key + INCLUDE ints */
+/* Callback to collect keys (1 or 2) + INCLUDE columns */
 static void
 smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
     CollectIncCtx *c = (CollectIncCtx *) state; (void) rel; (void) tid; (void) tupleIsAlive;
-    if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
-    for (int i=0;i<c->incn;i++) if (isnull[1+i]) ereport(ERROR, (errmsg("smol INCLUDE does not support NULL values")));
+    int inc_offset = c->nkeyatts;  /* INCLUDE columns start after nkeyatts */
+
+    /* Check for NULL keys */
+    for (int k = 0; k < c->nkeyatts; k++)
+        if (isnull[k]) ereport(ERROR, (errmsg("smol does not support NULL key values")));
+
+    /* Check for NULL INCLUDEs */
+    for (int i=0;i<c->incn;i++)
+        if (isnull[inc_offset+i]) ereport(ERROR, (errmsg("smol INCLUDE does not support NULL values")));
+
     if (*c->pcount == *c->pcap)
     {
         /* Grow exponentially up to 8M entries, then linearly by 2M to avoid MaxAllocSize (1GB) */
@@ -5326,17 +5426,32 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
             newcap = oldcap * 2;
         else
             newcap = oldcap + 2097152;  /* +2M entries per grow */
-        if (!c->key_is_text32)
+
+        /* Grow key buffers based on nkeyatts */
+        if (c->nkeyatts == 1)
         {
-            int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
-            *c->pk = newk;
+            if (!c->key_is_text32)
+            {
+                int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
+                *c->pk = newk;
+            }
+            else
+            {
+                Size bytes = (Size) newcap * (Size) c->key_len;
+                char *newkb = (*c->pcap == 0) ? (char *) palloc(bytes) : (char *) repalloc(*c->pkbytes, bytes);
+                *c->pkbytes = newkb;
+            }
         }
-        else
+        else  /* nkeyatts == 2 */
         {
-            Size bytes = (Size) newcap * (Size) c->key_len;
-            char *newkb = (*c->pcap == 0) ? (char *) palloc(bytes) : (char *) repalloc(*c->pkbytes, bytes);
-            *c->pkbytes = newkb;
+            Size bytes1 = (Size) newcap * (Size) c->key_len;
+            Size bytes2 = (Size) newcap * (Size) c->key_len2;
+            char *newk1 = (*c->pcap == 0) ? (char *) palloc(bytes1) : (char *) repalloc(*c->pk1buf, bytes1);
+            char *newk2 = (*c->pcap == 0) ? (char *) palloc(bytes2) : (char *) repalloc(*c->pk2buf, bytes2);
+            *c->pk1buf = newk1;
+            *c->pk2buf = newk2;
         }
+
         for (int i=0;i<c->incn;i++)
         {
             Size bytes = (Size) newcap * (Size) c->ilen[i];
@@ -5346,28 +5461,67 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         }
         *c->pcap = newcap;
     }
-    if (!c->key_is_text32)
+
+    /* Collect keys based on nkeyatts */
+    if (c->nkeyatts == 1)
     {
-        (*c->pk)[*c->pcount] = DatumGetInt64(values[0]);
+        if (!c->key_is_text32)
+        {
+            (*c->pk)[*c->pcount] = DatumGetInt64(values[0]);
+        }
+        else
+        {
+            /* pack text key to fixed key_len bytes (C collation assumed) */
+            text *t = DatumGetTextPP(values[0]);
+            int blen = VARSIZE_ANY_EXHDR(t);
+            if (blen > (int) c->key_len)
+                ereport(ERROR, (errmsg("smol text32 key exceeds %u bytes", (unsigned) c->key_len))); /* GCOV_EXCL_LINE - error path for oversized TEXT32 keys */
+            char *dstk = (*c->pkbytes) + ((size_t) (*c->pcount) * (size_t) c->key_len);
+            const char *src = VARDATA_ANY(t);
+            if (blen > 0) memcpy(dstk, src, blen);
+            if (blen < (int) c->key_len) memset(dstk + blen, 0, c->key_len - blen);
+        }
     }
-    else
+    else  /* nkeyatts == 2 */
     {
-        /* pack text key to fixed key_len bytes (C collation assumed) */
-        text *t = DatumGetTextPP(values[0]);
-        int blen = VARSIZE_ANY_EXHDR(t);
-        if (blen > (int) c->key_len)
-            ereport(ERROR, (errmsg("smol text32 key exceeds %u bytes", (unsigned) c->key_len))); /* GCOV_EXCL_LINE - error path for oversized TEXT32 keys */
-        char *dstk = (*c->pkbytes) + ((size_t) (*c->pcount) * (size_t) c->key_len);
-        const char *src = VARDATA_ANY(t);
-        if (blen > 0) memcpy(dstk, src, blen);
-        if (blen < (int) c->key_len) memset(dstk + blen, 0, c->key_len - blen);
+        /* Collect first key */
+        char *dst1 = (*c->pk1buf) + ((size_t) (*c->pcount) * (size_t) c->key_len);
+        if (c->byval1)
+        {
+            switch (c->key_len)
+            {
+                case 1: { char v = DatumGetChar(values[0]); memcpy(dst1, &v, 1); break; }
+                case 2: { int16 v = DatumGetInt16(values[0]); memcpy(dst1, &v, 2); break; }
+                case 4: { int32 v = DatumGetInt32(values[0]); memcpy(dst1, &v, 4); break; }
+                case 8: { int64 v = DatumGetInt64(values[0]); memcpy(dst1, &v, 8); break; }
+            }
+        }
+        else
+            memcpy(dst1, DatumGetPointer(values[0]), c->key_len);
+
+        /* Collect second key */
+        char *dst2 = (*c->pk2buf) + ((size_t) (*c->pcount) * (size_t) c->key_len2);
+        if (c->byval2)
+        {
+            switch (c->key_len2)
+            {
+                case 1: { char v = DatumGetChar(values[1]); memcpy(dst2, &v, 1); break; }
+                case 2: { int16 v = DatumGetInt16(values[1]); memcpy(dst2, &v, 2); break; }
+                case 4: { int32 v = DatumGetInt32(values[1]); memcpy(dst2, &v, 4); break; }
+                case 8: { int64 v = DatumGetInt64(values[1]); memcpy(dst2, &v, 8); break; }
+            }
+        }
+        else
+            memcpy(dst2, DatumGetPointer(values[1]), c->key_len2);
     }
+
+    /* Collect INCLUDE columns */
     for (int i=0;i<c->incn;i++)
     {
         char *dst = (*c->pi[i]) + ((size_t)(*c->pcount) * (size_t) c->ilen[i]);
         if (c->itext[i])
         {
-            text *t = DatumGetTextPP(values[1+i]);
+            text *t = DatumGetTextPP(values[inc_offset+i]);
             int blen = VARSIZE_ANY_EXHDR(t);
             if (blen > (int) c->ilen[i]) ereport(ERROR, (errmsg("smol text32 INCLUDE exceeds 32 bytes")));
             const char *src = VARDATA_ANY(t);
@@ -5380,17 +5534,17 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
                 (errmsg("unexpected include byval len=%u", (unsigned) c->ilen[i])));
             switch (c->ilen[i])
             {
-                case 1: { char v = DatumGetChar(values[1+i]); memcpy(dst, &v, 1); break; }
-                case 2: { int16 v = DatumGetInt16(values[1+i]); memcpy(dst, &v, 2); break; }
-                case 4: { int32 v = DatumGetInt32(values[1+i]); memcpy(dst, &v, 4); break; }
-                case 8: { int64 v = DatumGetInt64(values[1+i]); memcpy(dst, &v, 8); break; }
+                case 1: { char v = DatumGetChar(values[inc_offset+i]); memcpy(dst, &v, 1); break; }
+                case 2: { int16 v = DatumGetInt16(values[inc_offset+i]); memcpy(dst, &v, 2); break; }
+                case 4: { int32 v = DatumGetInt32(values[inc_offset+i]); memcpy(dst, &v, 4); break; }
+                case 8: { int64 v = DatumGetInt64(values[inc_offset+i]); memcpy(dst, &v, 8); break; }
             }
         }
         else
         {
             SMOL_DEFENSIVE_CHECK(!c->itext[i] && !c->ibyval[i], ERROR,
                 (errmsg("unexpected INCLUDE column: not text and not byval")));
-            memcpy(dst, DatumGetPointer(values[1+i]), c->ilen[i]);
+            memcpy(dst, DatumGetPointer(values[inc_offset+i]), c->ilen[i]);
         }
     }
     (*c->pcount)++;

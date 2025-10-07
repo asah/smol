@@ -373,22 +373,21 @@ BEGIN
     END;
     DROP TABLE t_err_varlena_k2 CASCADE;
 END $$;
--- Test 22: Error path - INCLUDE with 2-key index (line 706)
+-- Test 22: Two-key + INCLUDE now supported
 DO $$
+DECLARE
+    idx_exists boolean;
 BEGIN
-    CREATE UNLOGGED TABLE t_err_2key_inc(k1 int4, k2 int4, v int4);
-    BEGIN
-        CREATE INDEX t_err_2key_inc_smol ON t_err_2key_inc USING smol(k1, k2) INCLUDE (v);
-        RAISE EXCEPTION 'Expected error for 2-key + INCLUDE was not raised';
-    EXCEPTION
-        WHEN OTHERS THEN
-            IF SQLERRM LIKE '%INCLUDE columns currently supported only for single-key%' THEN
-                RAISE NOTICE 'Correctly caught 2-key+INCLUDE error';
-            ELSE
-                RAISE;
-            END IF;
-    END;
-    DROP TABLE t_err_2key_inc CASCADE;
+    CREATE UNLOGGED TABLE t_2key_inc(k1 int4, k2 int4, v int4);
+    INSERT INTO t_2key_inc SELECT i, i*2, i*3 FROM generate_series(1, 100) i;
+    -- This should succeed now that two-key + INCLUDE is supported
+    CREATE INDEX t_2key_inc_smol ON t_2key_inc USING smol(k1, k2) INCLUDE (v);
+    -- Verify the index was created
+    SELECT COUNT(*) > 0 INTO idx_exists FROM pg_indexes WHERE indexname = 't_2key_inc_smol';
+    IF idx_exists THEN
+        RAISE NOTICE 'Two-key + INCLUDE index created successfully';
+    END IF;
+    DROP TABLE t_2key_inc CASCADE;
 END $$;
 -- Test 23: Error path - too many INCLUDE columns (line 717)
 DO $$
