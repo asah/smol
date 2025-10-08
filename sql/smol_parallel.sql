@@ -96,3 +96,41 @@ ANALYZE p2_i2;
 SELECT 'int2_eq' AS typ,
        ((SELECT s FROM res_i2_eq) = (SELECT COALESCE(sum(a),0)::bigint FROM p2_i2 WHERE b > 500 AND a = 42)
         AND (SELECT c FROM res_i2_eq) = (SELECT count(*)::bigint FROM p2_i2 WHERE b > 500 AND a = 42)) AS match;
+
+-- Test parallel index build
+-- Create a table large enough to trigger parallel build
+DROP TABLE IF EXISTS pb_test CASCADE;
+CREATE UNLOGGED TABLE pb_test(k int4);
+INSERT INTO pb_test SELECT i FROM generate_series(1, 500000) AS s(i);
+ANALYZE pb_test;
+
+-- Force parallel build with low maintenance_work_mem and high worker count
+SET maintenance_work_mem = '4MB';
+SET max_parallel_maintenance_workers = 4;
+
+-- Create index with parallel build (single-key int4, which supports parallel build)
+DROP INDEX IF EXISTS pb_test_smol;
+CREATE INDEX pb_test_smol ON pb_test USING smol(k);
+ANALYZE pb_test;
+
+-- Verify index correctness by checking a range query
+SELECT 'parallel_build' AS test,
+       (SELECT count(*) FROM pb_test WHERE k >= 250000) = 250001 AS match;
+
+-- Test parallel build with text type (32-byte padded)
+DROP TABLE IF EXISTS pb_text CASCADE;
+CREATE UNLOGGED TABLE pb_text(k text COLLATE "C");
+INSERT INTO pb_text SELECT 'key' || lpad(i::text, 10, '0') FROM generate_series(1, 500000) AS s(i);
+ANALYZE pb_text;
+
+DROP INDEX IF EXISTS pb_text_smol;
+CREATE INDEX pb_text_smol ON pb_text USING smol(k);
+ANALYZE pb_text;
+
+-- Verify text index correctness
+SELECT 'parallel_build_text' AS test,
+       (SELECT count(*) FROM pb_text WHERE k >= 'key0000250000') = 250001 AS match;
+
+-- Reset settings
+SET maintenance_work_mem = '64MB';
+SET max_parallel_maintenance_workers = 2;

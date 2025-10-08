@@ -24,15 +24,11 @@ CREATE TABLE t_rightmost (k int4);
 -- Create multi-level tree (need height > 1)
 INSERT INTO t_rightmost SELECT i FROM generate_series(1, 2000000) i;
 CREATE INDEX t_rightmost_idx ON t_rightmost USING smol(k);
-WARNING:  smol: internal page full during build
-WARNING:  smol: internal page full during build
-WARNING:  smol: internal page full during build
-WARNING:  smol: internal page full during build
 -- Directly call smol_rightmost_leaf() to trigger lines 4107-4113
 SELECT smol_test_rightmost_leaf('t_rightmost_idx'::regclass) AS rightmost_leaf_block;
  rightmost_leaf_block 
 ----------------------
-                 2946
+                  982
 (1 row)
 
 -- Lines 3517-3518: smol_find_first_leaf() with rightmost child selection
@@ -40,7 +36,7 @@ SELECT smol_test_rightmost_leaf('t_rightmost_idx'::regclass) AS rightmost_leaf_b
 SELECT smol_test_find_first_leaf_rightmost('t_rightmost_idx'::regclass, 999999999::bigint) AS first_leaf_block;
  first_leaf_block 
 ------------------
-             2946
+              982
 (1 row)
 
 DROP TABLE t_rightmost CASCADE;

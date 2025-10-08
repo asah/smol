@@ -61,7 +61,16 @@
       "Bash(COVERAGE=1 make installcheck REGRESS=smol_benchmark_quick)",
       "Bash(env COVERAGE=1 make installcheck REGRESS=smol_benchmark_quick)",
       "Bash(/home/postgres/bench/flush_cache.sh:*)",
-      "Bash(vmtouch:*)"
+      "Bash(vmtouch:*)",
+      "Bash(cp:*)",
+      "Bash(env COVERAGE=1 make clean all)",
+      "WebSearch",
+      "Bash(time psql:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(nm:*)",
+      "Bash(env COVERAGE=1 make all)",
+      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_parallel)",
+      "Bash(xargs -r kill -9)"
     ],
     "deny": [],
     "ask": []

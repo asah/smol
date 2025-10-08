@@ -51,13 +51,18 @@
 #include "utils/selfuncs.h"
 #include "optimizer/cost.h"
 /* Parallel build support */
+#include "access/parallel.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/dsm.h"
 #include "storage/shm_toc.h"
 #include "storage/ipc.h"
+#include "storage/condition_variable.h"
+#include "storage/spin.h"
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"
+#include "utils/queryenvironment.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;  /* GCOV_EXCL_LINE */
 
@@ -804,6 +809,7 @@ static void smol_build_tree_from_sorted(Relation idx, const void *keys, Size nke
 static void smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * const *incs,
                              Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 static void smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len);
+static void smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, bool byval);
 static void smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * const *incs,
                              Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 /* removed: static void smol_build_tree2_from_sorted(...); */
@@ -1105,11 +1111,7 @@ smol_handler(PG_FUNCTION_ARGS)
     am->amclusterable = false;
     am->ampredlocks = false;
     am->amcanparallel = true;
-#ifdef SMOL_TEST_COVERAGE
-    am->amcanbuildparallel = true;  /* Enable for coverage testing */
-#else
-    am->amcanbuildparallel = false;
-#endif
+    am->amcanbuildparallel = true;
     am->amcaninclude = true;
     am->amusemaintenanceworkmem = false;
     am->amsummarizing = false;
@@ -1148,6 +1150,66 @@ smol_handler(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(am);
 }
 
+/* ---- Parallel Build Infrastructure ---- */
+
+/* Shared state for parallel index build */
+typedef struct SMOLShared
+{
+    /* Immutable state shared across all workers */
+    Oid heaprelid;
+    Oid indexrelid;
+    bool isconcurrent;
+    int scantuplesortstates;  /* Number of participants (leader + workers) */
+
+    /* Synchronization */
+    ConditionVariable workersdonecv;
+    slock_t mutex;
+
+    /* Mutable state updated by workers */
+    int nparticipantsdone;
+    double reltuples;
+    int maxlen;  /* Maximum text length seen across all workers (for text types) */
+
+    /*
+     * ParallelTableScanDescData follows. Can't directly embed here, as
+     * implementations of the parallel table scan desc interface might need
+     * stronger alignment.
+     */
+} SMOLShared;
+
+#define ParallelTableScanFromSMOLShared(shared) \
+    (ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(SMOLShared)))
+
+/* Leader state for coordinating parallel build */
+typedef struct SMOLLeader
+{
+    ParallelContext *pcxt;
+    SMOLShared *smolshared;
+    Sharedsort *sharedsort;
+    Snapshot snapshot;
+    int nparticipanttuplesorts;
+} SMOLLeader;
+
+/* Build state that gets passed around */
+typedef struct SMOLBuildState
+{
+    Relation heap;
+    Relation index;
+    IndexInfo *indexInfo;
+    SMOLLeader *smolleader;
+} SMOLBuildState;
+
+/* Table-of-contents IDs for shared memory segments */
+#define PARALLEL_KEY_SMOL_SHARED        1
+#define PARALLEL_KEY_TUPLESORT          2
+#define PARALLEL_KEY_QUERY_TEXT         3
+
+/* Forward declarations */
+static void smol_begin_parallel(SMOLBuildState *buildstate, bool isconcurrent, int request);
+static void smol_end_parallel(SMOLLeader *smolleader);
+/* Worker entry point - must NOT be static for dynamic loading */
+extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);
+
 /* --- Minimal implementations --- */
 static IndexBuildResult *
 smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
@@ -1160,6 +1222,14 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     int nkeyatts = index->rd_index->indnkeyatts;
     int natts = RelationGetDescr(index)->natts;
     int ninclude = natts - nkeyatts;
+    SMOLBuildState buildstate;
+
+    /* Initialize build state for potential parallel build */
+    buildstate.heap = heap;
+    buildstate.index = index;
+    buildstate.indexInfo = indexInfo;
+    buildstate.smolleader = NULL;
+
     SMOL_LOGF("build start rel=%u idx=%u", RelationGetRelid(heap), RelationGetRelid(index));
     /* Phase timers */
     instr_time t_start, t_collect_end, t_sort_end, t_write_end;
@@ -1167,6 +1237,15 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     INSTR_TIME_SET_CURRENT(t_collect_end);
     INSTR_TIME_SET_CURRENT(t_sort_end);
     INSTR_TIME_SET_CURRENT(t_write_end);
+
+    /* Request parallel workers for single-key builds without INCLUDE columns */
+    if (nkeyatts == 1 && ninclude == 0 && indexInfo->ii_ParallelWorkers > 0)
+    {
+        elog(LOG, "[smol] About to call smol_begin_parallel, ii_ParallelWorkers=%d", indexInfo->ii_ParallelWorkers);
+        smol_begin_parallel(&buildstate, indexInfo->ii_Concurrent,
+                          indexInfo->ii_ParallelWorkers);
+        elog(LOG, "[smol] Returned from smol_begin_parallel, smolleader=%p", buildstate.smolleader);
+    }
 
     /* Enforce 1 or 2 key columns (fixed-width or text32 packed) */
     if (nkeyatts != 1 && nkeyatts != 2)
@@ -1265,7 +1344,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 uint16 new_stride = (maxlen <= 8) ? 8 : (maxlen <= 16 ? 16 : 32);
                 if (new_stride != old_stride)
                 {
-                    char *nbuf = (char *) palloc(((Size) n) * new_stride);
+                    char *nbuf = (char *) MemoryContextAllocHuge(CurrentMemoryContext, ((Size) n) * new_stride);
                     for (Size r = 0; r < n; r++)
                     {
                         const char *src = incarr[c] + ((size_t) r * old_stride);
@@ -1284,7 +1363,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         /* Build permutation via radix sort */
         if (n > 0)
         {
-            char *sinc[16]; for (int i=0;i<inc_count;i++) sinc[i] = (char *) palloc(((Size) n) * inc_lens[i]);
+            char *sinc[16]; for (int i=0;i<inc_count;i++) sinc[i] = (char *) MemoryContextAllocHuge(CurrentMemoryContext, ((Size) n) * inc_lens[i]);
 
             if (nkeyatts == 2)
             {
@@ -1293,7 +1372,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 FmgrInfo cmp1, cmp2; Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation; Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
                 fmgr_info_copy(&cmp1, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
                 fmgr_info_copy(&cmp2, index_getprocinfo(index, 2, 1), CurrentMemoryContext);
-                uint32 *idx = (uint32 *) palloc(n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
+                uint32 *idx = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
                 /* set global comparator context */
                 g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
                 qsort(idx, n, sizeof(uint32), smol_pair_qsort_cmp);
@@ -1349,18 +1428,18 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             }
             else  /* nkeyatts == 1 */
             {
-                uint32 *idx = (uint32 *) palloc(n * sizeof(uint32));
+                uint32 *idx = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32));
                 for (Size i = 0; i < n; i++) idx[i] = (uint32) i;
                 if (!cctx.key_is_text32)
                 {
                     /* radix sort by int64 key */
-                    uint64 *norm = (uint64 *) palloc(n * sizeof(uint64));
-                    uint32 *tmp = (uint32 *) palloc(n * sizeof(uint32));
+                    uint64 *norm = (uint64 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint64));
+                    uint32 *tmp = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32));
                     for (Size i = 0; i < n; i++) norm[i] = smol_norm64(karr[i]);
                     smol_radix_sort_idx_u64(norm, idx, tmp, n);
                     pfree(norm); pfree(tmp);
                     /* Apply permutation */
-                    int64 *sk = (int64 *) palloc(n * sizeof(int64));
+                    int64 *sk = (int64 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(int64));
                     for (Size i = 0; i < n; i++)
                     {
                         uint32 j = idx[i]; sk[i] = karr[j];
@@ -1381,7 +1460,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                     g_k1buf = kbytes; g_key_len1 = key_len; /* reuse globals for simple cmp */
                     qsort(idx, n, sizeof(uint32), smol_qsort_cmp_bytes);
                     /* Apply permutation */
-                    char *skeys = (char *) palloc(((Size) n) * key_len);
+                    char *skeys = (char *) MemoryContextAllocHuge(CurrentMemoryContext, ((Size) n) * key_len);
                     for (Size i = 0; i < n; i++)
                     {
                         uint32 j = idx[i];
@@ -1429,7 +1508,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     else if (nkeyatts == 1 && atttypid == TEXTOID)
     {
         /* Single-key text: sort with tuplesort then pack to 32-byte padded keys */
-        Oid ltOp; Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+        Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
         /* Defensive check - no if-statement needed, macro handles everything */
         SMOL_DEFENSIVE_CHECK(coll == C_COLLATION_OID ||
             (get_collation_name(coll) &&
@@ -1437,16 +1516,55 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
               strcmp(get_collation_name(coll), "POSIX") == 0)), ERROR,
             (errmsg("smol text keys require C/POSIX collation")));
         TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
-        Tuplesortstate *ts; 
-        TsBuildCtxText cb; int maxlen = 0; 
+        Tuplesortstate *ts;
+        TsBuildCtxText cb; int maxlen = 0;
         if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
-        ltOp = tce->lt_opr;
-        ts = tuplesort_begin_datum(atttypid, ltOp, coll, false, maintenance_work_mem, NULL, false);
+        /* Set up parallel coordination if workers were launched */
+        SortCoordinate coordinate = NULL;
+        if (buildstate.smolleader)
+        {
+            coordinate = (SortCoordinate) palloc0(sizeof(SortCoordinateData));
+            coordinate->isWorker = false;
+            coordinate->nParticipants = buildstate.smolleader->nparticipanttuplesorts;
+            coordinate->sharedsort = buildstate.smolleader->sharedsort;
+        }
+        ts = tuplesort_begin_index_btree(heap, index, false, false, maintenance_work_mem, coordinate, TUPLESORT_NONE);
         /* collect and track max len */
         cb.ts = ts; cb.pnkeys = &nkeys; cb.pmax = &maxlen;
-        table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_text, (void *) &cb, NULL);
-        INSTR_TIME_SET_CURRENT(t_collect_end);
-        tuplesort_performsort(ts);
+
+        /* In parallel mode, only workers scan the table. Leader just waits and merges. */
+        if (!buildstate.smolleader)
+        {
+            /* Serial build: leader does the scan */
+            table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_text, (void *) &cb, NULL);
+            INSTR_TIME_SET_CURRENT(t_collect_end);
+            tuplesort_performsort(ts);
+        }
+        else
+        {
+            /* Parallel build: wait for all workers to finish, then merge */
+            SMOLShared *smolshared = buildstate.smolleader->smolshared;
+
+            /* Wait for all workers to finish sorting */
+            for (;;)
+            {
+                SpinLockAcquire(&smolshared->mutex);
+                if (smolshared->nparticipantsdone == buildstate.smolleader->nparticipanttuplesorts)
+                {
+                    nkeys = smolshared->reltuples;
+                    maxlen = smolshared->maxlen;
+                    SpinLockRelease(&smolshared->mutex);
+                    break;
+                }
+                SpinLockRelease(&smolshared->mutex);
+                ConditionVariableSleep(&smolshared->workersdonecv, WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+            }
+            ConditionVariableCancelSleep();
+            INSTR_TIME_SET_CURRENT(t_collect_end);
+
+            /* Now perform sort on leader's tuplesort, which merges worker results */
+            tuplesort_performsort(ts);
+        }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         if (maxlen > 32) ereport(ERROR, (errmsg("smol text32 key exceeds 32 bytes")));
         /* choose auto cap 8/16/32 */
@@ -1459,47 +1577,62 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     else if (nkeyatts == 1)
     {
         /* Generic fixed-length single-key path (non-varlena) */
-        int16 typlen; bool byval; char typalign; Oid coll;
-        TypeCacheEntry *tce; Oid ltOp; Tuplesortstate *ts; bool isnull; Datum val; Size i = 0;
+        int16 typlen; bool byval; char typalign;
+        TypeCacheEntry *tce; Tuplesortstate *ts;
         get_typlenbyvalalign(atttypid, &typlen, &byval, &typalign);
         /* Defensive check - no if-statement needed, macro handles everything */
         SMOL_DEFENSIVE_CHECK(typlen > 0, ERROR,
             (errmsg("smol supports fixed-length types only (typlen=%d)", (int) typlen)));
         key_len = SMOL_KEYLEN_ADJUST((uint16) typlen);
-        coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
         tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
         if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
-        ltOp = tce->lt_opr;
-        ts = tuplesort_begin_datum(atttypid, ltOp, coll, false, maintenance_work_mem, NULL, false);
-        TsBuildCtxAny gcb; gcb.ts = ts; gcb.pnkeys = &nkeys;
-        table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_any, (void *) &gcb, NULL);
-        INSTR_TIME_SET_CURRENT(t_collect_end);
-        tuplesort_performsort(ts);
-        INSTR_TIME_SET_CURRENT(t_sort_end);
-        /* materialize into contiguous bytes */
+        /* Set up parallel coordination if workers were launched */
+        SortCoordinate coordinate = NULL;
+        if (buildstate.smolleader)
         {
-            char *out = (char *) palloc(((Size) nkeys) * key_len);
-            while (tuplesort_getdatum(ts, true, false, &val, &isnull, NULL))
-            {
-                char *dst = out + ((size_t) i * key_len);
-		/* TODO: if/when we support other lengths,
-		   then add memcpy(dst, DatumGetPointer(val), key_len); */
-		SMOL_DEFENSIVE_CHECK(byval, ERROR, (errmsg("unexpected byval==false")));
-		/* PostgreSQL type system guarantees byval types are 1, 2, 4, or 8 bytes */
-		SMOL_DEFENSIVE_CHECK(key_len == 0 || (key_len & (key_len - 1)) == 0, ERROR,
-				     (errmsg("key_len %d is not a power of two", (int) key_len)));
-		switch (key_len)
-		  {
-		  case 1: { char v = DatumGetChar(val); memcpy(dst, &v, 1); break; }
-		  case 2: { int16 v = DatumGetInt16(val); memcpy(dst, &v, 2); break; }
-		  case 4: { int32 v = DatumGetInt32(val); memcpy(dst, &v, 4); break; }
-		  case 8: { int64 v = DatumGetInt64(val); memcpy(dst, &v, 8); break; }
-		  }
-                i++;
-            }
-            smol_build_tree_from_sorted(index, (const void *) out, nkeys, key_len);
-            pfree(out);
+            coordinate = (SortCoordinate) palloc0(sizeof(SortCoordinateData));
+            coordinate->isWorker = false;
+            coordinate->nParticipants = buildstate.smolleader->nparticipanttuplesorts;
+            coordinate->sharedsort = buildstate.smolleader->sharedsort;
         }
+        ts = tuplesort_begin_index_btree(heap, index, false, false, maintenance_work_mem, coordinate, TUPLESORT_NONE);
+        TsBuildCtxAny gcb; gcb.ts = ts; gcb.pnkeys = &nkeys;
+
+        /* In parallel mode, only workers scan the table. Leader just waits and merges. */
+        if (!buildstate.smolleader)
+        {
+            /* Serial build: leader does the scan */
+            table_index_build_scan(heap, index, indexInfo, true, true, ts_build_cb_any, (void *) &gcb, NULL);
+            INSTR_TIME_SET_CURRENT(t_collect_end);
+            tuplesort_performsort(ts);
+        }
+        else
+        {
+            /* Parallel build: wait for all workers to finish, then merge */
+            SMOLShared *smolshared = buildstate.smolleader->smolshared;
+
+            /* Wait for all workers to finish sorting */
+            for (;;)
+            {
+                SpinLockAcquire(&smolshared->mutex);
+                if (smolshared->nparticipantsdone == buildstate.smolleader->nparticipanttuplesorts)
+                {
+                    nkeys = smolshared->reltuples;
+                    SpinLockRelease(&smolshared->mutex);
+                    break;
+                }
+                SpinLockRelease(&smolshared->mutex);
+                ConditionVariableSleep(&smolshared->workersdonecv, WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+            }
+            ConditionVariableCancelSleep();
+            INSTR_TIME_SET_CURRENT(t_collect_end);
+
+            /* Now perform sort on leader's tuplesort, which merges worker results */
+            tuplesort_performsort(ts);
+        }
+        INSTR_TIME_SET_CURRENT(t_sort_end);
+        /* stream write directly from tuplesort */
+        smol_build_fixed_stream_from_tuplesort(index, ts, nkeys, key_len, byval);
         tuplesort_end(ts);
         INSTR_TIME_SET_CURRENT(t_write_end);
     }
@@ -1534,7 +1667,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 FmgrInfo cmp1, cmp2; Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation; Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
                 fmgr_info_copy(&cmp1, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
                 fmgr_info_copy(&cmp2, index_getprocinfo(index, 2, 1), CurrentMemoryContext);
-                idx = (uint32 *) palloc(n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
+                idx = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
                 /* set global comparator context */
                 g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
                 qsort(idx, n, sizeof(uint32), smol_pair_qsort_cmp);
@@ -1611,6 +1744,15 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         SMOL_LOGF("build finish tuples=%zu profile: collect=%.3f ms sort=%.3f ms write=%.3f ms total~%.3f ms",
                   nkeys, ms_collect, ms_sort, ms_write, ms_total);
     }
+
+    /* Clean up parallel build state if used */
+    if (buildstate.smolleader)
+    {
+        smol_end_parallel(buildstate.smolleader);
+        pfree(buildstate.smolleader);
+        SMOL_LOG("parallel build complete");
+    }
+
     return res;
 }
 
@@ -3488,7 +3630,7 @@ smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink)
               BufferGetBlockNumber(buf), leaf ? 1 : 0, rightlink);
 }
 
-static void
+static void pg_attribute_unused()
 smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 key_len)
 {
     /*
@@ -4809,7 +4951,6 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
     char *leaf_high = NULL; /* bytes array nleaves*key_len */
     char lastkey[32];
     Size remaining = nkeys;
-    bool isnull; Datum val;
     while (remaining > 0)
     {
         Buffer buf = smol_extend(idx);
@@ -4826,8 +4967,11 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         char *p = scratch + header;
         for (Size i = 0; i < n_this; i++)
         {
-            SMOL_DEFENSIVE_CHECK(tuplesort_getdatum(ts, true, false, &val, &isnull, NULL), ERROR,
+            IndexTuple itup = tuplesort_getindextuple(ts, true);
+            SMOL_DEFENSIVE_CHECK(itup != NULL, ERROR,
                                 (errmsg("smol: unexpected end of tuplesort stream")));
+            bool isnull;
+            Datum val = index_getattr(itup, 1, idx->rd_att, &isnull);
             if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
             text *t = DatumGetTextPP(val); int blen = VARSIZE_ANY_EXHDR(t);
             const char *src = VARDATA_ANY(t);
@@ -4842,6 +4986,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
                 pfree(hx);
             } /* GCOV_EXCL_STOP */
             if (i == n_this - 1) memcpy(lastkey, p, key_len);
+            /* Do not pfree itup - owned by tuplesort */
             p += key_len;
         }
         Size sz = header + n_this * key_len;
@@ -4883,6 +5028,125 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         m->height = 1;
         MarkBufferDirty(mb);
         UnlockReleaseBuffer(mb);
+    }
+    else
+    {
+        BlockNumber rootblk = InvalidBlockNumber; uint16 levels = 0;
+        smol_build_internal_levels_bytes(idx, leaves, leaf_high, nleaves, key_len, &rootblk, &levels);
+        pfree(leaves); pfree(leaf_high);
+    }
+}
+
+/* Stream-write fixed-length keys from tuplesort into leaf pages. */
+static void
+smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, bool byval)
+{
+    /* init meta page if new */
+    if (RelationGetNumberOfBlocks(idx) == 0)
+    {
+        Buffer mbuf = ReadBufferExtended(idx, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+        LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+        Page mpage = BufferGetPage(mbuf);
+        PageInit(mpage, BLCKSZ, 0);
+        SmolMeta *meta = smol_meta_ptr(mpage);
+        meta->magic = SMOL_META_MAGIC;
+        meta->version = SMOL_META_VERSION;
+        meta->nkeyatts = 1;
+        meta->key_len1 = key_len;
+        meta->key_len2 = 0;
+        meta->root_blkno = InvalidBlockNumber;
+        meta->height = 0;
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+    }
+    if (nkeys == 0)
+        return;
+    BlockNumber prev = InvalidBlockNumber;
+    Size nleaves = 0, aleaves = 0;
+    BlockNumber *leaves = NULL;
+    char *leaf_high = NULL; /* byte array for highkeys */
+    char lastkey[8]; /* buffer for last key (max 8 bytes) */
+    Size remaining = nkeys;
+    IndexTuple itup;
+    memset(lastkey, 0, sizeof(lastkey));
+    while (remaining > 0)
+    {
+        Buffer buf = smol_extend(idx);
+        smol_init_page(buf, true, InvalidBlockNumber);
+        Page page = BufferGetPage(buf);
+        Size fs = PageGetFreeSpace(page);
+        Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
+        Size header = sizeof(uint16);
+        Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
+        SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
+        Size n_this = (remaining < max_n) ? remaining : max_n;
+        char *scratch = (char *) palloc(header + n_this * key_len);
+        memcpy(scratch, &n_this, sizeof(uint16));
+        char *p = scratch + header;
+        for (Size i = 0; i < n_this; i++)
+        {
+            itup = tuplesort_getindextuple(ts, true);
+            SMOL_DEFENSIVE_CHECK(itup != NULL, ERROR,
+                                (errmsg("smol: unexpected end of tuplesort stream")));
+            /* Extract the key value from the index tuple */
+            bool isnull;
+            Datum val = index_getattr(itup, 1, idx->rd_att, &isnull);
+            if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
+            /* PostgreSQL type system guarantees byval types are 1, 2, 4, or 8 bytes */
+            SMOL_DEFENSIVE_CHECK(key_len == 0 || (key_len & (key_len - 1)) == 0, ERROR,
+                                (errmsg("key_len %d is not a power of two", (int) key_len)));
+            SMOL_DEFENSIVE_CHECK(byval, ERROR, (errmsg("unexpected byval==false")));
+            switch (key_len)
+            {
+                case 1: { char v = DatumGetChar(val); memcpy(p, &v, 1); if (i == n_this - 1) memcpy(lastkey, &v, 1); break; }
+                case 2: { int16 v = DatumGetInt16(val); memcpy(p, &v, 2); if (i == n_this - 1) memcpy(lastkey, &v, 2); break; }
+                case 4: { int32 v = DatumGetInt32(val); memcpy(p, &v, 4); if (i == n_this - 1) memcpy(lastkey, &v, 4); break; }
+                case 8: { int64 v = DatumGetInt64(val); memcpy(p, &v, 8); if (i == n_this - 1) memcpy(lastkey, &v, 8); break; }
+            }
+            /* Do not pfree itup - owned by tuplesort */
+            p += key_len;
+        }
+        Size sz = header + n_this * key_len;
+        OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
+        SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
+            (errmsg("smol: failed to add leaf payload (fixed)")));
+        pfree(scratch);
+        MarkBufferDirty(buf);
+        BlockNumber cur = BufferGetBlockNumber(buf);
+        UnlockReleaseBuffer(buf);
+        if (BlockNumberIsValid(prev))
+        {
+            Buffer pbuf = ReadBuffer(idx, prev);
+            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+            smol_page_opaque(BufferGetPage(pbuf))->rightlink = cur;
+            MarkBufferDirty(pbuf);
+            UnlockReleaseBuffer(pbuf);
+        }
+        prev = cur;
+        /* record leaf and highkey */
+        if (nleaves == aleaves)
+        {
+            aleaves = (aleaves == 0 ? 64 : aleaves * 2);
+            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber)) : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
+            leaf_high = (leaf_high == NULL) ? (char *) palloc(aleaves * key_len) : (char *) repalloc(leaf_high, aleaves * key_len);
+        }
+        leaves[nleaves] = cur;
+        memcpy(leaf_high + (nleaves * key_len), lastkey, key_len);
+        nleaves++;
+        remaining -= n_this;
+    }
+    /* set meta or build internal */
+    if (nleaves == 1)
+    {
+        Buffer mb = ReadBuffer(idx, 0);
+        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+        SmolMeta *m = smol_meta_ptr(BufferGetPage(mb));
+        m->root_blkno = leaves[0];
+        m->height = 1;
+        MarkBufferDirty(mb);
+        UnlockReleaseBuffer(mb);
+        pfree(leaves);
+        pfree(leaf_high);
     }
     else
     {
@@ -4988,20 +5252,20 @@ static void
 ts_build_cb_any(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
     TsBuildCtxAny *c = (TsBuildCtxAny *) state;
-    (void) rel; (void) tid; (void) tupleIsAlive;
+    (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
-    tuplesort_putdatum(c->ts, values[0], false);
+    tuplesort_putindextuplevalues(c->ts, rel, tid, values, isnull);
     (*c->pnkeys)++;
 }
 
 static void
 ts_build_cb_text(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    TsBuildCtxText *c = (TsBuildCtxText *) state; (void) rel; (void) tid; (void) tupleIsAlive;
+    TsBuildCtxText *c = (TsBuildCtxText *) state; (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR,(errmsg("smol does not support NULL values")));
     text *t = DatumGetTextPP(values[0]); int blen = VARSIZE_ANY_EXHDR(t);
     if (blen > *c->pmax) *c->pmax = blen;
-    tuplesort_putdatum(c->ts, values[0], false);
+    tuplesort_putindextuplevalues(c->ts, rel, tid, values, isnull);
     (*c->pnkeys)++;
 }
 
@@ -5034,8 +5298,8 @@ smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, b
             newcap = oldcap + 2097152;  /* +2M entries per grow */
         Size bytes1 = (Size) newcap * (Size) c->len1;
         Size bytes2 = (Size) newcap * (Size) c->len2;
-        char *n1 = (*c->pcap == 0) ? (char *) palloc(bytes1) : (char *) repalloc(*c->pk1, bytes1);
-        char *n2 = (*c->pcap == 0) ? (char *) palloc(bytes2) : (char *) repalloc(*c->pk2, bytes2);
+        char *n1 = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes1) : (char *) repalloc_huge(*c->pk1, bytes1);
+        char *n2 = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes2) : (char *) repalloc_huge(*c->pk2, bytes2);
         *c->pk1 = n1; *c->pk2 = n2; *c->pcap = newcap;
     }
     char *dst1 = (*c->pk1) + ((size_t) (*c->pcount) * (size_t) c->len1);
@@ -5117,8 +5381,8 @@ static void
 smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n)
 {
     if (n < 2) return;
-    int64 *t1 = (int64 *) palloc(n * sizeof(int64));
-    int64 *t2 = (int64 *) palloc(n * sizeof(int64));
+    int64 *t1 = (int64 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(int64));
+    int64 *t2 = (int64 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(int64));
     uint32 *count = (uint32 *) palloc0(65536 * sizeof(uint32));
 
     /* 4 passes on k2 (low to high) */
@@ -5432,13 +5696,13 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         {
             if (!c->key_is_text32)
             {
-                int64 *newk = (*c->pcap == 0) ? (int64 *) palloc(newcap * sizeof(int64)) : (int64 *) repalloc(*c->pk, newcap * sizeof(int64));
+                int64 *newk = (*c->pcap == 0) ? (int64 *) MemoryContextAllocHuge(CurrentMemoryContext, newcap * sizeof(int64)) : (int64 *) repalloc_huge(*c->pk, newcap * sizeof(int64));
                 *c->pk = newk;
             }
             else
             {
                 Size bytes = (Size) newcap * (Size) c->key_len;
-                char *newkb = (*c->pcap == 0) ? (char *) palloc(bytes) : (char *) repalloc(*c->pkbytes, bytes);
+                char *newkb = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes) : (char *) repalloc_huge(*c->pkbytes, bytes);
                 *c->pkbytes = newkb;
             }
         }
@@ -5446,8 +5710,8 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         {
             Size bytes1 = (Size) newcap * (Size) c->key_len;
             Size bytes2 = (Size) newcap * (Size) c->key_len2;
-            char *newk1 = (*c->pcap == 0) ? (char *) palloc(bytes1) : (char *) repalloc(*c->pk1buf, bytes1);
-            char *newk2 = (*c->pcap == 0) ? (char *) palloc(bytes2) : (char *) repalloc(*c->pk2buf, bytes2);
+            char *newk1 = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes1) : (char *) repalloc_huge(*c->pk1buf, bytes1);
+            char *newk2 = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes2) : (char *) repalloc_huge(*c->pk2buf, bytes2);
             *c->pk1buf = newk1;
             *c->pk2buf = newk2;
         }
@@ -5456,7 +5720,7 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
         {
             Size bytes = (Size) newcap * (Size) c->ilen[i];
             char *old = *c->pi[i];
-            char *ni = (*c->pcap == 0) ? (char *) palloc(bytes) : (char *) repalloc(old, bytes);
+            char *ni = (*c->pcap == 0) ? (char *) MemoryContextAllocHuge(CurrentMemoryContext, bytes) : (char *) repalloc_huge(old, bytes);
             *c->pi[i] = ni;
         }
         *c->pcap = newcap;
@@ -5868,4 +6132,295 @@ smol_test_run_synthetic(PG_FUNCTION_ARGS)
     smol_run_synthetic_tests();
 #endif
     PG_RETURN_BOOL(true);
+}
+
+/*
+ * ---- Parallel Build Implementation ----
+ */
+
+/*
+ * smol_begin_parallel - Set up parallel context for index build
+ *
+ * Similar to btree's _bt_begin_parallel, this function:
+ * 1. Creates a parallel context
+ * 2. Estimates and allocates shared memory
+ * 3. Initializes shared state
+ * 4. Launches parallel workers
+ */
+static void
+smol_begin_parallel(SMOLBuildState *buildstate, bool isconcurrent, int request)
+{
+    ParallelContext *pcxt;
+    Size estsmolshared;
+    Size estsort;
+    SMOLShared *smolshared;
+    Sharedsort *sharedsort;
+    int scantuplesortstates;
+
+    elog(LOG, "[smol] smol_begin_parallel starting, request=%d", request);
+
+    /* Don't start parallel build if only requesting 1 worker */
+    if (request < 1)
+        return;
+
+    /* Enter parallel mode before creating parallel context */
+    EnterParallelMode();
+
+    /* Create parallel context
+     * Note: Using "$libdir/smol" to match how extension functions are loaded
+     */
+    elog(LOG, "[smol] About to CreateParallelContext");
+    pcxt = CreateParallelContext("$libdir/smol", "smol_parallel_build_main", request);
+    elog(LOG, "[smol] Created ParallelContext, pcxt=%p", pcxt);
+
+    /* Get snapshot for parallel scan - required for table_parallelscan_estimate */
+    Snapshot snapshot = RegisterSnapshot(GetTransactionSnapshot());
+
+    /* Estimate shared memory size for SMOLShared + ParallelTableScanDesc */
+    elog(LOG, "[smol] Estimating shared memory");
+    estsmolshared = BUFFERALIGN(sizeof(SMOLShared)) +
+                    table_parallelscan_estimate(buildstate->heap, snapshot);
+    elog(LOG, "[smol] estsmolshared=%zu", estsmolshared);
+    shm_toc_estimate_chunk(&pcxt->estimator, estsmolshared);
+    shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+    /* Leader doesn't participate, so estimate for number of workers.
+     * We estimate for the requested amount, but will initialize based on actual launched. */
+    elog(LOG, "[smol] Estimating tuplesort shared memory for %d workers", request);
+    estsort = tuplesort_estimate_shared(request);
+    elog(LOG, "[smol] estsort=%zu", estsort);
+    shm_toc_estimate_chunk(&pcxt->estimator, estsort);
+    shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+    /* Estimate space for query text (if available) */
+    Size querylen;
+    if (debug_query_string)
+    {
+        querylen = strlen(debug_query_string);
+        shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+        shm_toc_estimate_keys(&pcxt->estimator, 1);
+    }
+    else
+        querylen = 0;
+
+    /* Initialize parallel context */
+    InitializeParallelDSM(pcxt);
+
+    /* Initialize based on REQUESTED workers (actual might be less) */
+    scantuplesortstates = request;
+
+    /* Allocate and initialize SMOLShared */
+    smolshared = (SMOLShared *) shm_toc_allocate(pcxt->toc, estsmolshared);
+    smolshared->heaprelid = RelationGetRelid(buildstate->heap);
+    smolshared->indexrelid = RelationGetRelid(buildstate->index);
+    smolshared->isconcurrent = isconcurrent;
+    smolshared->scantuplesortstates = scantuplesortstates;
+
+    /* Initialize synchronization primitives */
+    ConditionVariableInit(&smolshared->workersdonecv);
+    SpinLockInit(&smolshared->mutex);
+
+    /* Initialize mutable state */
+    smolshared->nparticipantsdone = 0;
+    smolshared->reltuples = 0.0;
+    smolshared->maxlen = 0;
+
+    /* Initialize parallel table scan with snapshot */
+    table_parallelscan_initialize(buildstate->heap,
+                                  ParallelTableScanFromSMOLShared(smolshared),
+                                  snapshot);
+
+    /* Store in table of contents */
+    shm_toc_insert(pcxt->toc, PARALLEL_KEY_SMOL_SHARED, smolshared);
+
+    /* Allocate and initialize shared tuplesort state */
+    sharedsort = (Sharedsort *) shm_toc_allocate(pcxt->toc, estsort);
+    tuplesort_initialize_shared(sharedsort, scantuplesortstates, pcxt->seg);
+    shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLESORT, sharedsort);
+
+    /* Store query text for workers to access (if available) */
+    if (debug_query_string)
+    {
+        char *sharedquery = (char *) shm_toc_allocate(pcxt->toc, querylen + 1);
+        memcpy(sharedquery, debug_query_string, querylen + 1);
+        shm_toc_insert(pcxt->toc, PARALLEL_KEY_QUERY_TEXT, sharedquery);
+    }
+
+    /* Launch workers */
+    LaunchParallelWorkers(pcxt);
+
+    /* If no workers were launched, clean up and return */
+    if (pcxt->nworkers_launched == 0)
+    {
+        DestroyParallelContext(pcxt);
+        ExitParallelMode();
+        return;
+    }
+
+    /* Store leader state */
+    buildstate->smolleader = (SMOLLeader *) palloc0(sizeof(SMOLLeader));
+    buildstate->smolleader->pcxt = pcxt;
+    buildstate->smolleader->smolshared = smolshared;
+    buildstate->smolleader->sharedsort = sharedsort;
+    buildstate->smolleader->snapshot = snapshot;
+    /* Leader doesn't participate in scanning, so nparticipants = nworkers only */
+    buildstate->smolleader->nparticipanttuplesorts = pcxt->nworkers_launched;
+
+    /* Wait for workers to attach before continuing */
+    WaitForParallelWorkersToAttach(pcxt);
+
+    SMOL_LOGF("parallel build: launched %d workers", pcxt->nworkers_launched);
+}
+
+/*
+ * smol_end_parallel - Clean up parallel build state
+ */
+static void
+smol_end_parallel(SMOLLeader *smolleader)
+{
+    /* Wait for all workers to finish */
+    WaitForParallelWorkersToFinish(smolleader->pcxt);
+
+    /* Unregister snapshot if it was an MVCC snapshot */
+    if (IsMVCCSnapshot(smolleader->snapshot))
+        UnregisterSnapshot(smolleader->snapshot);
+
+    /* Clean up parallel context */
+    DestroyParallelContext(smolleader->pcxt);
+    ExitParallelMode();
+}
+
+/*
+ * smol_parallel_build_main - Entry point for parallel worker processes
+ *
+ * This function runs in each worker process and performs partial sorting
+ * of index tuples, coordinating through shared memory.
+ *
+ * Must be exported for parallel workers to find it.
+ */
+PGDLLEXPORT void
+smol_parallel_build_main(dsm_segment *seg, shm_toc *toc)
+{
+    SMOLShared *smolshared;
+    Sharedsort *sharedsort;
+    Relation heap;
+    Relation index;
+    IndexInfo *indexInfo;
+    Tuplesortstate *ts;
+    SortCoordinate coordinate;
+
+    elog(LOG, "[smol] worker starting, ParallelWorkerNumber=%d", ParallelWorkerNumber);
+
+    /* Get shared state from table of contents */
+    elog(LOG, "[smol] worker about to lookup PARALLEL_KEY_SMOL_SHARED");
+    smolshared = (SMOLShared *) shm_toc_lookup(toc, PARALLEL_KEY_SMOL_SHARED, false);
+
+    elog(LOG, "[smol] worker about to lookup PARALLEL_KEY_TUPLESORT");
+    sharedsort = (Sharedsort *) shm_toc_lookup(toc, PARALLEL_KEY_TUPLESORT, false);
+
+    elog(LOG, "[smol] worker looked up shared state, smolshared=%p, sharedsort=%p", smolshared, sharedsort);
+
+    /* Attach to shared tuplesort - required before creating worker tuplesort */
+    elog(LOG, "[smol] worker about to call tuplesort_attach_shared");
+    tuplesort_attach_shared(sharedsort, seg);
+
+    elog(LOG, "[smol] worker attached to shared tuplesort");
+
+    /* Open relations */
+    heap = table_open(smolshared->heaprelid, ShareLock);
+    index = index_open(smolshared->indexrelid, RowExclusiveLock);
+
+    elog(LOG, "[smol] worker opened relations");
+
+    /* Build IndexInfo (we need this for table_index_build_scan) */
+    indexInfo = BuildIndexInfo(index);
+    indexInfo->ii_Concurrent = smolshared->isconcurrent;
+
+    /* Set up sort coordinate for this worker */
+    coordinate = (SortCoordinate) palloc0(sizeof(SortCoordinateData));
+    coordinate->isWorker = true;
+    coordinate->nParticipants = -1;  /* Workers don't know the total yet */
+    coordinate->sharedsort = sharedsort;
+
+    elog(LOG, "[smol] worker created coordinate");
+
+    /* Initialize tuplesort for this worker.
+     * Workers get a fraction of maintenance_work_mem based on number of participants.
+     */
+    int sortmem = maintenance_work_mem / smolshared->scantuplesortstates;
+
+    elog(LOG, "[smol] worker about to create tuplesort, sortmem=%d, scantuplesortstates=%d",
+         sortmem, smolshared->scantuplesortstates);
+
+    ts = tuplesort_begin_index_btree(heap, index, false, false,
+                                     sortmem, coordinate,
+                                     TUPLESORT_NONE);
+
+    elog(LOG, "[smol] worker created tuplesort");
+
+    /* Perform partial table scan and sorting */
+    {
+        Size nkeys = 0;
+        Oid atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+        TableScanDesc scan;
+
+        /* Join the parallel scan */
+        scan = table_beginscan_parallel(heap, ParallelTableScanFromSMOLShared(smolshared));
+
+        if (atttypid == TEXTOID)
+        {
+            TsBuildCtxText cb;
+            int maxlen = 0;
+            cb.ts = ts;
+            cb.pnkeys = &nkeys;
+            cb.pmax = &maxlen;
+            table_index_build_scan(heap, index, indexInfo, true, true,
+                                 ts_build_cb_text, (void *) &cb, scan);
+
+            /* Workers must perform their sort and signal completion.
+             * The leader will merge the sorted runs from all workers.
+             */
+            tuplesort_performsort(ts);
+
+            /* Signal that this worker has completed sorting and update shared state */
+            SpinLockAcquire(&smolshared->mutex);
+            smolshared->nparticipantsdone++;
+            smolshared->reltuples += (double) nkeys;
+            if (maxlen > smolshared->maxlen)
+                smolshared->maxlen = maxlen;
+            SpinLockRelease(&smolshared->mutex);
+        }
+        else
+        {
+            TsBuildCtxAny cb;
+            cb.ts = ts;
+            cb.pnkeys = &nkeys;
+            table_index_build_scan(heap, index, indexInfo, true, true,
+                                 ts_build_cb_any, (void *) &cb, scan);
+
+            /* Workers must perform their sort and signal completion.
+             * The leader will merge the sorted runs from all workers.
+             */
+            tuplesort_performsort(ts);
+
+            /* Signal that this worker has completed sorting and update shared state */
+            SpinLockAcquire(&smolshared->mutex);
+            smolshared->nparticipantsdone++;
+            smolshared->reltuples += (double) nkeys;
+            SpinLockRelease(&smolshared->mutex);
+        }
+    }
+
+    /* Wake up leader if it's waiting */
+    ConditionVariableBroadcast(&smolshared->workersdonecv);
+
+    /* Clean up worker's tuplesort state.
+     * Now that the leader doesn't scan and only merges results,
+     * workers can safely clean up their tuplesort states.
+     */
+    tuplesort_end(ts);
+
+    /* Clean up relations */
+    index_close(index, RowExclusiveLock);
+    table_close(heap, ShareLock);
 }
