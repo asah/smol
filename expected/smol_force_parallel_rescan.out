@@ -1,0 +1,104 @@
+-- Aggressive attempt to force parallel rescan (lines 2486-2493)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Force parallel execution settings
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+-- Large inner table to encourage parallel scan
+DROP TABLE IF EXISTS t_inner CASCADE;
+CREATE TABLE t_inner (k int4, v int4);
+INSERT INTO t_inner SELECT i, i*10 FROM generate_series(1, 100000) i;
+CREATE INDEX t_inner_smol ON t_inner USING smol(k);
+ANALYZE t_inner;
+-- Small outer table
+DROP TABLE IF EXISTS t_outer CASCADE;
+CREATE TABLE t_outer (id int4);
+INSERT INTO t_outer VALUES (1), (2), (3), (4), (5);
+ANALYZE t_outer;
+-- Force nested loop, disable other joins
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+-- Try to force parallel index scan on inner side
+-- Each outer row should trigger a rescan of the parallel scan
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT t_outer.id, COUNT(*)
+FROM t_outer
+CROSS JOIN LATERAL (
+    SELECT * FROM t_inner WHERE k > t_outer.id * 1000 LIMIT 100
+) sub
+GROUP BY t_outer.id;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ GroupAggregate
+   Output: t_outer.id, count(*)
+   Group Key: t_outer.id
+   ->  Nested Loop
+         Output: t_outer.id
+         ->  Gather Merge
+               Output: t_outer.id
+               Workers Planned: 1
+               ->  Sort
+                     Output: t_outer.id
+                     Sort Key: t_outer.id
+                     ->  Parallel Seq Scan on public.t_outer
+                           Output: t_outer.id
+         ->  Limit
+               Output: NULL::integer, NULL::integer
+               ->  Index Only Scan using t_inner_smol on public.t_inner
+                     Output: NULL::integer, NULL::integer
+                     Index Cond: (t_inner.k > (t_outer.id * 1000))
+ Query Identifier: 6416337933281961315
+(19 rows)
+
+-- Execute it
+SELECT t_outer.id, COUNT(*)
+FROM t_outer
+CROSS JOIN LATERAL (
+    SELECT * FROM t_inner WHERE k > t_outer.id * 1000 LIMIT 100
+) sub
+GROUP BY t_outer.id
+ORDER BY t_outer.id;
+ id | count 
+----+-------
+  1 |   100
+  2 |   100
+  3 |   100
+  4 |   100
+  5 |   100
+(5 rows)
+
+-- Alternative: nested loop with parallel scan
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*)
+FROM t_outer, t_inner
+WHERE t_inner.k BETWEEN t_outer.id * 10000 AND (t_outer.id + 1) * 10000;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Nested Loop
+         Join Filter: ((t_inner.k >= (t_outer.id * 10000)) AND (t_inner.k <= ((t_outer.id + 1) * 10000)))
+         ->  Gather
+               Workers Planned: 1
+               ->  Parallel Seq Scan on t_outer
+         ->  Gather
+               Workers Planned: 4
+               ->  Parallel Seq Scan on t_inner
+(9 rows)
+
+SELECT COUNT(*)
+FROM t_outer, t_inner  
+WHERE t_inner.k BETWEEN t_outer.id * 10000 AND (t_outer.id + 1) * 10000;
+ count 
+-------
+ 50005
+(1 row)
+
+-- Cleanup
+DROP TABLE t_inner CASCADE;
+DROP TABLE t_outer CASCADE;

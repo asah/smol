@@ -102,19 +102,19 @@ SELECT k, v1 FROM t_rle_text_inc WHERE k = 'textkey0010' LIMIT 3;
 (3 rows)
 
 -- ============================================================================
--- Test 5: Text RLE fall back to plain (line 3345)
+-- Test 5: Text RLE fall back to zero-copy (line 3345)
 -- Create text data where RLE doesn't help (all unique keys)
 -- ============================================================================
-DROP TABLE IF EXISTS t_text_plain CASCADE;
-CREATE UNLOGGED TABLE t_text_plain (k text COLLATE "C", v int4);
+DROP TABLE IF EXISTS t_text_zerocopy CASCADE;
+CREATE UNLOGGED TABLE t_text_zerocopy (k text COLLATE "C", v int4);
 -- All unique keys - RLE won't help
-INSERT INTO t_text_plain
+INSERT INTO t_text_zerocopy
 SELECT
     'unique' || lpad(i::text, 8, '0') AS k,
     i AS v
 FROM generate_series(1, 5000) i;
-CREATE INDEX t_text_plain_smol ON t_text_plain USING smol(k) INCLUDE (v);
-SELECT count(*) FROM t_text_plain WHERE k >= 'unique00001000';
+CREATE INDEX t_text_zerocopy_smol ON t_text_zerocopy USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_text_zerocopy WHERE k >= 'unique00001000';
  count 
 -------
   4001
@@ -347,7 +347,7 @@ DROP TABLE t_rle_int4 CASCADE;
 DROP TABLE t_rle_int2 CASCADE;
 DROP TABLE t_rle_boundary CASCADE;
 DROP TABLE t_rle_text_inc CASCADE;
-DROP TABLE t_text_plain CASCADE;
+DROP TABLE t_text_zerocopy CASCADE;
 DROP TABLE t_text_multipage CASCADE;
 DROP TABLE t_rle_runs CASCADE;
 DROP TABLE t_key_rle_only CASCADE;

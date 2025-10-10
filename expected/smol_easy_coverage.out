@@ -12,7 +12,7 @@ ERROR:  smol is read-only: aminsert is not supported
 EXPLAIN SELECT * FROM t_nokey WHERE b > 500;
                         QUERY PLAN                        
 ----------------------------------------------------------
- Seq Scan on t_nokey  (cost=0.00..39.25 rows=753 width=8)
+ Seq Scan on t_nokey  (cost=0.00..38.25 rows=753 width=8)
    Filter: (b > 500)
 (2 rows)
 

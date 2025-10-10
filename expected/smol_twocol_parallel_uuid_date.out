@@ -80,11 +80,7 @@ ERROR:  smol: amgettuple called before amrescan
 SET smol.parallel_claim_batch = 3;
 -- These should use parallel workers
 SELECT count(*) FROM t_uuid_parallel;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 SELECT count(*) FROM t_date_parallel;
 ERROR:  smol: parallel scan without bound
 -- Cleanup

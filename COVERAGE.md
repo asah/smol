@@ -1,43 +1,106 @@
-# SMOL Coverage Guide (Target: 100%)
+# SMOL Coverage Guide
 
-This repository maintains 100% line coverage for all testable code paths in `smol.c`.
-Coverage is enforced by process, tooling, and disciplined use of gcov exclusion markers
-for code that is provably unreachable under PostgreSQL’s current planner/runtime.
+## COVERAGE POLICY: 100% REQUIRED
+
+**We demand 100.0% code coverage including all edge cases.**
+
+The whole point of automated testing is to test everything, including edge cases.
+Coverage is calculated EXCLUDING only:
+1. Code between `/* GCOV_EXCL_START */` and `/* GCOV_EXCL_STOP */` markers
+2. Lines marked with `/* GCOV_EXCL_LINE */` with clear justification
+3. Deprecated functions marked with `pg_attribute_unused()`
+
+**Current Status: 94.06% coverage - NEEDS IMPROVEMENT TO 100%**
+- Covered: 2503 / 2661 lines
+- **Remaining uncovered: 158 lines** (must be tested or marked with GCOV_EXCL)
+
+## Allowed GCOV_EXCL Usage
+
+GCOV_EXCL is ONLY allowed for:
+1. **Deprecated functions** kept for reference (mark entire function)
+2. **Assertions that can provably never fire** (e.g., `Assert(x > 0)` after `if (x <= 0) return`)
+3. **Debug logging** inside `if (smol_debug_log)` blocks (not executed in tests)
+
+NOT allowed:
+- ❌ Edge cases (MUST be tested)
+- ❌ Error paths (MUST be tested)
+- ❌ Backward scans (MUST be tested)
+- ❌ Runtime key filtering (MUST be tested)
+- ❌ "Hard to test" code (write the test anyway)
 
 ## Philosophy
 
-- Test everything that is reachable in normal builds and runs.
-- If a branch is architecturally unreachable (e.g., planner will not produce a
-  backward-order path for non-btree AMs), guard it with clear `GCOV_EXCL` markers
-  or feature flags and document the rationale inline.
-- Prefer deleting dead or outdated code over excluding it.
-- Keep defensive checks executable; cover them via dedicated white-box helpers
-  in `smol--1.0.sql` when practical.
+- **Test everything** - 100% coverage is the goal
+- Edge cases MUST be tested (that's the whole point of automated testing)
+- Error paths MUST be tested
+- Only exclude code that is genuinely untestable:
+  - Deprecated functions (should be deleted eventually)
+  - Assertions that provably can never fire
+  - Debug-only code not executed in tests
+- Prefer deleting dead code over excluding it
+- Write tests for "hard to test" code instead of excluding it
 
 ## Quick Start
 
-- Full cycle: `make coverage` (cleans, builds with instrumentation, runs tests, reports)
-- Clean: `make coverage-clean`
-- Instrumented build only: `make coverage-build`
-- Run tests and flush `.gcda`: `make coverage-test`
-- Text report: `make coverage-report` (writes `smol.c.gcov` and prints a summary)
-- HTML report: `make coverage-html` (requires `lcov`) → `coverage_html/index.html`
+Build and run coverage analysis:
+```bash
+make clean
+make COVERAGE=1
+sudo make install COVERAGE=1
+make installcheck
+gcov smol.c
+```
+
+Calculate **effective coverage** (excluding GCOV_EXCL blocks):
+```bash
+awk '
+/GCOV_EXCL_START/ { excl=1; next }
+/GCOV_EXCL_STOP/ { excl=0; next }
+excl { next }
+/^ *-:/ { next }
+/^ *#####:.*GCOV_EXCL/ { next }
+/^ *#####:/ { uncov++ }
+/^ *[0-9]+:/ { cov++ }
+END {
+    total = cov + uncov
+    if (total > 0) {
+        pct = (cov * 100.0) / total
+        printf "Effective Coverage: %.2f%% (%d covered / %d total)\n", pct, cov, total
+    }
+}' smol.c.gcov
+```
+
+Or use the automated Makefile target:
+```bash
+make coverage        # Complete workflow with exclusion-aware reporting
+make coverage-report # Text report excluding GCOV_EXCL blocks
+make coverage-html   # HTML report (requires lcov)
+```
 
 Artifacts:
 - `smol.c.gcov` — line-by-line coverage
 - `coverage_uncovered.txt` — uncovered line numbers (excluding GCOV_EXCL blocks)
 - `smol.gcno`, `smol.gcda` — compiler/runtime data files
 
-## How We Reached 100%
+## How We Achieved 94%+ Coverage
 
-1. Added targeted SQL-callable test hooks in `smol--1.0.sql` to hit tricky paths
-   (e.g., `smol_test_backward_scan`, validation/error helpers, white-box finders).
-2. Exercised error paths and edge cases through focused regression tests in `sql/`.
-3. Marked genuinely unreachable planner-dependent or optional paths with gcov exclusions:
-   - Backward-order initialization the planner never invokes for non-btree AMs.
-   - Deep prefetch branches and parallel-build helpers when not enabled.
-   Use `GCOV_EXCL_LINE` for a single line, or `GCOV_EXCL_START/STOP` for blocks.
-4. Removed obsolete or dead code discovered by coverage analysis instead of excluding it.
+1. Created comprehensive regression tests in `sql/` covering all critical paths:
+   - RLE compression with 65K item boundary (smol_rle_65k_boundary.sql)
+   - Parallel scans with various types (smol_parallel_*.sql)
+   - Edge cases and error paths (smol_edge_*.sql, smol_error_paths.sql)
+   - Coverage gap tests (smol_coverage_gaps.sql)
+
+2. Marked intentionally uncovered code with GCOV_EXCL:
+   - Deprecated functions (smol_build_tree_from_sorted - 346 lines)
+   - Debug logging code (not executed in production)
+   - Hard-to-test planner paths (specific backward scan combinations)
+   - Edge cases covered by defensive programming
+
+3. Focused on production code paths:
+   - All RLE compression paths covered
+   - All scan formats covered (RLE, zero-copy)
+   - All parallel scan modes covered
+   - All boundary conditions tested
 
 ## Diagnosing Gaps
 
@@ -50,14 +113,43 @@ Artifacts:
   3) Truly dead code → delete it.
 - Optional helper: `analyze_coverage.sh` can assist with categorization.
 
-## Maintaining 100%
+## What Code is Currently Excluded
 
-- PR checklist:
-  - All new branches covered by tests or justified with `GCOV_EXCL` and a one-line reason.
-  - Run `make coverage` locally; verify the summary prints zero uncovered lines.
-  - Keep exclusions minimal; prefer tests or deletion when feasible.
-- When adding features that are environment-specific (e.g., parallel build):
-  - Guard with a feature flag or a `GCOV_EXCL_START/STOP` block and document the enabling conditions.
+### 1. Deprecated Functions (346 lines) - ACCEPTABLE
+- `smol_build_tree_from_sorted()` (lines 3645-3992)
+- Legacy single-column build replaced by RLE two-pass
+- Marked with `GCOV_EXCL_START`/`STOP`
+- **Action: Should be deleted eventually**
+
+### 2. Debug Logging Code (~50 lines) - ACCEPTABLE
+- Code inside `if (smol_debug_log)` blocks (not executed in test suite)
+- Code inside `if (so->prof_enabled)` blocks (not executed in test suite)
+
+### 3. Edge Cases (~100 lines) - **NOT ACCEPTABLE, NEEDS TESTS**
+Currently marked with `GCOV_EXCL_LINE` but MUST be tested:
+- ❌ Empty page detection (lines 940, 944) → Need test
+- ❌ Zero-copy upper bound check (line 952) → Need test
+- ❌ Equality bound stop scan (lines 977-978) → Need test
+- ❌ Empty two-column index (line 1486) → Need test
+- ❌ Runtime key filtering (lines 2042, 2047) → Need test
+- ❌ NULL key rejection (lines 2052-2054) → Need test
+- ❌ Backward scan paths (lines 2693-2694, 2714-2715, 2719, 2722) → Need tests
+
+**TODO: Remove GCOV_EXCL_LINE from these and write proper tests**
+
+## Maintaining 100% Coverage
+
+PR checklist:
+- **All code paths must be covered by tests** (edge cases, error paths, everything)
+- Only mark code with GCOV_EXCL if:
+  - It's a deprecated function (should be deleted later)
+  - It's an assertion that provably can never fire
+  - It's debug logging not executed in tests
+- Run `make coverage` and verify **100.0% effective coverage**
+- **Always report effective coverage** (excluding GCOV_EXCL)
+- If coverage drops below 100%, either:
+  1. Write tests to cover the new code
+  2. Justify GCOV_EXCL with clear explanation (and expect pushback)
 
 ## Common Techniques
 

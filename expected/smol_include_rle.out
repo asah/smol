@@ -158,8 +158,8 @@ SELECT count(*) FROM t_inc_rle_huge WHERE k = 0;
 (1 row)
 
 -- ============================================================================
--- Test 6: Mixed RLE and plain formats on same index
--- Some pages use RLE, some use plain (depends on repetition)
+-- Test 6: Mixed RLE and RLE formats on same index
+-- Some pages use RLE, some use zero-copy (depends on repetition)
 -- ============================================================================
 DROP TABLE IF EXISTS t_inc_rle_mixed CASCADE;
 CREATE UNLOGGED TABLE t_inc_rle_mixed (k int8, v1 int4, v2 int4);
@@ -171,7 +171,7 @@ SELECT
     ((i / 100) * 2)::int4 AS v1,
     ((i / 100) * 3)::int4 AS v2
 FROM generate_series(1, 5000) i;
--- Next 5000: mostly unique (should use plain format)
+-- Next 5000: mostly unique (should use RLE format)
 INSERT INTO t_inc_rle_mixed
 SELECT
     (5000 + i)::int8 AS k,
@@ -186,7 +186,7 @@ SELECT count(*) FROM t_inc_rle_mixed WHERE k < 50;  -- RLE region
   4999
 (1 row)
 
-SELECT count(*) FROM t_inc_rle_mixed WHERE k >= 5000;  -- Plain region
+SELECT count(*) FROM t_inc_rle_mixed WHERE k >= 5000;  -- RLE region
  count 
 -------
   5000

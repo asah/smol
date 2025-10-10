@@ -1,0 +1,149 @@
+-- Tests to achieve 100% code coverage
+-- This test covers all edge cases currently marked with GCOV_EXCL_LINE
+
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- =============================================================================
+-- Test 1: Empty page detection (lines 943-944)
+-- =============================================================================
+DROP TABLE IF EXISTS t_empty_page CASCADE;
+CREATE UNLOGGED TABLE t_empty_page(k int4);
+CREATE INDEX t_empty_page_smol ON t_empty_page USING smol(k);
+-- Query empty index
+SELECT COUNT(*) FROM t_empty_page WHERE k > 0;
+DROP TABLE t_empty_page CASCADE;
+
+-- =============================================================================
+-- Test 2: No upper bounds path (line 940)
+-- =============================================================================
+DROP TABLE IF EXISTS t_no_bounds CASCADE;
+CREATE UNLOGGED TABLE t_no_bounds(k int4);
+INSERT INTO t_no_bounds SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX t_no_bounds_smol ON t_no_bounds USING smol(k);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Query without upper bound (only lower bound)
+SELECT COUNT(*) FROM t_no_bounds WHERE k >= 100;
+DROP TABLE t_no_bounds CASCADE;
+
+-- =============================================================================
+-- Test 3: Zero-copy format with upper bound (line 952)
+-- =============================================================================
+DROP TABLE IF EXISTS t_zerocopy_bound CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy_bound(k int8);
+-- Insert unique values to trigger zero-copy format
+INSERT INTO t_zerocopy_bound SELECT i FROM generate_series(1, 10000) i;
+SET smol.enable_zero_copy = on;
+CREATE INDEX t_zerocopy_bound_smol ON t_zerocopy_bound USING smol(k);
+RESET smol.enable_zero_copy;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Query with both lower and upper bounds on zero-copy index
+SELECT COUNT(*) FROM t_zerocopy_bound WHERE k >= 1000 AND k < 2000;
+-- Query that exceeds upper bound early (triggers stop_scan, lines 964-965)
+SELECT COUNT(*) FROM t_zerocopy_bound WHERE k < 100;
+DROP TABLE t_zerocopy_bound CASCADE;
+
+-- =============================================================================
+-- Test 4: Equality bound that stops scan (lines 977-978)
+-- =============================================================================
+DROP TABLE IF EXISTS t_equality_stop CASCADE;
+CREATE UNLOGGED TABLE t_equality_stop(k int4);
+-- Insert data that will span multiple pages
+INSERT INTO t_equality_stop SELECT (i % 10)::int4 FROM generate_series(1, 100000) i;
+CREATE INDEX t_equality_stop_smol ON t_equality_stop USING smol(k);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Equality query that will scan past the matching keys and trigger stop
+SELECT COUNT(*) FROM t_equality_stop WHERE k = 5;
+DROP TABLE t_equality_stop CASCADE;
+
+-- =============================================================================
+-- Test 5: Empty two-column index initialization (line 1486)
+-- =============================================================================
+DROP TABLE IF EXISTS t_empty_twocol CASCADE;
+CREATE UNLOGGED TABLE t_empty_twocol(k int4, v int4);
+-- Create two-column index on empty table
+CREATE INDEX t_empty_twocol_smol ON t_empty_twocol USING smol(k, v);
+-- Verify it works after insert
+INSERT INTO t_empty_twocol VALUES (1, 100);
+SELECT COUNT(*) FROM t_empty_twocol WHERE k = 1;
+DROP TABLE t_empty_twocol CASCADE;
+
+-- =============================================================================
+-- Test 6: Runtime key filtering on attribute 2 (lines 2042, 2047)
+-- =============================================================================
+DROP TABLE IF EXISTS t_runtime_keys CASCADE;
+CREATE UNLOGGED TABLE t_runtime_keys(k int4, v int4);
+INSERT INTO t_runtime_keys SELECT i, i*2 FROM generate_series(1, 5000) i;
+CREATE INDEX t_runtime_keys_smol ON t_runtime_keys USING smol(k, v);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Query with attribute 2 equality (line 2042)
+SELECT COUNT(*) FROM t_runtime_keys WHERE k >= 100 AND v = 200;
+-- Query with attribute 2 inequality (line 2047 - BTLessStrategyNumber)
+SELECT COUNT(*) FROM t_runtime_keys WHERE k >= 100 AND v < 500;
+DROP TABLE t_runtime_keys CASCADE;
+
+-- =============================================================================
+-- Test 7: Zero-copy binary search (line 2291)
+-- =============================================================================
+DROP TABLE IF EXISTS t_zerocopy_binsearch CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy_binsearch(k int8);
+INSERT INTO t_zerocopy_binsearch SELECT i FROM generate_series(1, 10000) i;
+SET smol.enable_zero_copy = on;
+CREATE INDEX t_zerocopy_binsearch_smol ON t_zerocopy_binsearch USING smol(k);
+RESET smol.enable_zero_copy;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Query that requires binary search within page
+SELECT COUNT(*) FROM t_zerocopy_binsearch WHERE k > 5000;
+DROP TABLE t_zerocopy_binsearch CASCADE;
+
+-- =============================================================================
+-- Test 8: Backward scan with runtime key filtering (lines 2693-2694)
+-- =============================================================================
+DROP TABLE IF EXISTS t_backward_runtime CASCADE;
+CREATE UNLOGGED TABLE t_backward_runtime(k int4, v int4);
+INSERT INTO t_backward_runtime SELECT i, i*2 FROM generate_series(1, 1000) i;
+CREATE INDEX t_backward_runtime_smol ON t_backward_runtime USING smol(k, v);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Backward scan with runtime key that filters some tuples
+SELECT k, v FROM t_backward_runtime WHERE k <= 100 AND v < 150 ORDER BY k DESC LIMIT 5;
+DROP TABLE t_backward_runtime CASCADE;
+
+-- =============================================================================
+-- Test 9: Zero-copy backward scan (lines 2714-2715)
+-- =============================================================================
+DROP TABLE IF EXISTS t_zerocopy_backward CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy_backward(k int8);
+INSERT INTO t_zerocopy_backward SELECT i FROM generate_series(1, 5000) i;
+SET smol.enable_zero_copy = on;
+CREATE INDEX t_zerocopy_backward_smol ON t_zerocopy_backward USING smol(k);
+RESET smol.enable_zero_copy;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Backward scan on zero-copy index
+SELECT k FROM t_zerocopy_backward WHERE k <= 1000 ORDER BY k DESC LIMIT 10;
+DROP TABLE t_zerocopy_backward CASCADE;
+
+-- =============================================================================
+-- Test 10: RLE format fast path (lines 2719, 2722)
+-- =============================================================================
+DROP TABLE IF EXISTS t_zerocopy_fastpath CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy_fastpath(k int4, v int4);
+-- Insert data that will use RLE format (moderate uniqueness)
+INSERT INTO t_zerocopy_fastpath SELECT (i % 100), i FROM generate_series(1, 10000) i;
+SET smol.enable_zero_copy = off;
+CREATE INDEX t_zerocopy_fastpath_smol ON t_zerocopy_fastpath USING smol(k, v);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+-- Query that should use RLE format fast path
+SELECT COUNT(*) FROM t_zerocopy_fastpath WHERE k >= 50 AND v > 5000;
+DROP TABLE t_zerocopy_fastpath CASCADE;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexonlyscan;

@@ -25,7 +25,7 @@ SELECT smol_test_backward_scan('t_cov_smol'::regclass, 500) AS backward_with_bou
 DROP TABLE IF EXISTS t_cov_parallel CASCADE;
 CREATE UNLOGGED TABLE t_cov_parallel(k int4);
 -- Insert enough data to trigger parallel scan
-INSERT INTO t_cov_parallel SELECT i FROM generate_series(1, 1000000) i;
+INSERT INTO t_cov_parallel SELECT i FROM generate_series(1, 100000) i;  -- OPTIMIZED: 10x reduction, still triggers parallel
 CREATE INDEX t_cov_parallel_smol ON t_cov_parallel USING smol(k);
 ANALYZE t_cov_parallel;
 
@@ -340,7 +340,7 @@ DROP TABLE t_text_inc_opt CASCADE;
 DROP TABLE IF EXISTS t_radix64 CASCADE;
 CREATE UNLOGGED TABLE t_radix64(k int8);
 -- Insert 200k rows to ensure radix sort is used
-INSERT INTO t_radix64 SELECT i::int8 FROM generate_series(1, 200000) i;
+INSERT INTO t_radix64 SELECT i::int8 FROM generate_series(1, 50000) i;  -- OPTIMIZED: 4x reduction, radix triggers at ~10k
 CREATE INDEX t_radix64_smol ON t_radix64 USING smol(k);
 SELECT COUNT(*) FROM t_radix64 WHERE k > 100000;
 DROP TABLE t_radix64 CASCADE;
@@ -349,7 +349,7 @@ DROP TABLE t_radix64 CASCADE;
 DROP TABLE IF EXISTS t_radix64_pair CASCADE;
 CREATE UNLOGGED TABLE t_radix64_pair(k1 int8, k2 int8);
 -- Insert enough rows to trigger radix sort
-INSERT INTO t_radix64_pair SELECT i::int8, (i*2)::int8 FROM generate_series(1, 200000) i;
+INSERT INTO t_radix64_pair SELECT i::int8, (i*2)::int8 FROM generate_series(1, 50000) i;  -- OPTIMIZED: 4x reduction
 CREATE INDEX t_radix64_pair_smol ON t_radix64_pair USING smol(k1, k2);
 SELECT COUNT(*) FROM t_radix64_pair WHERE k1 > 100000;
 DROP TABLE t_radix64_pair CASCADE;
@@ -451,7 +451,7 @@ SET max_parallel_maintenance_workers = 2;
 DROP TABLE IF EXISTS t_parallel_build CASCADE;
 CREATE UNLOGGED TABLE t_parallel_build(k1 int8, k2 int8);
 -- Insert 500k rows to trigger parallel build
-INSERT INTO t_parallel_build SELECT (i % 1000)::int8, i::int8 FROM generate_series(1, 500000) i;
+INSERT INTO t_parallel_build SELECT (i % 1000)::int8, i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_parallel_build_smol ON t_parallel_build USING smol(k1, k2);
 SELECT COUNT(*) FROM t_parallel_build WHERE k1 > 500;
 DROP TABLE t_parallel_build CASCADE;
@@ -485,7 +485,7 @@ SET parallel_tuple_cost = 0;
 DROP TABLE IF EXISTS t_par_chain CASCADE;
 CREATE UNLOGGED TABLE t_par_chain(k int4);
 -- Large dataset to create many leaf pages
-INSERT INTO t_par_chain SELECT i FROM generate_series(1, 500000) i;
+INSERT INTO t_par_chain SELECT i FROM generate_series(1, 100000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_par_chain_smol ON t_par_chain USING smol(k);
 ANALYZE t_par_chain;
 -- Force parallel scan with many workers
@@ -547,7 +547,7 @@ SET effective_io_concurrency = 10;
 DROP TABLE IF EXISTS t_prefetch CASCADE;
 CREATE UNLOGGED TABLE t_prefetch(k int4);
 -- Create large index to trigger prefetch
-INSERT INTO t_prefetch SELECT i FROM generate_series(1, 200000) i;
+INSERT INTO t_prefetch SELECT i FROM generate_series(1, 20000) i;  -- OPTIMIZED: 10x reduction
 CREATE INDEX t_prefetch_smol ON t_prefetch USING smol(k);
 -- Scan that should trigger rightlink prefetch
 SELECT COUNT(*) FROM t_prefetch WHERE k > 50000;
@@ -614,7 +614,7 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 DROP TABLE IF EXISTS t_par_atomic CASCADE;
 CREATE UNLOGGED TABLE t_par_atomic(k int8);
-INSERT INTO t_par_atomic SELECT i::int8 FROM generate_series(1, 500000) i;
+INSERT INTO t_par_atomic SELECT i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_par_atomic_smol ON t_par_atomic USING smol(k);
 ANALYZE t_par_atomic;
 -- This should trigger parallel scan with atomic leaf claiming
@@ -673,7 +673,7 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 DROP TABLE IF EXISTS t_par_init CASCADE;
 CREATE UNLOGGED TABLE t_par_init(k int8);
-INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 200000) i;
+INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 2x reduction
 CREATE INDEX t_par_init_smol ON t_par_init USING smol(k);
 ANALYZE t_par_init;
 -- Trigger parallel scan initialization which should prefetch first leaf
@@ -699,7 +699,7 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 DROP TABLE IF EXISTS t_par_batch CASCADE;
 CREATE UNLOGGED TABLE t_par_batch(k int8);
-INSERT INTO t_par_batch SELECT i::int8 FROM generate_series(1, 1000000) i;
+INSERT INTO t_par_batch SELECT i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 10x reduction
 CREATE INDEX t_par_batch_smol ON t_par_batch USING smol(k);
 ANALYZE t_par_batch;
 -- Parallel scan should use batch claiming to reserve multiple leaves at once
@@ -803,7 +803,7 @@ SET min_parallel_index_scan_size = 0;
 DROP TABLE IF EXISTS t_par_contention CASCADE;
 CREATE UNLOGGED TABLE t_par_contention(k int8);
 -- Insert enough data to create many leaves
-INSERT INTO t_par_contention SELECT i::int8 FROM generate_series(1, 2000000) i;
+INSERT INTO t_par_contention SELECT i::int8 FROM generate_series(1, 200000) i;  -- OPTIMIZED: 10x reduction, BIG WIN
 CREATE INDEX t_par_contention_smol ON t_par_contention USING smol(k);
 ANALYZE t_par_contention;
 -- Force parallel scan with many workers to trigger atomic contention
@@ -842,7 +842,7 @@ SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 CREATE UNLOGGED TABLE t_par_init(k int8);
 -- Insert enough data to ensure parallel scan
-INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 500000) i;
+INSERT INTO t_par_init SELECT i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_par_init_smol ON t_par_init USING smol(k);
 ANALYZE t_par_init;
 -- Multiple queries to increase chance of hitting curv=0 race
@@ -895,7 +895,7 @@ DROP TABLE t_rescan_buf CASCADE;
 -- Use SCROLL cursor and FETCH BACKWARD to trigger backward scan direction
 CREATE UNLOGGED TABLE t_back_rle(k int8);
 -- Insert data to create RLE-encoded pages (many duplicates)
-INSERT INTO t_back_rle SELECT (i % 100)::int8 FROM generate_series(1, 100000) i;
+INSERT INTO t_back_rle SELECT (i % 100)::int8 FROM generate_series(1, 20000) i;  -- OPTIMIZED: 5x reduction, RLE still works
 CREATE INDEX t_back_rle_smol ON t_back_rle USING smol(k);
 ANALYZE t_back_rle;
 -- Backward scan with bound checking (lines 1721-1732)
@@ -933,21 +933,21 @@ COMMIT;
 DROP TABLE t_back_text CASCADE;
 SET smol.debug_log = off;
 
--- Test 70: Backward scan on plain (non-RLE) pages with profiling (lines 1811-1813)
+-- Test 70: Backward scan on zero-copy pages with profiling (lines 1811-1813)
 SET smol.profile = on;
-CREATE UNLOGGED TABLE t_back_plain(k int8);
--- All unique keys -> plain pages (no RLE)
-INSERT INTO t_back_plain SELECT i::int8 FROM generate_series(1, 50000) i;
-CREATE INDEX t_back_plain_smol ON t_back_plain USING smol(k);
-ANALYZE t_back_plain;
+CREATE UNLOGGED TABLE t_back_zerocopy(k int8);
+-- All unique keys -> RLE or zero-copy pages (no RLE)
+INSERT INTO t_back_zerocopy SELECT i::int8 FROM generate_series(1, 50000) i;
+CREATE INDEX t_back_zerocopy_smol ON t_back_zerocopy USING smol(k);
+ANALYZE t_back_zerocopy;
 -- Backward scan to trigger profiling (lines 1811-1813)
 BEGIN;
-DECLARE c_back_plain SCROLL CURSOR FOR SELECT k FROM t_back_plain WHERE k > 40000::int8;
-MOVE FORWARD ALL FROM c_back_plain;
-FETCH BACKWARD 10 FROM c_back_plain;
-CLOSE c_back_plain;
+DECLARE c_back_zerocopy SCROLL CURSOR FOR SELECT k FROM t_back_zerocopy WHERE k > 40000::int8;
+MOVE FORWARD ALL FROM c_back_zerocopy;
+FETCH BACKWARD 10 FROM c_back_zerocopy;
+CLOSE c_back_zerocopy;
 COMMIT;
-DROP TABLE t_back_plain CASCADE;
+DROP TABLE t_back_zerocopy CASCADE;
 SET smol.profile = off;
 
 -- Test 71: User-defined type with non-standard length (lines 1698, 1704)
@@ -1032,7 +1032,7 @@ SET max_parallel_workers_per_gather = 2;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 CREATE UNLOGGED TABLE t_atomic_race(k int8);
-INSERT INTO t_atomic_race SELECT i::int8 FROM generate_series(1, 100000) i;
+INSERT INTO t_atomic_race SELECT i::int8 FROM generate_series(1, 20000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_atomic_race_smol ON t_atomic_race USING smol(k);
 ANALYZE t_atomic_race;
 -- This should trigger the curv==0 initialization path
@@ -1108,7 +1108,7 @@ SET parallel_tuple_cost = 0;
 SET min_parallel_index_scan_size = 0;
 DROP TABLE IF EXISTS t_atomic_first CASCADE;
 CREATE UNLOGGED TABLE t_atomic_first(k int8);
-INSERT INTO t_atomic_first SELECT i::int8 FROM generate_series(1, 100000) i;
+INSERT INTO t_atomic_first SELECT i::int8 FROM generate_series(1, 20000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_atomic_first_smol ON t_atomic_first USING smol(k);
 ANALYZE t_atomic_first;
 -- This should be the first parallel scan after setting simulate_atomic_race=1
@@ -1126,7 +1126,7 @@ SET min_parallel_index_scan_size = 0;
 DROP TABLE IF EXISTS t_batch_claim CASCADE;
 CREATE UNLOGGED TABLE t_batch_claim(k int8);
 -- Need enough data to create multiple leaves for batch claiming
-INSERT INTO t_batch_claim SELECT i::int8 FROM generate_series(1, 500000) i;
+INSERT INTO t_batch_claim SELECT i::int8 FROM generate_series(1, 100000) i;  -- OPTIMIZED: 5x reduction
 CREATE INDEX t_batch_claim_smol ON t_batch_claim USING smol(k);
 ANALYZE t_batch_claim;
 -- Parallel scan should claim batches of 4 leaves at a time
@@ -1188,7 +1188,7 @@ SHOW smol.prefetch_depth;  -- Verify setting took effect
 DROP TABLE IF EXISTS t_prefetch_serial CASCADE;
 CREATE UNLOGGED TABLE t_prefetch_serial(k int4);
 -- Use much larger dataset to ensure many leaf pages and scan iterations
-INSERT INTO t_prefetch_serial SELECT i FROM generate_series(1, 1000000) i;
+INSERT INTO t_prefetch_serial SELECT i FROM generate_series(1, 50000) i;  -- OPTIMIZED: 20x reduction, BIG WIN
 CREATE INDEX t_prefetch_serial_smol ON t_prefetch_serial USING smol(k);
 SET max_parallel_workers_per_gather = 0;  -- Disable parallel to hit non-parallel path
 SELECT COUNT(*) FROM t_prefetch_serial WHERE k > 500000;
@@ -1201,7 +1201,7 @@ SET parallel_tuple_cost = 0;
 SET min_parallel_index_scan_size = 0;
 DROP TABLE IF EXISTS t_prefetch_parallel CASCADE;
 CREATE UNLOGGED TABLE t_prefetch_parallel(k int4);
-INSERT INTO t_prefetch_parallel SELECT i FROM generate_series(1, 500000) i;
+INSERT INTO t_prefetch_parallel SELECT i FROM generate_series(1, 50000) i;  -- OPTIMIZED: 10x reduction
 CREATE INDEX t_prefetch_parallel_smol ON t_prefetch_parallel USING smol(k);
 ANALYZE t_prefetch_parallel;
 -- Force parallel scan

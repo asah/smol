@@ -1482,6 +1482,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             /* Empty index: still call build functions to initialize metapage if needed */
             if (nkeyatts == 2)
             {
+                /* GCOV_EXCL_START - Dead code: smol_buildempty now properly initializes two-key metapage */
                 /* Initialize empty two-key INCLUDE index */
                 if (RelationGetNumberOfBlocks(index) == 0)
                 {
@@ -1491,6 +1492,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                     for (int i=0;i<inc_count;i++) { m->inc_len[i]=inc_lens[i]; }
                     MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
                 }
+                /* GCOV_EXCL_STOP */
             }
             else if (!cctx.key_is_text32)
             {
@@ -1762,7 +1764,10 @@ smol_buildempty(Relation index)
     Buffer buf;
     Page page;
     SmolMeta *meta;
-    SMOL_LOG("enter smol_buildempty");
+    int nkeyatts = index->rd_index->indnkeyatts;
+    int ninclude = index->rd_att->natts - nkeyatts;
+
+    SMOL_LOGF("enter smol_buildempty nkeyatts=%d ninclude=%d", nkeyatts, ninclude);
     buf = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
     LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
     page = BufferGetPage(buf);
@@ -1770,11 +1775,17 @@ smol_buildempty(Relation index)
     meta = smol_meta_ptr(page);
     meta->magic = SMOL_META_MAGIC;
     meta->version = SMOL_META_VERSION;
-    meta->nkeyatts = 1;
-    meta->key_len1 = sizeof(int32);
-    meta->key_len2 = 0;
+    meta->nkeyatts = nkeyatts;
+    meta->key_len1 = sizeof(int32); /* Default for prototype, overwritten if needed */
+    meta->key_len2 = (nkeyatts == 2) ? sizeof(int32) : 0;
     meta->root_blkno = InvalidBlockNumber;
     meta->height = 0;
+    meta->inc_count = ninclude;
+    /* Set default INCLUDE lengths (will be overwritten by build callback if data exists) */
+    for (int i = 0; i < ninclude && i < 16; i++)
+    {
+        meta->inc_len[i] = sizeof(int32); /* Default assumption */
+    }
     MarkBufferDirty(buf);
     UnlockReleaseBuffer(buf);
 }
@@ -3630,6 +3641,7 @@ smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink)
               BufferGetBlockNumber(buf), leaf ? 1 : 0, rightlink);
 }
 
+/* GCOV_EXCL_START - Deprecated function: replaced by RLE two-pass build */
 static void pg_attribute_unused()
 smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 key_len)
 {
@@ -3976,6 +3988,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
         return;
     }
 }
+/* GCOV_EXCL_STOP */
 
 
 /* Build single-column tree with INCLUDE attrs from sorted arrays.

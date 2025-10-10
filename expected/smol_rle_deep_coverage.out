@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS smol;
 DROP TABLE IF EXISTS t_key_rle_with_inc CASCADE;
 CREATE UNLOGGED TABLE t_key_rle_with_inc (k int8, v1 int4, v2 int4);
 -- Insert data that creates key-only RLE
--- When keys are highly repetitive but we have includes, we might get 0x8001 + plain includes
+-- When keys are highly repetitive but we have includes, we might get 0x8001 + columnar includes
 INSERT INTO t_key_rle_with_inc
 SELECT
     ((i / 1000) % 10)::int8 AS k,

@@ -27,8 +27,6 @@
       "Bash(/dev/null)",
       "Bash(cat:*)",
       "Bash(python3:*)",
-      "Bash(COVERAGE=1 make installcheck REGRESS=smol_plain_include_cache)",
-      "Bash(env COVERAGE=1 make installcheck REGRESS=smol_plain_include_cache)",
       "Bash(for line in 1606 1611 1616 1617 1618 2211 2212 2340 2424 2425)",
       "Bash(do sed -n \"$linep\" smol.c)",
       "Bash(done)",
@@ -70,7 +68,12 @@
       "Bash(nm:*)",
       "Bash(env COVERAGE=1 make all)",
       "Bash(env COVERAGE=1 make installcheck REGRESS=smol_parallel)",
-      "Bash(xargs -r kill -9)"
+      "Bash(xargs -r kill -9)",
+      "Bash(git checkout:*)",
+      "Bash(timeout 180 make installcheck)",
+      "Bash(COVERAGE=1 make all)",
+      "Bash(COVERAGE=1 make clean all)",
+      "Bash(time:*)"
     ],
     "deny": [],
     "ask": []

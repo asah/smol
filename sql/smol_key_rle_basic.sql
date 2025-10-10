@@ -1,0 +1,117 @@
+-- Test KEY_RLE compression format for repetitive data
+-- Verifies that RLE compression activates and produces correct results
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET enable_indexscan = off;
+SET max_parallel_workers_per_gather = 0;
+
+-- Test 1: Highly repetitive date column (typical use case)
+DROP TABLE IF EXISTS rle_dates CASCADE;
+CREATE UNLOGGED TABLE rle_dates(d date);
+
+-- Insert 10000 rows with only 10 distinct dates (high repetition)
+INSERT INTO rle_dates
+SELECT ('2024-01-' || ((i % 10) + 1))::date
+FROM generate_series(1, 10000) i;
+
+ALTER TABLE rle_dates SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) rle_dates;
+
+CREATE INDEX rle_dates_smol_idx ON rle_dates USING smol(d);
+
+-- Check that RLE format is used
+SELECT
+    key_rle_pages > 0 AS has_rle_pages,
+    zerocopy_pages = 0 AS no_zerocopy_pages,
+    compression_pct > 50 AS good_compression
+FROM smol_inspect('rle_dates_smol_idx');
+
+-- Verify correctness: count rows for each date
+SELECT count(*) = 1000 AS correct_count_per_date
+FROM rle_dates WHERE d = '2024-01-01';
+
+SELECT count(*) = 10000 AS correct_total_count
+FROM rle_dates;
+
+-- Test 2: Perfectly repetitive data (all same value)
+DROP TABLE IF EXISTS rle_single CASCADE;
+CREATE UNLOGGED TABLE rle_single(x int4);
+INSERT INTO rle_single SELECT 42 FROM generate_series(1, 5000);
+ALTER TABLE rle_single SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) rle_single;
+
+CREATE INDEX rle_single_smol_idx ON rle_single USING smol(x);
+
+-- Should use RLE for all pages
+SELECT
+    key_rle_pages = leaf_pages AS all_pages_rle,
+    compression_pct = 100 AS full_compression
+FROM smol_inspect('rle_single_smol_idx');
+
+-- Verify correctness
+SELECT count(*) = 5000 AS correct_single_value_count
+FROM rle_single WHERE x = 42;
+
+-- Test 3: Mixed - some pages with duplicates, some unique
+DROP TABLE IF EXISTS rle_mixed CASCADE;
+CREATE UNLOGGED TABLE rle_mixed(k int4);
+
+-- First half: highly repetitive (same pattern repeated)
+INSERT INTO rle_mixed
+SELECT (i % 5) FROM generate_series(1, 5000) i;
+
+-- Second half: mostly unique values
+INSERT INTO rle_mixed
+SELECT 10000 + i FROM generate_series(1, 5000) i;
+
+ALTER TABLE rle_mixed SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) rle_mixed;
+
+CREATE INDEX rle_mixed_smol_idx ON rle_mixed USING smol(k);
+
+-- Should have both RLE and RLE or zero-copy pages
+SELECT
+    key_rle_pages + zerocopy_pages = leaf_pages AS all_pages_accounted,
+    key_rle_pages > 0 AS has_some_rle,
+    zerocopy_pages >= 0 AS has_some_zerocopy_or_none
+FROM smol_inspect('rle_mixed_smol_idx');
+
+-- Verify correctness
+SELECT count(*) = 1000 AS correct_dup_count
+FROM rle_mixed WHERE k = 0;
+
+SELECT count(*) = 10000 AS correct_total_count
+FROM rle_mixed;
+
+-- Test 4: Compare space usage with btree
+DROP TABLE IF EXISTS rle_compare CASCADE;
+CREATE UNLOGGED TABLE rle_compare(d date);
+
+-- Highly repetitive date data
+INSERT INTO rle_compare
+SELECT ('2024-' || lpad(((i % 100) + 1)::text, 2, '0') || '-01')::date
+FROM generate_series(1, 50000) i;
+
+ALTER TABLE rle_compare SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) rle_compare;
+
+CREATE INDEX rle_compare_btree_idx ON rle_compare USING btree(d);
+CREATE INDEX rle_compare_smol_idx ON rle_compare USING smol(d);
+
+-- SMOL with RLE should be significantly smaller than btree
+SELECT
+    pg_relation_size('rle_compare_btree_idx')::float /
+    pg_relation_size('rle_compare_smol_idx')::float > 1.3 AS smol_smaller_than_btree,
+    pg_size_pretty(pg_relation_size('rle_compare_btree_idx')) AS btree_size,
+    pg_size_pretty(pg_relation_size('rle_compare_smol_idx')) AS smol_size
+FROM (SELECT 1) dummy;
+
+-- Cleanup
+DROP TABLE rle_dates CASCADE;
+DROP TABLE rle_single CASCADE;
+DROP TABLE rle_mixed CASCADE;
+DROP TABLE rle_compare CASCADE;

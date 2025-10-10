@@ -22,7 +22,7 @@ DROP TABLE t_rle_mismatch CASCADE;
 
 -- Test multi-column include with RLE run break on second column (line 3457)
 -- This specifically targets the inner loop that checks include value mismatches
--- Need MANY duplicate keys to trigger Include-RLE format (not plain format)
+-- Need MANY duplicate keys to trigger Include-RLE format (not RLE format)
 DROP TABLE IF EXISTS t_multi_inc CASCADE;
 CREATE UNLOGGED TABLE t_multi_inc (k text, v1 int4, v2 int4);
 

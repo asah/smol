@@ -129,8 +129,8 @@ CREATE INDEX t_inc_rle_huge_smol ON t_inc_rle_huge USING smol(k) INCLUDE (v);
 SELECT count(*) FROM t_inc_rle_huge WHERE k = 0;
 
 -- ============================================================================
--- Test 6: Mixed RLE and plain formats on same index
--- Some pages use RLE, some use plain (depends on repetition)
+-- Test 6: Mixed RLE and RLE formats on same index
+-- Some pages use RLE, some use zero-copy (depends on repetition)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_inc_rle_mixed CASCADE;
@@ -145,7 +145,7 @@ SELECT
     ((i / 100) * 3)::int4 AS v2
 FROM generate_series(1, 5000) i;
 
--- Next 5000: mostly unique (should use plain format)
+-- Next 5000: mostly unique (should use RLE format)
 INSERT INTO t_inc_rle_mixed
 SELECT
     (5000 + i)::int8 AS k,
@@ -157,7 +157,7 @@ CREATE INDEX t_inc_rle_mixed_smol ON t_inc_rle_mixed USING smol(k) INCLUDE (v1, 
 
 -- Query both regions
 SELECT count(*) FROM t_inc_rle_mixed WHERE k < 50;  -- RLE region
-SELECT count(*) FROM t_inc_rle_mixed WHERE k >= 5000;  -- Plain region
+SELECT count(*) FROM t_inc_rle_mixed WHERE k >= 5000;  -- RLE region
 
 -- ============================================================================
 -- Test 7: Include-RLE with multiple include columns (lines 3138-3143)

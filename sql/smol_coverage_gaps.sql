@@ -1,0 +1,64 @@
+-- Additional coverage tests for uncovered code paths
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test 1: Empty two-column index
+DROP TABLE IF EXISTS t_empty_twocol CASCADE;
+CREATE UNLOGGED TABLE t_empty_twocol(k int4, v int4);
+-- Create two-column index on empty table (covers lines 1486-1492)
+CREATE INDEX t_empty_twocol_smol ON t_empty_twocol USING smol(k, v);
+-- Verify it works after inserting data
+INSERT INTO t_empty_twocol VALUES (1, 100), (2, 200);
+SELECT COUNT(*) FROM t_empty_twocol WHERE k >= 1;
+DROP TABLE t_empty_twocol CASCADE;
+
+-- Test 2: Equality bound that stops scan across pages
+DROP TABLE IF EXISTS t_equality_bound CASCADE;
+CREATE UNLOGGED TABLE t_equality_bound(k int4);
+-- Insert enough data to span multiple pages
+INSERT INTO t_equality_bound SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX t_equality_bound_smol ON t_equality_bound USING smol(k);
+-- Equality query that should stop early (covers lines 977-978)
+SELECT COUNT(*) FROM t_equality_bound WHERE k = 50000;
+DROP TABLE t_equality_bound CASCADE;
+
+-- Test 3: Upper bound check with zero-copy format
+DROP TABLE IF EXISTS t_zerocopy_bound CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy_bound(k int8);
+-- Insert unique values to trigger zero-copy format
+INSERT INTO t_zerocopy_bound SELECT i FROM generate_series(1, 10000) i;
+-- Force zero-copy format
+SET smol.enable_zero_copy = on;
+CREATE INDEX t_zerocopy_bound_smol ON t_zerocopy_bound USING smol(k);
+RESET smol.enable_zero_copy;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Upper bound query on zero-copy page (covers line 952, 977-978)
+SELECT COUNT(*) FROM t_zerocopy_bound WHERE k < 5000;
+SELECT COUNT(*) FROM t_zerocopy_bound WHERE k BETWEEN 1000 AND 2000;
+DROP TABLE t_zerocopy_bound CASCADE;
+
+-- Test 4: Runtime parameter filtering (covers lines 2042, 2047)
+-- Note: This is tricky to trigger as it requires specific scan key conditions
+-- that PostgreSQL planner generates. The code handles BTGreaterEqualStrategyNumber
+-- and BTLessStrategyNumber on attribute 2 in two-column indexes.
+DROP TABLE IF EXISTS t_runtime_filter CASCADE;
+CREATE UNLOGGED TABLE t_runtime_filter(k int4, v int4);
+INSERT INTO t_runtime_filter SELECT i, i*2 FROM generate_series(1, 1000) i;
+CREATE INDEX t_runtime_filter_smol ON t_runtime_filter USING smol(k, v);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Query with bounds on both columns
+SELECT COUNT(*) FROM t_runtime_filter WHERE k >= 100 AND v < 500;
+DROP TABLE t_runtime_filter CASCADE;
+
+-- Test 5: Empty page detection (lines 940, 944)
+-- This is difficult to create naturally, but we can try with a very sparse index
+DROP TABLE IF EXISTS t_sparse CASCADE;
+CREATE UNLOGGED TABLE t_sparse(k int4);
+-- Single value
+INSERT INTO t_sparse VALUES (1);
+CREATE INDEX t_sparse_smol ON t_sparse USING smol(k);
+-- Query with bounds
+SELECT COUNT(*) FROM t_sparse WHERE k >= 0;
+SELECT COUNT(*) FROM t_sparse WHERE k > 1000;
+DROP TABLE t_sparse CASCADE;

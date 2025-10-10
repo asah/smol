@@ -3,6 +3,31 @@
 This file summarizes the hard‑won details needed to work on the `smol`
 PostgreSQL 18 index access method in this repo.
 
+## CRITICAL: 100% Code Coverage Policy
+
+**We demand 100.0% code coverage including all edge cases.**
+
+The whole point of automated testing is to test everything.
+GCOV_EXCL is ONLY allowed for:
+1. Deprecated functions (should be deleted eventually)
+2. Assertions that provably can never fire
+3. Debug logging code not executed in tests
+
+NOT allowed to exclude:
+- ❌ Edge cases (MUST be tested)
+- ❌ Error paths (MUST be tested)
+- ❌ "Hard to test" code (write the test anyway)
+
+Calculate effective coverage (excluding GCOV_EXCL):
+```bash
+awk '/GCOV_EXCL_START/{excl=1;next}/GCOV_EXCL_STOP/{excl=0;next}excl{next}/^ *-:/{next}/^ *#####:.*GCOV_EXCL/{next}/^ *#####:/{uncov++}/^ *[0-9]+:/{cov++}END{total=cov+uncov;if(total>0){pct=(cov*100.0)/total;printf "Effective Coverage: %.2f%% (%d/%d)\n",pct,cov,total}}' smol.c.gcov
+```
+
+**Current: 94.06% - NEEDS IMPROVEMENT TO 100%**
+**TODO: Remove GCOV_EXCL_LINE from edge cases and write proper tests**
+
+See COVERAGE.md for complete details.
+
 Working Notes
 - User-facing overview lives in `README.md`.
 - Benchmarking docs and usage are consolidated in `BENCHMARKING.md`.
@@ -183,18 +208,16 @@ Practical guidance
 ## RLE (single-key)
 - Single-key leaves always attempt RLE encoding; no GUC toggle. Reader transparently decodes both formats.
 - Rationale: shrink duplicate-heavy runs (e.g., many equal keys) without changing planner or scan semantics.
-- On-disk (RLE leaf payload): `[u16 tag=0x8001][u16 nitems][u16 nruns][runs...]` where each run is `[key bytes][u16 count]`. Plain payload remains `[u16 n][keys...]`.
+- On-disk (RLE leaf payload): `[u16 tag=0x8001][u16 nitems][u16 nruns][runs...]` where each run is `[key bytes][u16 count]`.
 - Reader changes: `smol_leaf_nitems()` now returns `nitems` for RLE; `smol_leaf_keyptr()` maps a 1-based index to the run’s key pointer by summing counts. Binary search and run-skip logic continue to work unmodified.
-- Build path: each leaf chunk is analyzed; if `sizeof(RLE) < sizeof(plain)` it emits RLE, otherwise plain. No changes for INCLUDE path yet.
 
 ## Duplicate-caching for INCLUDE (single-key)
 - Scan now caches INCLUDE bytes across equal-key runs: when all INCLUDE columns are constant within a run, SMOL copies them once at run start and skips memcpy for the rest of the run.
 - This reduces per-row CPU materially for SUM-like projections on duplicate-heavy keys. We detect constancy once per run and reuse the decision.
-- Reader supports both plain and RLE pages; INCLUDE dup-caching applies to both layouts.
 
 ## Include‑RLE (tag 0x8003) - IMPLEMENTED ✓
 - Reader can locate INCLUDE data in a per-run RLE layout (tag `0x8003`): `[tag][nitems][nruns] [run: key||u16 count||inc1||inc2..]*`.
-- Writer implemented (smol.c:2864-2909, 3073-3117): emits `0x8003` when all INCLUDEs in a run are constant and the encoded size beats the plain layout.
+- Writer implemented (smol.c:2864-2909, 3073-3117): emits `0x8003` when all INCLUDEs in a run are constant.
 - Provides 10-30% additional space savings on INCLUDE-heavy workloads with duplicate keys.
 
 ## RLE opportunity (design)
@@ -210,9 +233,7 @@ Practical guidance
 
 # Performance status (OPTIMIZED ✓)
 - Run-detection optimization: IMPLEMENTED ✅ (smol.c:1645-1650, 1767-1770, 1887-1890)
-  - Checks page type ONCE per page via `so->page_is_plain = !smol_leaf_is_rle(page)`
   - Only applies when `!two_col && ninclude==0` (single-key, no INCLUDE columns)
-  - On plain pages: sets `start = end = so->cur_off` (run length = 1) without scanning
   - Eliminates 60% CPU overhead on unique-key workloads
   - SMOL now competitive with BTREE on unique data (15ms vs 13.5ms, but 81% smaller)
 - Include-RLE writer: IMPLEMENTED ✅ (smol.c:2864-2909, 3073-3117)
