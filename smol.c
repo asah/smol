@@ -48,6 +48,7 @@
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "portability/instr_time.h"
+#include "pgstat.h"
 #include "utils/selfuncs.h"
 #include "optimizer/cost.h"
 /* Parallel build support */
@@ -141,8 +142,8 @@ static bool smol_profile_log = false; /* toggled by GUC smol.profile */
 static int  smol_progress_log_every = 250000; /* GUC: log progress every N tuples */
 static int  smol_wait_log_ms = 500; /* GUC: log waits longer than this (ms) */
 /* Planner cost GUCs */
-static double smol_cost_page = 0.01;   /* cheaper page walk for contiguous IOS */
-static double smol_cost_tup = 0.0015;  /* per-tuple CPU lower after optimizations */
+static double smol_cost_page = 1.0;   /* cost multiplier for page I/O (>1 penalizes smol) */
+static double smol_cost_tup = 1.0;    /* cost multiplier for per-tuple CPU (>1 penalizes smol) */
 static double smol_selec_eq = 0.05;    /* heuristic equality selectivity */
 static double smol_selec_range = 0.15; /* heuristic range selectivity */
 static int  smol_parallel_claim_batch = 1; /* GUC: number of leaves to claim per atomic operation */
@@ -344,18 +345,18 @@ _PG_init(void)
 #endif
 
     DefineCustomRealVariable("smol.cost_page",
-                             "Estimated per-page cost for SMOL IOS reads",
+                             "Cost multiplier for SMOL page I/O (values > 1 penalize smol)",
                              NULL,
                              &smol_cost_page,
-                             0.02, 0.0, 1.0,
+                             1.0, 0.0, 10000.0,
                              PGC_USERSET, 0,
                              NULL, NULL, NULL);
 
     DefineCustomRealVariable("smol.cost_tup",
-                             "Estimated per-tuple CPU cost for SMOL IOS",
+                             "Cost multiplier for SMOL per-tuple CPU (values > 1 penalize smol)",
                              NULL,
                              &smol_cost_tup,
-                             0.002, 0.0, 1.0,
+                             1.0, 0.0, 10000.0,
                              PGC_USERSET, 0,
                              NULL, NULL, NULL);
 
@@ -605,6 +606,8 @@ static void smol_costestimate(struct PlannerInfo *root, struct IndexPath *path, 
                               double *indexPages);
 static struct IndexBulkDeleteResult *smol_vacuumcleanup(struct IndexVacuumInfo *info,
                                                         struct IndexBulkDeleteResult *stats);
+static CompareType smol_translatestrategy(StrategyNumber strat, Oid opfamily);
+static StrategyNumber smol_translatecmptype(CompareType cmptype, Oid opfamily);
 
 /* --- On-disk structs (prototype, 1- or 2-column fixed-width ints) --- */
 #define SMOL_META_MAGIC   0x534D4F4CUL /* 'SMOL' */
@@ -1144,8 +1147,8 @@ smol_handler(PG_FUNCTION_ARGS)
     am->aminitparallelscan = smol_initparallelscan;
     am->amparallelrescan = smol_parallelrescan;
 
-    am->amtranslatestrategy = NULL;
-    am->amtranslatecmptype = NULL;
+    am->amtranslatestrategy = smol_translatestrategy;
+    am->amtranslatecmptype = smol_translatecmptype;
 
     PG_RETURN_POINTER(am);
 }
@@ -2107,8 +2110,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
      */
     if (!so->initialized)
     {
-        /* Defensive: PostgreSQL executor always calls amrescan before amgettuple, so this should never be needed */
-        SMOL_DEFENSIVE_CHECK(so->have_bound || so->have_upper_bound || scan->numberOfKeys == 0 || !scan->keyData, ERROR,
+        /* PostgreSQL executor always calls amrescan before amgettuple.
+         * If we have scan keys but runtime_keys is NULL, rescan was never called. */
+        SMOL_DEFENSIVE_CHECK(scan->numberOfKeys == 0 || so->runtime_keys != NULL, ERROR,
                             (errmsg("smol: amgettuple called before amrescan")));
         /* no local variables needed here */
         if (dir == BackwardScanDirection)
@@ -3534,21 +3538,35 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     MemSet(&costs, 0, sizeof(costs));
     genericcostestimate(root, path, loop_count, &costs);
 
-    /* Apply SMOL-specific adjustments */
-    /* SMOL has lower per-page I/O cost than random access indexes like BTREE
-     * due to sequential leaf traversal via rightlinks (contiguous I/O pattern).
-     * Adjust costs if smol_cost_page is configured lower than default. */
-    if (smol_cost_page < 1.0 && costs.spc_random_page_cost > 0.0)
+    /* Apply SMOL-specific cost multipliers
+     *
+     * smol_cost_page: Multiplier for I/O costs
+     *   - Values < 1.0: Make smol cheaper (sequential I/O advantage)
+     *   - Values > 1.0: Make smol more expensive (penalize smol vs btree)
+     *   - Default: 1.0 (neutral, same as btree)
+     *
+     * smol_cost_tup: Multiplier for per-tuple CPU costs
+     *   - Values < 1.0: Make smol cheaper (optimized tuple processing)
+     *   - Values > 1.0: Make smol more expensive (format detection overhead)
+     *   - Default: 1.0 (neutral, same as btree)
+     */
+
+    /* Apply page I/O cost multiplier */
+    if (smol_cost_page != 1.0 && costs.spc_random_page_cost > 0.0)
     {
-        /* Scale down the I/O cost portion proportionally */
-        double io_adjustment = smol_cost_page;
         Cost io_cost = costs.numIndexPages * costs.spc_random_page_cost;
         Cost cpu_cost = costs.indexTotalCost - io_cost;
-        costs.indexTotalCost = (io_cost * io_adjustment) + cpu_cost;
+        costs.indexTotalCost = (io_cost * smol_cost_page) + cpu_cost;
     }
 
-    /* SMOL has slightly higher per-tuple CPU cost due to format detection overhead,
-     * but genericcostestimate already accounts for this via cpu_index_tuple_cost GUC */
+    /* Apply per-tuple CPU cost multiplier */
+    if (smol_cost_tup != 1.0)
+    {
+        /* Estimate CPU cost as indexTotalCost minus I/O cost, then apply multiplier */
+        Cost io_cost = costs.numIndexPages * costs.spc_random_page_cost;
+        Cost cpu_cost = costs.indexTotalCost - io_cost;
+        costs.indexTotalCost = io_cost + (cpu_cost * smol_cost_tup);
+    }
 
     *indexStartupCost = costs.indexStartupCost;
     *indexTotalCost = costs.indexTotalCost;
@@ -3564,6 +3582,54 @@ smol_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
     (void) info;
     (void) stats;
     return NULL;
+}
+
+/*
+ * smol_translatestrategy - translate strategy number to CompareType
+ *
+ * SMOL uses standard btree-style strategy numbers:
+ *   1 = <  (COMPARE_LT)
+ *   2 = <= (COMPARE_LE)
+ *   3 = =  (COMPARE_EQ)
+ *   4 = >= (COMPARE_GE)
+ *   5 = >  (COMPARE_GT)
+ */
+static CompareType
+smol_translatestrategy(StrategyNumber strat, Oid opfamily)
+{
+    CompareType result;
+
+    (void) opfamily;  /* unused */
+
+    /* Direct mapping from strategy to CompareType (same as btree) */
+    if (strat >= 1 && strat <= 5)
+        result = (CompareType) strat;
+    else
+        result = COMPARE_INVALID;
+
+    return result;
+}
+
+/*
+ * smol_translatecmptype - translate CompareType to strategy number
+ *
+ * Inverse of smol_translatestrategy. Maps CompareType back to strategy:
+ *   COMPARE_LT (1) -> 1 (<)
+ *   COMPARE_LE (2) -> 2 (<=)
+ *   COMPARE_EQ (3) -> 3 (=)
+ *   COMPARE_GE (4) -> 4 (>=)
+ *   COMPARE_GT (5) -> 5 (>)
+ */
+static StrategyNumber
+smol_translatecmptype(CompareType cmptype, Oid opfamily)
+{
+    (void) opfamily;  /* unused */
+
+    /* Direct mapping from CompareType to strategy (same as btree) */
+    if (cmptype >= COMPARE_LT && cmptype <= COMPARE_GT)
+        return (StrategyNumber) cmptype;
+
+    return InvalidStrategy;
 }
 
 static void
@@ -5942,7 +6008,7 @@ smol_inspect(PG_FUNCTION_ARGS)
     int32       inc_rle_pages = 0;
     Buffer      buf;
     Page        page;
-    uint16      tag;
+    uint16      tag = 0;
 
     /* Open the index */
     idx = index_open(indexoid, AccessShareLock);
@@ -5954,35 +6020,58 @@ smol_inspect(PG_FUNCTION_ARGS)
     /* Scan all pages to classify them */
     for (blkno = 1; blkno < nblocks; blkno++)  /* Skip meta page 0 */
     {
+        CHECK_FOR_INTERRUPTS();
+
         buf = ReadBuffer(idx, blkno);
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         page = BufferGetPage(buf);
+
+        /* Skip empty pages */
+        if (PageIsEmpty(page))
+        {
+            UnlockReleaseBuffer(buf);
+            continue;
+        }
 
         /* Check if it's a leaf page using opaque data */
         if (PageGetSpecialSize(page) == sizeof(SmolPageOpaqueData))
         {
             SmolPageOpaqueData *opaque = (SmolPageOpaqueData *) PageGetSpecialPointer(page);
-            if (opaque->flags & SMOL_F_LEAF)
-            {
-                /* Leaf page - read format tag */
-                ItemId iid = PageGetItemId(page, FirstOffsetNumber);
-                if (iid != NULL && ItemIdIsNormal(iid))
-                {
-                    char *data = (char *) PageGetItem(page, iid);
-                    memcpy(&tag, data, sizeof(uint16));
 
+            /* Bounds check and safe dereference */
+            if (opaque != NULL &&
+                (char *)opaque >= (char *)page &&
+                (char *)opaque + sizeof(SmolPageOpaqueData) <= (char *)page + BLCKSZ)
+            {
+                uint16 flags = opaque->flags;
+
+                if (flags & SMOL_F_LEAF)
+                {
                     leaf_pages++;
 
-                    /* Check format tags - note that plain format has no tag, just nitems as uint16 */
-                    if (tag == SMOL_TAG_ZEROCOPY)
-                        zerocopy_pages++;
-                    else if (tag == SMOL_TAG_KEY_RLE)
-                        key_rle_pages++;
-                    else if (tag == SMOL_TAG_INC_RLE)
-                        inc_rle_pages++;
-                    /* If tag < 0x8000, it's plain format (nitems stored as first uint16) */
-                    else if (tag < 0x8000)
-                        zerocopy_pages++;  /* Plain format is treated as zero-copy at runtime */
+                    /* Check if page has items before reading tag */
+                    if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber)
+                    {
+                        ItemId iid = PageGetItemId(page, FirstOffsetNumber);
+                        if (iid != NULL && ItemIdIsNormal(iid) && ItemIdGetLength(iid) >= sizeof(uint16))
+                        {
+                            char *data = (char *) PageGetItem(page, iid);
+                            if (data != NULL)
+                            {
+                                memcpy(&tag, data, sizeof(uint16));
+
+                                /* Check format tags */
+                                if (tag == SMOL_TAG_ZEROCOPY)
+                                    zerocopy_pages++;
+                                else if (tag == SMOL_TAG_KEY_RLE)
+                                    key_rle_pages++;
+                                else if (tag == SMOL_TAG_INC_RLE)
+                                    inc_rle_pages++;
+                                else if (tag < 0x8000)
+                                    zerocopy_pages++;
+                            }
+                        }
+                    }
                 }
             }
         }
