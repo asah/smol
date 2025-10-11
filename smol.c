@@ -216,6 +216,7 @@ static int smol_force_loop_guard_test = 0;  /* 0=off, >0=force n_this=0 after N 
 static int smol_loop_guard_iteration = 0;   /* Counter for loop guard test */
 static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children per internal node to force tall trees */
 static int smol_test_force_realloc_at = 0;  /* 0=disabled, >0=force reallocation when next_n reaches this value */
+static bool smol_test_force_page_bounds_check = false;  /* Force page-level bounds checking even when planner doesn't set it up */
 /* Note: Parallel CAS retry (line ~1700) proved too difficult to reliably test with synthetic worker coordination */
 
 #define SMOL_ATOMIC_READ_U32(ptr) \
@@ -342,6 +343,15 @@ _PG_init(void)
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.test_force_page_bounds_check",
+                             "TEST ONLY: Force page-level bounds checking",
+                             "For coverage testing: enable page-level bounds optimization even when planner doesn't set it up",
+                             &smol_test_force_page_bounds_check,
+                             false, /* default: disabled */
+                             PGC_USERSET,
+                             0,
+                             NULL, NULL, NULL);
 #endif
 
     DefineCustomRealVariable("smol.cost_page",
@@ -939,21 +949,25 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     *stop_scan_out = false;
 
     /* No upper bounds: all pages match (lower bounds handled by initial seek) */
-    if (!so->have_upper_bound && !so->have_k1_eq) /* GCOV_EXCL_LINE */
-        return true; /* GCOV_EXCL_LINE */
+    if (!so->have_upper_bound && !so->have_k1_eq)
+        return true;
 
-    /* Empty page: skip */
-    if (nitems == 0) /* GCOV_EXCL_LINE */
-        return false; /* GCOV_EXCL_LINE */
+    /* Empty page: defensive check for corruption */
+    if (nitems == 0)
+    {
+        SMOL_DEFENSIVE_CHECK(false, ERROR,
+            (errmsg("smol: empty page %u during bounds checking", so->cur_blk)));
+        return false;
+    }
 
     /* Get first key on page for bounds checking */
     char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude);
 
     /* For zero-copy pages, skip IndexTuple header to get actual key data */
-    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
-    { /* GCOV_EXCL_LINE */
-        first_key += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
-    } /* GCOV_EXCL_LINE */
+    if (so->page_is_zerocopy)
+    {
+        first_key += sizeof(IndexTupleData);
+    }
 
     /* Upper bound check: if first key exceeds upper bound, stop entire scan
      * Since keys are sorted across pages (via rightlinks), if first_key > upper_bound
@@ -964,8 +978,8 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
         {
             /* first_key > upper_bound → past end of range, stop scan */
-            *stop_scan_out = true; /* GCOV_EXCL_LINE */
-            return false; /* GCOV_EXCL_LINE */
+            *stop_scan_out = true;
+            return false;
         }
     }
 
@@ -977,8 +991,8 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         if (c > 0)
         {
             /* first_key > equality_bound → past the equal value, stop scan */
-            *stop_scan_out = true; /* GCOV_EXCL_LINE */
-            return false; /* GCOV_EXCL_LINE */
+            *stop_scan_out = true;
+            return false;
         }
     }
 
@@ -2002,6 +2016,19 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
             }
         }
     }
+
+#ifdef SMOL_TEST_COVERAGE
+    /* Test hook: fake bounds for page-level bounds checking coverage */
+    if (smol_test_force_page_bounds_check && !so->have_upper_bound && !so->have_k1_eq)
+    {
+        /* Fake an upper bound to trigger page-level bounds check
+         * Use a value that will be exceeded by later pages in test data
+         * Test data has gap: 1-5000, then 100000+, so fake bound at 10000 */
+        so->have_upper_bound = true;
+        so->upper_bound_strict = true;
+        so->upper_bound_datum = Int32GetDatum(10000);
+    }
+#endif
 }
 
 /*
@@ -3217,7 +3244,13 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
             /* Page-level bounds checking: stop scan early for BETWEEN and equality queries
              * Only applies to single-column indexes with forward scans that have upper bounds or equality */
-            if (!so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq))
+#ifdef SMOL_TEST_COVERAGE
+            bool enable_page_bounds_check = smol_test_force_page_bounds_check ||
+                (!so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq));
+#else
+            bool enable_page_bounds_check = !so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq);
+#endif
+            if (enable_page_bounds_check)
             {
                 uint16 n_check = smol_leaf_nitems(np);
 
@@ -3239,11 +3272,6 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     /* Restore original format flag */
                     so->page_is_zerocopy = saved_zerocopy;
 
-                    /* GCOV_EXCL_START - page-level bounds optimization, only reached when
-                     * smol_page_matches_scan_bounds returns false. All false-return paths in
-                     * that function (lines 947, 968, 981) are already marked GCOV_EXCL_LINE
-                     * as they're extremely rare edge cases (empty pages, bounds exceeded).
-                     * This code is valid optimization but untestable without triggering those paths. */
                     if (!matches)
                     {
                         /* Page doesn't match bounds */
@@ -3260,7 +3288,6 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         so->cur_blk = InvalidBlockNumber;
                         continue;
                     }
-                    /* GCOV_EXCL_STOP */
                 }
             }
 
