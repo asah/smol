@@ -5280,6 +5280,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
 }
 
 /* Diagnostic: count page types and log a summary */
+/* GCOV_EXCL_START - debug diagnostic function, only called when smol_debug_log enabled */
 static void
 smol_log_page_summary(Relation idx)
 {
@@ -5304,6 +5305,7 @@ smol_log_page_summary(Relation idx)
     SMOL_LOGF("page summary: blocks=%u meta=%d internal=%d leaf=%d",
               (unsigned) nblocks, nmeta, ninternal, nleaf);
 }
+/* GCOV_EXCL_STOP */
 
 /* Return rightmost leaf block number by scanning all pages */
 static BlockNumber
