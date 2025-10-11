@@ -54,8 +54,8 @@ awk '
 BEGIN { excl_block = 0 }
 
 # Track GCOV_EXCL_START/STOP blocks
-/GCOV_EXCL_START/ { excl_block = 1 }
-/GCOV_EXCL_STOP/ { excl_block = 0 }
+/GCOV_EXCL_START/ { excl_block = 1; next }
+/GCOV_EXCL_STOP/ { excl_block = 0; next }
 
 # Line is excluded if: in excl_block OR has GCOV_EXCL_LINE
 {
@@ -113,7 +113,7 @@ if [ "$MODE" = "verbose" ] || [ "$MODE" = "condensed" ]; then
         awk '
         BEGIN { excl_block = 0 }
 
-        /GCOV_EXCL_START/ { excl_block = 1 }
+        /GCOV_EXCL_START/ { excl_block = 1; next }
         /GCOV_EXCL_STOP/ { excl_block = 0; next }
 
         /^ *#####:/ && !excl_block && !/GCOV_EXCL_LINE/ {
@@ -142,7 +142,7 @@ if [ "$MODE" = "verbose" ] || [ "$MODE" = "condensed" ]; then
             prev_line = 0
         }
 
-        /GCOV_EXCL_START/ { excl_block = 1 }
+        /GCOV_EXCL_START/ { excl_block = 1; next }
         /GCOV_EXCL_STOP/ { excl_block = 0; next }
 
         /^ *#####:/ && !excl_block && !/GCOV_EXCL_LINE/ {
