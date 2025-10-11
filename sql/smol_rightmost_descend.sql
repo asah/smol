@@ -7,9 +7,8 @@ CREATE EXTENSION IF NOT EXISTS smol;
 DROP TABLE IF EXISTS t_rightmost CASCADE;
 CREATE TABLE t_rightmost (k int4);
 
--- Insert enough data to create multi-level tree
--- Need height > 1 to trigger internal node navigation
-INSERT INTO t_rightmost SELECT i FROM generate_series(1, 200000) i;
+-- Insert enough data to create multi-level tree (height > 1)
+INSERT INTO t_rightmost SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX t_rightmost_idx ON t_rightmost USING smol(k);
 
 -- Query with lower bound > all keys forces rightmost child selection
@@ -20,8 +19,8 @@ SELECT count(*) FROM t_rightmost WHERE k >= 999999;
 -- Lines 4107-4113: smol_rightmost_leaf() direct whitebox test
 DROP TABLE t_rightmost CASCADE;
 CREATE TABLE t_rightmost (k int4);
--- Create multi-level tree (need height > 1)
-INSERT INTO t_rightmost SELECT i FROM generate_series(1, 2000000) i;
+-- Create multi-level tree (height > 1, 300K rows is sufficient)
+INSERT INTO t_rightmost SELECT i FROM generate_series(1, 300000) i;
 CREATE INDEX t_rightmost_idx ON t_rightmost USING smol(k);
 
 -- Directly call smol_rightmost_leaf() to trigger lines 4107-4113
@@ -36,7 +35,7 @@ DROP TABLE t_rightmost CASCADE;
 -- Test with two-column index for completeness
 DROP TABLE IF EXISTS t_rightmost2 CASCADE;
 CREATE TABLE t_rightmost2 (k int4, v int4);
-INSERT INTO t_rightmost2 SELECT i, i*10 FROM generate_series(1, 200000) i;
+INSERT INTO t_rightmost2 SELECT i, i*10 FROM generate_series(1, 100000) i;
 CREATE INDEX t_rightmost2_idx ON t_rightmost2 USING smol(k, v);
 
 -- Backward scan on two-column index

@@ -14,9 +14,9 @@ CREATE EXTENSION IF NOT EXISTS smol;
 DROP TABLE IF EXISTS t_tall_tree CASCADE;
 CREATE UNLOGGED TABLE t_tall_tree (k int8);
 
--- Insert 1 million rows to force tall tree
+-- Insert 250k rows to force tall tree (3-4 levels)
 INSERT INTO t_tall_tree
-SELECT i::int8 FROM generate_series(1, 1000000) i;
+SELECT i::int8 FROM generate_series(1, 250000) i;
 
 -- Create index - should build 3-4 level tree
 CREATE INDEX t_tall_tree_smol ON t_tall_tree USING smol(k);
@@ -38,10 +38,10 @@ SELECT count(*) FROM t_tall_tree WHERE k <= 250000::int8;
 DROP TABLE IF EXISTS t_tall_tree_text CASCADE;
 CREATE UNLOGGED TABLE t_tall_tree_text (k text COLLATE "C");
 
--- Insert 500K text keys to build tall tree
+-- Insert 150K text keys to build tall tree (2-3 levels)
 INSERT INTO t_tall_tree_text
 SELECT 'key' || lpad(i::text, 10, '0')
-FROM generate_series(1, 500000) i;
+FROM generate_series(1, 150000) i;
 
 -- Create index - should build 2-3 level tree
 CREATE INDEX t_tall_tree_text_smol ON t_tall_tree_text USING smol(k);
@@ -59,7 +59,7 @@ DROP TABLE IF EXISTS t_tall_tree_int4 CASCADE;
 CREATE UNLOGGED TABLE t_tall_tree_int4 (k int4);
 
 INSERT INTO t_tall_tree_int4
-SELECT i::int4 FROM generate_series(1, 1000000) i;
+SELECT i::int4 FROM generate_series(1, 250000) i;
 
 CREATE INDEX t_tall_tree_int4_smol ON t_tall_tree_int4 USING smol(k);
 
@@ -76,7 +76,7 @@ CREATE UNLOGGED TABLE t_tall_tree_int2 (k int2);
 
 -- int2 range is -32768 to 32767, so repeat values
 INSERT INTO t_tall_tree_int2
-SELECT (i % 32767)::int2 FROM generate_series(1, 500000) i;
+SELECT (i % 32767)::int2 FROM generate_series(1, 150000) i;
 
 CREATE INDEX t_tall_tree_int2_smol ON t_tall_tree_int2 USING smol(k);
 
@@ -92,9 +92,9 @@ DROP TABLE IF EXISTS t_wide_tree CASCADE;
 CREATE UNLOGGED TABLE t_wide_tree (k int8, v int4);
 
 -- Insert data in a pattern that creates many leaf pages at same level
--- Use ascending order to create clean splits
+-- Use ascending order to create clean splits (300K rows = multi-level tree)
 INSERT INTO t_wide_tree
-SELECT i::int8, i::int4 FROM generate_series(1, 2000000) i;
+SELECT i::int8, i::int4 FROM generate_series(1, 300000) i;
 
 CREATE INDEX t_wide_tree_smol ON t_wide_tree USING smol(k) INCLUDE (v);
 

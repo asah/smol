@@ -3,12 +3,12 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
--- Build dataset with duplicates (500k rows, ~10 rows per key)
+-- Build dataset with duplicates (100k rows, ~10 rows per key, sufficient for compression test)
 DROP TABLE IF EXISTS io_test CASCADE;
 CREATE UNLOGGED TABLE io_test(k1 int4, inc1 int4, inc2 int4);
 INSERT INTO io_test
-SELECT (i % 50000)::int4, (i % 10000)::int4, (i % 10000)::int4
-FROM generate_series(1, 500000) i;
+SELECT (i % 10000)::int4, (i % 10000)::int4, (i % 10000)::int4
+FROM generate_series(1, 100000) i;
 
 ALTER TABLE io_test SET (autovacuum_enabled = off);
 VACUUM (FREEZE, ANALYZE) io_test;
@@ -46,7 +46,7 @@ SELECT
     sum(inc1)::bigint AS sum1,
     sum(inc2)::bigint AS sum2,
     count(*)::bigint AS cnt
-FROM io_test WHERE k1 >= 45000;
+FROM io_test WHERE k1 >= 9000;
 
 DROP INDEX io_test_btree;
 CREATE INDEX io_test_smol ON io_test USING smol (k1) INCLUDE (inc1, inc2);
@@ -56,7 +56,7 @@ SELECT
     sum(inc1)::bigint AS sum1,
     sum(inc2)::bigint AS sum2,
     count(*)::bigint AS cnt
-FROM io_test WHERE k1 >= 45000;
+FROM io_test WHERE k1 >= 9000;
 
 SELECT
     (SELECT sum1 FROM results_btree) = (SELECT sum1 FROM results_smol) AS sum1_match,

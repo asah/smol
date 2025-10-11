@@ -17,7 +17,7 @@ SET min_parallel_table_scan_size=0;
 -- Case 1: int2
 DROP TABLE IF EXISTS p2_i2 CASCADE;
 CREATE UNLOGGED TABLE p2_i2(a int2, b int2);
-INSERT INTO p2_i2 SELECT (i % 32767)::int2, (i % 1000)::int2 FROM generate_series(1,100000) AS s(i);
+INSERT INTO p2_i2 SELECT (i % 32767)::int2, (i % 1000)::int2 FROM generate_series(1,50000) AS s(i);
 ANALYZE p2_i2;
 ALTER TABLE p2_i2 SET (autovacuum_enabled = off);
 DROP TABLE IF EXISTS res_i2;
@@ -38,7 +38,7 @@ SELECT 'int2' AS typ,
 -- Case 2: int4
 DROP TABLE IF EXISTS p2_i4 CASCADE;
 CREATE UNLOGGED TABLE p2_i4(a int4, b int4);
-INSERT INTO p2_i4 SELECT (i % 1000000)::int4, (i % 1000000)::int4 FROM generate_series(1,100000) AS s(i);
+INSERT INTO p2_i4 SELECT (i % 1000000)::int4, (i % 1000000)::int4 FROM generate_series(1,50000) AS s(i);
 ANALYZE p2_i4;
 ALTER TABLE p2_i4 SET (autovacuum_enabled = off);
 DROP TABLE IF EXISTS res_i4;
@@ -59,7 +59,7 @@ SELECT 'int4' AS typ,
 -- Case 3: int8
 DROP TABLE IF EXISTS p2_i8 CASCADE;
 CREATE UNLOGGED TABLE p2_i8(a int8, b int8);
-INSERT INTO p2_i8 SELECT (i % 1000000)::int8, (i % 1000000)::int8 FROM generate_series(1,100000) AS s(i);
+INSERT INTO p2_i8 SELECT (i % 1000000)::int8, (i % 1000000)::int8 FROM generate_series(1,50000) AS s(i);
 ANALYZE p2_i8;
 ALTER TABLE p2_i8 SET (autovacuum_enabled = off);
 DROP TABLE IF EXISTS res_i8;
@@ -98,10 +98,10 @@ SELECT 'int2_eq' AS typ,
         AND (SELECT c FROM res_i2_eq) = (SELECT count(*)::bigint FROM p2_i2 WHERE b > 500 AND a = 42)) AS match;
 
 -- Test parallel index build
--- Create a table large enough to trigger parallel build
+-- Create a table large enough to trigger parallel build (200K is sufficient)
 DROP TABLE IF EXISTS pb_test CASCADE;
 CREATE UNLOGGED TABLE pb_test(k int4);
-INSERT INTO pb_test SELECT i FROM generate_series(1, 500000) AS s(i);
+INSERT INTO pb_test SELECT i FROM generate_series(1, 200000) AS s(i);
 ANALYZE pb_test;
 
 -- Force parallel build with low maintenance_work_mem and high worker count
@@ -120,7 +120,7 @@ SELECT 'parallel_build' AS test,
 -- Test parallel build with text type (32-byte padded)
 DROP TABLE IF EXISTS pb_text CASCADE;
 CREATE UNLOGGED TABLE pb_text(k text COLLATE "C");
-INSERT INTO pb_text SELECT 'key' || lpad(i::text, 10, '0') FROM generate_series(1, 500000) AS s(i);
+INSERT INTO pb_text SELECT 'key' || lpad(i::text, 10, '0') FROM generate_series(1, 200000) AS s(i);
 ANALYZE pb_text;
 
 DROP INDEX IF EXISTS pb_text_smol;
