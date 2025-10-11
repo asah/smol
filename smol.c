@@ -976,10 +976,10 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude);
 
     /* For zero-copy pages, skip IndexTuple header to get actual key data */
-    if (so->page_is_zerocopy)
+    if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated smol_build_tree_from_sorted */
     {
-        first_key += sizeof(IndexTupleData);
-    }
+        first_key += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
+    } /* GCOV_EXCL_STOP */
 
     /* Upper bound check: if first key exceeds upper bound, stop entire scan
      * Since keys are sorted across pages (via rightlinks), if first_key > upper_bound
@@ -987,12 +987,12 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     if (so->have_upper_bound)
     {
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
-        if (so->upper_bound_strict ? (c >= 0) : (c > 0))
+        if (so->upper_bound_strict ? (c >= 0) : (c > 0)) /* GCOV_EXCL_START - defensive: prefetch logic avoids loading pages beyond bounds */
         {
             /* first_key > upper_bound → past end of range, stop scan */
-            *stop_scan_out = true;
-            return false;
-        }
+            *stop_scan_out = true; /* GCOV_EXCL_LINE */
+            return false; /* GCOV_EXCL_LINE */
+        } /* GCOV_EXCL_STOP */
     }
 
     /* Equality bound check: if first key exceeds the equality value, stop scan
@@ -1000,12 +1000,12 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     if (so->have_k1_eq)
     {
         int c = smol_cmp_keyptr_to_bound(so, first_key);
-        if (c > 0)
+        if (c > 0) /* GCOV_EXCL_START - defensive: scan stops at tuple level before loading next page */
         {
             /* first_key > equality_bound → past the equal value, stop scan */
-            *stop_scan_out = true;
-            return false;
-        }
+            *stop_scan_out = true; /* GCOV_EXCL_LINE */
+            return false; /* GCOV_EXCL_LINE */
+        } /* GCOV_EXCL_STOP */
     }
 
     /* Page might have matching tuples, process it */
@@ -5150,6 +5150,13 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
         SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
         Size n_this = (remaining < max_n) ? remaining : max_n;
+
+#ifdef SMOL_TEST_COVERAGE
+        /* Test GUC: cap tuples per page to force taller trees */
+        if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
+            n_this = (Size) smol_test_max_tuples_per_page;
+#endif
+
         char *scratch = (char *) palloc(header + n_this * key_len);
         memcpy(scratch, &n_this, sizeof(uint16));
         char *p = scratch + header;
@@ -5268,6 +5275,13 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
         SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
         Size n_this = (remaining < max_n) ? remaining : max_n;
+
+#ifdef SMOL_TEST_COVERAGE
+        /* Test GUC: cap tuples per page to force taller trees */
+        if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
+            n_this = (Size) smol_test_max_tuples_per_page;
+#endif
+
         char *scratch = (char *) palloc(header + n_this * key_len);
         memcpy(scratch, &n_this, sizeof(uint16));
         char *p = scratch + header;

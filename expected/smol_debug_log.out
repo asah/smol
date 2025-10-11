@@ -33,20 +33,20 @@ SET enable_indexonlyscan = on;
 -- The debug log will show varlena sizes and scan behavior, but
 -- we've disabled logging during CREATE INDEX to avoid non-deterministic OIDs/timing
 SELECT k, v, i FROM t_debug WHERE k >= 'key002';
-LOG:  [smol] smol_handler:1110: enter smol_handler
-LOG:  [smol] smol_handler:1110: enter smol_handler
-LOG:  [smol] smol_handler:1110: enter smol_handler
-LOG:  [smol] smol_meta_read:3723: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_beginscan:1853: beginscan nkeys=1 key_len=32
-LOG:  [smol] smol_meta_read:3723: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_beginscan:1911: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
-LOG:  [smol] smol_beginscan:1913: include[0]: len=8 align=i off=36 is_text=1
-LOG:  [smol] smol_beginscan:1913: include[1]: len=4 align=i off=48 is_text=0
-LOG:  [smol] smol_meta_read:3723: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
-LOG:  [smol] smol_find_first_leaf:4591: find_first_leaf: leaf=1 for bound=0 height=1
-LOG:  [smol] smol_gettuple:2308: gettuple init cur_blk=1
-LOG:  [smol] smol_gettuple:2904: tuple key varlena size=10
-LOG:  [smol] smol_endscan:3376: end scan
+LOG:  [smol] smol_handler:1122: enter smol_handler
+LOG:  [smol] smol_handler:1122: enter smol_handler
+LOG:  [smol] smol_handler:1122: enter smol_handler
+LOG:  [smol] smol_meta_read:3735: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1865: beginscan nkeys=1 key_len=32
+LOG:  [smol] smol_meta_read:3735: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_beginscan:1923: beginscan layout: key_len=32 two_col=0 ninclude=2 sz=64
+LOG:  [smol] smol_beginscan:1925: include[0]: len=8 align=i off=36 is_text=1
+LOG:  [smol] smol_beginscan:1925: include[1]: len=4 align=i off=48 is_text=0
+LOG:  [smol] smol_meta_read:3735: meta: magic=0x534d4f4c ver=1 nkeyatts=1 len1=32 len2=0 root=1 h=1
+LOG:  [smol] smol_find_first_leaf:4621: find_first_leaf: leaf=1 for bound=0 height=1
+LOG:  [smol] smol_gettuple:2320: gettuple init cur_blk=1
+LOG:  [smol] smol_gettuple:2916: tuple key varlena size=10
+LOG:  [smol] smol_endscan:3388: end scan
    k    |    v     | i 
 --------+----------+---
  key002 | value002 | 2

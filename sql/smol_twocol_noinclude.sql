@@ -1,0 +1,98 @@
+-- Test two-column indexes WITHOUT INCLUDE columns
+-- Covers smol_build_tree_from_sorted and two-column scan paths
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test 1: Two int4 columns (most common case)
+DROP TABLE IF EXISTS t_twocol_int4 CASCADE;
+CREATE UNLOGGED TABLE t_twocol_int4 (a int4, b int4, c text);
+INSERT INTO t_twocol_int4 SELECT i/100, i%100, 'data'||i FROM generate_series(1, 10000) i;
+CREATE INDEX t_twocol_int4_idx ON t_twocol_int4 USING smol(a, b);
+
+-- Basic queries
+SELECT count(*) FROM t_twocol_int4 WHERE a = 50;
+SELECT count(*) FROM t_twocol_int4 WHERE a = 50 AND b > 25;
+SELECT count(*) FROM t_twocol_int4 WHERE a >= 90 AND b < 50;
+
+-- Test 2: Two int8 columns
+DROP TABLE IF EXISTS t_twocol_int8 CASCADE;
+CREATE UNLOGGED TABLE t_twocol_int8 (a int8, b int8, c text);
+INSERT INTO t_twocol_int8 SELECT i/100, i%100, 'data'||i FROM generate_series(1, 5000) i;
+CREATE INDEX t_twocol_int8_idx ON t_twocol_int8 USING smol(a, b);
+
+SELECT count(*) FROM t_twocol_int8 WHERE a = 25 AND b = 50;
+SELECT count(*) FROM t_twocol_int8 WHERE a > 40;
+
+-- Test 3: Two int2 columns
+DROP TABLE IF EXISTS t_twocol_int2 CASCADE;
+CREATE UNLOGGED TABLE t_twocol_int2 (a int2, b int2, c text);
+INSERT INTO t_twocol_int2 SELECT (i/50)::int2, (i%50)::int2, 'data'||i FROM generate_series(1, 5000) i;
+CREATE INDEX t_twocol_int2_idx ON t_twocol_int2 USING smol(a, b);
+
+SELECT count(*) FROM t_twocol_int2 WHERE a = 30::int2 AND b < 25::int2;
+
+-- Test 4: Mixed int types (int4, int2)
+DROP TABLE IF EXISTS t_twocol_mixed CASCADE;
+CREATE UNLOGGED TABLE t_twocol_mixed (a int4, b int2, c text);
+INSERT INTO t_twocol_mixed SELECT i/100, (i%100)::int2, 'data'||i FROM generate_series(1, 5000) i;
+CREATE INDEX t_twocol_mixed_idx ON t_twocol_mixed USING smol(a, b);
+
+SELECT count(*) FROM t_twocol_mixed WHERE a = 30 AND b = 50::int2;
+
+-- Test 5: Date columns (two fixed-width types)
+DROP TABLE IF EXISTS t_twocol_date CASCADE;
+CREATE UNLOGGED TABLE t_twocol_date (start_date date, end_date date, description text);
+INSERT INTO t_twocol_date
+SELECT
+    '2024-01-01'::date + (i/10),
+    '2024-01-01'::date + (i/10) + (i%10),
+    'event'||i
+FROM generate_series(1, 1000) i;
+CREATE INDEX t_twocol_date_idx ON t_twocol_date USING smol(start_date, end_date);
+
+SELECT count(*) FROM t_twocol_date WHERE start_date = '2024-01-15' AND end_date > '2024-01-20';
+
+-- Test 6: Two "char" columns (1-byte keys)
+DROP TABLE IF EXISTS t_twocol_char CASCADE;
+CREATE UNLOGGED TABLE t_twocol_char (a "char", b "char", c text);
+INSERT INTO t_twocol_char SELECT (65 + (i%26))::"char", (97 + (i%26))::"char", 'data'||i FROM generate_series(1, 1000) i;
+CREATE INDEX t_twocol_char_idx ON t_twocol_char USING smol(a, b);
+
+SELECT count(*) FROM t_twocol_char WHERE a = 'A'::"char" AND b = 'z'::"char";
+
+-- Test 7: Backward scan on two-column index
+DROP TABLE IF EXISTS t_twocol_backward CASCADE;
+CREATE UNLOGGED TABLE t_twocol_backward (a int4, b int4);
+INSERT INTO t_twocol_backward SELECT i/50, i%50 FROM generate_series(1, 5000) i;
+CREATE INDEX t_twocol_backward_idx ON t_twocol_backward USING smol(a, b);
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = on;
+SET enable_indexonlyscan = off;
+
+-- Backward scan using ORDER BY DESC
+SELECT a, b FROM t_twocol_backward WHERE a >= 90 ORDER BY a DESC, b DESC LIMIT 10;
+
+-- Test 8: Larger dataset to test multiple pages
+DROP TABLE IF EXISTS t_twocol_large CASCADE;
+CREATE UNLOGGED TABLE t_twocol_large (a int4, b int4);
+INSERT INTO t_twocol_large SELECT i/1000, i%1000 FROM generate_series(1, 50000) i;
+CREATE INDEX t_twocol_large_idx ON t_twocol_large USING smol(a, b);
+
+-- Verify index structure
+SELECT total_pages > 1 AS has_multiple_pages, leaf_pages > 1 AS has_multiple_leaves
+FROM smol_inspect('t_twocol_large_idx'::regclass);
+
+SELECT count(*) FROM t_twocol_large WHERE a BETWEEN 20 AND 30 AND b < 500;
+
+-- Cleanup
+DROP TABLE t_twocol_int4 CASCADE;
+DROP TABLE t_twocol_int8 CASCADE;
+DROP TABLE t_twocol_int2 CASCADE;
+DROP TABLE t_twocol_mixed CASCADE;
+DROP TABLE t_twocol_date CASCADE;
+DROP TABLE t_twocol_char CASCADE;
+DROP TABLE t_twocol_backward CASCADE;
+DROP TABLE t_twocol_large CASCADE;
