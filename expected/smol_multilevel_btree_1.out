@@ -1,0 +1,81 @@
+-- Test multi-level B-tree internal node building (lines 4830-4900+)
+-- CRITICAL: This tests smol_build_internal_levels which builds multiple levels of internal nodes
+-- when the tree is too tall to fit in a single level
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+SET max_parallel_maintenance_workers = 0;  -- Non-parallel build to hit sequential code
+-- ============================================================================
+-- Test: Force multi-level internal node building
+-- Use smol.test_max_internal_fanout to limit children per internal node
+-- This forces tall trees with multiple internal levels without needing millions of rows
+--
+-- Strategy:
+-- - Set fanout=10 (each internal node can have max 10 children)
+-- - Create > 10 leaf pages (need height >= 2)
+-- - Create > 100 leaf pages (need height >= 3, triggering multi-level code!)
+--
+-- With int4 keys, each leaf page holds ~2000 keys (8KB / 4 bytes)
+-- So 100 leaf pages = 200,000 rows
+-- ============================================================================
+DROP TABLE IF EXISTS t_multilevel CASCADE;
+CREATE UNLOGGED TABLE t_multilevel (k int4);
+-- CRITICAL: Set low fanout to force tall trees
+SET smol.test_max_internal_fanout = 10;  -- Each internal node can only have 10 children
+-- Insert enough rows to create > 100 leaf pages
+-- ~2000 rows per leaf page, so 200K rows = ~100 leaf pages
+-- With fanout=10:
+--   Level 0: 100 leaves
+--   Level 1: 10 internal pages (100/10)
+--   Level 2: 1 root page
+-- This gives height=3, which triggers smol_build_internal_levels loop multiple times!
+INSERT INTO t_multilevel
+SELECT i FROM generate_series(1, 200000) i;
+ALTER TABLE t_multilevel SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_multilevel;
+-- Create index - this will trigger smol_build_internal_levels with multiple iterations
+CREATE INDEX t_multilevel_smol_idx ON t_multilevel USING smol(k);
+-- Verify multi-level structure was created
+-- With fanout=10 and ~100 leaf pages, should have height >= 3 (multiple internal levels!)
+SELECT
+    total_pages,
+    leaf_pages,
+    total_pages - leaf_pages AS internal_pages,
+    (total_pages - leaf_pages) > 10 AS has_multiple_internal_levels
+FROM smol_inspect('t_multilevel_smol_idx');
+ total_pages | leaf_pages | internal_pages | has_multiple_internal_levels 
+-------------+------------+----------------+------------------------------
+         112 |         99 |             13 | t
+(1 row)
+
+-- Test queries that navigate the multi-level tree
+SELECT count(*) FROM t_multilevel WHERE k > 100000;
+ count  
+--------
+ 100000
+(1 row)
+
+SELECT count(*) FROM t_multilevel WHERE k BETWEEN 50000 AND 150000;
+ count  
+--------
+ 100001
+(1 row)
+
+SELECT k FROM t_multilevel WHERE k > 199000 ORDER BY k LIMIT 10;
+   k    
+--------
+ 199001
+ 199002
+ 199003
+ 199004
+ 199005
+ 199006
+ 199007
+ 199008
+ 199009
+ 199010
+(10 rows)
+
+-- Reset the GUC
+RESET smol.test_max_internal_fanout;
+-- Cleanup
+DROP TABLE t_multilevel CASCADE;
