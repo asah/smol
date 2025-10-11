@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreadline-dev zlib1g-dev libssl-dev \
     libxml2-dev libxslt1-dev \
     libzstd-dev liblz4-dev \
-    libicu-dev \
+    libicu-dev liburing-dev \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
     locales sudo less jq emacs gcovr vmtouch \
@@ -36,7 +36,7 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN useradd -m -s /bin/bash -d /home/postgres postgres \
   && mkdir -p /home/postgres/pgdata /var/run/postgresql /usr/local/pgsql \
   && chown -R postgres:postgres /var/run/postgresql /usr/local/pgsql \
-  && echo "PATH=$PATH:/usr/local/pgsql/bin" >> /home/postgres/.bashrc
+  && echo "PATH=$PATH:/usr/local/pgsql/bin" >> /home/postgres/.bashrc \
   && echo "postgres ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-postgres-nopasswd \
   && chmod 0440 /etc/sudoers.d/90-postgres-nopasswd
 
@@ -58,8 +58,9 @@ RUN ./configure \
       --with-lz4 \
       --with-python \
       --with-llvm \
+      --with-liburing \
       --disable-cassert \
-  && make -j $(nproc) \
+  && make -j $(( $(nproc) * 2 )) \
   && make install \
   && (cd contrib/pg_buffercache && make install)
 
