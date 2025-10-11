@@ -154,6 +154,29 @@ SELECT count(*) FROM t_no_parallel WHERE k > 5000;
 
 -- Reset parallel workers
 SET max_parallel_maintenance_workers = DEFAULT;
+-- Test 8: Force tall trees with smol.test_max_tuples_per_page GUC
+-- Covers smol_rightmost_in_subtree loop (lines 5379-5387) with smaller dataset
+-- Setting GUC caps tuples per page, forcing more pages and taller tree
+SET smol.test_max_tuples_per_page = 100;
+DROP TABLE IF EXISTS t_tall_guc CASCADE;
+CREATE UNLOGGED TABLE t_tall_guc (k int4, i1 int4, i2 int4, i3 int4, i4 int4, i5 int4, i6 int4, i7 int4, i8 int4);
+INSERT INTO t_tall_guc SELECT i, i, i, i, i, i, i, i, i FROM generate_series(1, 50000) i;
+CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8);
+-- Verify many more pages than normal (should have 400+ leaf pages)
+SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
+ has_many_pages | has_many_leaves 
+----------------+-----------------
+ t              | t
+(1 row)
+
+-- Backward scan exercises smol_rightmost_in_subtree navigation
+SELECT smol_test_backward_scan('t_tall_guc_idx'::regclass, 25000);
+ smol_test_backward_scan 
+-------------------------
+                      10
+(1 row)
+
+RESET smol.test_max_tuples_per_page;
 -- Cleanup
 DROP TABLE t_cost CASCADE;
 DROP TABLE t_large CASCADE;
@@ -165,3 +188,4 @@ DROP TABLE t_twocol_int8 CASCADE;
 DROP TABLE t_twocol_char CASCADE;
 DROP TABLE t_empty_inspect CASCADE;
 DROP TABLE t_no_parallel CASCADE;
+DROP TABLE t_tall_guc CASCADE;

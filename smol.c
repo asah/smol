@@ -217,6 +217,7 @@ static int smol_loop_guard_iteration = 0;   /* Counter for loop guard test */
 static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children per internal node to force tall trees */
 static int smol_test_force_realloc_at = 0;  /* 0=disabled, >0=force reallocation when next_n reaches this value */
 static bool smol_test_force_page_bounds_check = false;  /* Force page-level bounds checking even when planner doesn't set it up */
+static int smol_test_max_tuples_per_page = 0;  /* 0=unlimited, >0=cap tuples per leaf page to force taller trees */
 /* Note: Parallel CAS retry (line ~1700) proved too difficult to reliably test with synthetic worker coordination */
 
 #define SMOL_ATOMIC_READ_U32(ptr) \
@@ -352,6 +353,17 @@ _PG_init(void)
                              PGC_USERSET,
                              0,
                              NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.test_max_tuples_per_page",
+                            "TEST ONLY: Cap tuples per leaf page to force taller trees",
+                            "For coverage testing: limit tuples per page (0=unlimited)",
+                            &smol_test_max_tuples_per_page,
+                            0, /* default: unlimited */
+                            0, /* min */
+                            10000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
 #endif
 
     DefineCustomRealVariable("smol.cost_page",
@@ -3864,6 +3876,12 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             Size max_n_zerocopy = (avail > header_zerocopy) ? ((avail - header_zerocopy) / zero_copy_tuple_sz) : 0;
             Size n_this = (remaining < max_n_zerocopy) ? remaining : max_n_zerocopy;
 
+#ifdef SMOL_TEST_COVERAGE
+            /* Test GUC: cap tuples per page to force taller trees */
+            if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
+                n_this = (Size) smol_test_max_tuples_per_page;
+#endif
+
             SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
                 (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u avail=%zu)", key_len, (size_t) avail)));
 
@@ -4248,6 +4266,12 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
             use_inc_rle = false;
         }
 
+#ifdef SMOL_TEST_COVERAGE
+        /* Test GUC: cap tuples per page to force taller trees */
+        if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
+            n_this = (Size) smol_test_max_tuples_per_page;
+#endif
+
         SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
             (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
 
@@ -4458,6 +4482,12 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
             n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
             use_inc_rle = false;
         }
+
+#ifdef SMOL_TEST_COVERAGE
+        /* Test GUC: cap tuples per page to force taller trees */
+        if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
+            n_this = (Size) smol_test_max_tuples_per_page;
+#endif
 
         SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
             (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
