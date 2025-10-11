@@ -120,6 +120,21 @@ Limitations
 - INCLUDE columns supported for single-key indexes with fixed-length INCLUDE attrs (not limited to integers).
 - Prototype: no WAL/FSM crash-safety yet.
 
+Cursor Support
+SMOL supports forward-only cursor operations:
+- **Forward-only cursors**: `DECLARE c CURSOR` (or `NO SCROLL`) with `FETCH`, `FETCH NEXT`, `FETCH FORWARD`
+- **Positioning**: `MOVE FORWARD` operations
+- **Held cursors**: `WITH HOLD` (survives commit) for forward scans
+- **Locking**: `FOR UPDATE`, `FOR SHARE` clauses work but have limitations (see below)
+- **Multiple concurrent cursors**: Full support for multiple active forward cursors
+
+Cursor Limitations:
+- **SCROLL cursors NOT supported**: `DECLARE c SCROLL CURSOR` will be accepted but backward operations return incorrect results (0 rows). Do not use `SCROLL` with SMOL indexes.
+- **Backward scans broken**: `FETCH LAST`, `FETCH PRIOR`, `FETCH BACKWARD`, `FETCH ABSOLUTE` with negative offsets all return 0 rows due to incomplete backward page navigation implementation. Always use forward-only cursors.
+- **WHERE CURRENT OF with UPDATE/INSERT**: Since SMOL indexes are read-only, any INSERT or UPDATE on a table with a SMOL index will fail with error: "smol is read-only: aminsert is not supported". You must DROP the SMOL index before modifying the table.
+- **WHERE CURRENT OF with DELETE**: DELETE succeeds on the heap table but leaves stale entries in the SMOL index. Queries may return deleted rows until you rebuild the index. To avoid this, DROP the SMOL index before DELETE operations.
+- **Recommendation**: Only use SMOL indexes on truly read-only tables (e.g., loaded once, never modified). If you need to modify data, drop all SMOL indexes first, modify the data, then recreate the indexes.
+
 Build & Test (PostgreSQL 18 from source)
 - Docker helpers: `make dbuild` builds the image; `make dstart` creates/runs the `smol` container; `make dexec` opens a shell; `make dpsql` opens psql.
 - Bare targets (inside or outside Docker):
