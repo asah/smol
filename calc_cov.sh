@@ -1,0 +1,52 @@
+#!/bin/bash
+# Properly calculate coverage excluding GCOV_EXCL blocks and lines
+
+awk '
+BEGIN { excl_block = 0 }
+
+# Track GCOV_EXCL_START/STOP blocks
+/GCOV_EXCL_START/ { excl_block = 1 }
+/GCOV_EXCL_STOP/ { excl_block = 0 }
+
+# Line is excluded if: in excl_block OR has GCOV_EXCL_LINE
+{
+    is_excluded = (excl_block || /GCOV_EXCL_LINE/)
+    is_uncovered = /^ *#####:/
+    is_covered = /^ *[0-9]+\*?:/
+
+    if (is_uncovered) {
+        if (is_excluded) {
+            excluded_uncov++
+        } else {
+            uncovered++
+        }
+    } else if (is_covered) {
+        if (is_excluded) {
+            excluded_cov++
+        } else {
+            covered++
+        }
+    }
+}
+
+END {
+    total_excluded = excluded_uncov + excluded_cov
+    total_measured = uncovered + covered
+
+    if (total_measured > 0) {
+        pct = (covered * 100.0) / total_measured
+    } else {
+        pct = 0
+    }
+
+    printf "Coverage Report (excluding GCOV_EXCL):\n"
+    printf "========================================\n"
+    printf "Excluded lines: %d\n", total_excluded
+    printf "  - Excluded uncovered: %d\n", excluded_uncov
+    printf "  - Excluded covered: %d\n", excluded_cov
+    printf "Measured lines: %d\n", total_measured
+    printf "  - Covered: %d\n", covered
+    printf "  - Uncovered: %d\n", uncovered
+    printf "Coverage: %.2f%%\n", pct
+}
+' smol.c.gcov

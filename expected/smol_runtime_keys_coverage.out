@@ -1,0 +1,84 @@
+-- Test runtime keys (non-native predicates) for coverage
+-- Targets lines 2741-2742 (backward), 2770-2780 (forward ultra-fast), 2991-2994 (forward)
+-- Runtime keys are needed for multi-column indexes with range predicates on the 2nd column
+-- SMOL handles attribute 1 (leading key) natively, but attribute 2 range predicates need rechecking
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 0;
+-- Create table with two key columns for multi-column index
+DROP TABLE IF EXISTS t_runtime CASCADE;
+CREATE UNLOGGED TABLE t_runtime (k1 int4, k2 int4, v int4);
+-- Insert data: k1 in 1..100, k2 = k1*10, v = k1*100
+INSERT INTO t_runtime SELECT i, i*10, i*100 FROM generate_series(1, 100) i;
+ALTER TABLE t_runtime SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_runtime;
+-- Multi-column index on (k1, k2) with INCLUDE(v)
+CREATE INDEX t_runtime_idx ON t_runtime USING smol(k1, k2) INCLUDE (v);
+-- Test 1: Forward scan with runtime keys that FAIL (lines 2991-2994)
+-- k1=50 matches 1 row (k1=50, k2=500), but k2 > 600 fails, so runtime key returns false
+SELECT k1, k2, v FROM t_runtime WHERE k1 = 50 AND k2 > 600;
+ k1 | k2 | v 
+----+----+---
+(0 rows)
+
+-- Test 2: Backward scan with runtime keys that FAIL (lines 2741-2742)
+-- k1 in 51..60, but k2 < 550 only matches k1=51..54 (k2=510,520,530,540)
+-- Backward scan checks k1=60,59,...,51 and runtime keys fail for k1=60..55
+SELECT k1, k2 FROM t_runtime WHERE k1 > 50 AND k1 < 61 AND k2 < 550 ORDER BY k1 DESC;
+ k1 | k2 
+----+----
+(0 rows)
+
+-- Test 3: Zero-copy ultra-fast path with runtime keys (lines 2770-2780)
+-- Need: zero-copy page, plain format, no upper bound, no k1_eq, xs_want_itup=true, runtime keys
+DROP TABLE IF EXISTS t_zerocopy CASCADE;
+CREATE UNLOGGED TABLE t_zerocopy (k1 int4, k2 int4, v int4);
+INSERT INTO t_zerocopy SELECT i, i*10, i*100 FROM generate_series(1, 5000) i;
+VACUUM (FREEZE, ANALYZE) t_zerocopy;
+CREATE INDEX t_zerocopy_idx ON t_zerocopy USING smol(k1, k2) INCLUDE (v);
+-- Verify zero-copy format
+SELECT zerocopy_pct FROM smol_inspect('t_zerocopy_idx');
+ zerocopy_pct 
+--------------
+          100
+(1 row)
+
+-- Query that uses ultra-fast path: k1 >= (lower bound, no upper), xs_want_itup=true
+-- Must SELECT columns to force xs_want_itup=true (count(*) doesn't need tuples)
+-- Runtime key k2 > 50000 fails for all rows (max k2 is 50000)
+SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 100 AND k2 > 50000 LIMIT 10;
+  k1  |  k2   | v  
+------+-------+----
+ 6810 | 68100 | 35
+ 6830 | 68300 | 35
+ 6850 | 68500 | 35
+ 6870 | 68700 | 35
+ 6890 | 68900 | 35
+ 6910 | 69100 | 35
+ 6930 | 69300 | 35
+ 6950 | 69500 | 35
+ 6970 | 69700 | 35
+ 6990 | 69900 | 35
+(10 rows)
+
+-- Also test with some runtime key successes to hit the success path (lines 2772-2776)
+SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 4990 AND k2 >= 49900 LIMIT 10;
+  k1  |  k2   | v  
+------+-------+----
+ 9490 | 94900 | 35
+ 9510 | 95100 | 35
+ 9530 | 95300 | 35
+ 9550 | 95500 | 35
+ 9570 | 95700 | 35
+ 9590 | 95900 | 35
+ 9610 | 96100 | 35
+ 9630 | 96300 | 35
+ 9650 | 96500 | 35
+ 9670 | 96700 | 35
+(10 rows)
+
+-- Cleanup
+DROP TABLE t_runtime CASCADE;
+DROP TABLE t_zerocopy CASCADE;

@@ -1,0 +1,84 @@
+-- Test smol_page_matches_scan_bounds() edge cases (lines 941, 945, 965-966)
+-- This function performs page-level bounds checking optimizations
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- ============================================================================
+-- Test 1: Line 941 - No upper bounds (lower bound only: k >= value)
+-- Condition: !so->have_upper_bound && !so->have_k1_eq
+-- Query pattern: WHERE k >= N (no upper limit, no equality)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_lower_only CASCADE;
+CREATE UNLOGGED TABLE t_lower_only (k int4);
+
+-- Create multiple pages worth of data
+INSERT INTO t_lower_only SELECT i FROM generate_series(1, 10000) i;
+
+ALTER TABLE t_lower_only SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_lower_only;
+
+CREATE INDEX t_lower_only_smol_idx ON t_lower_only USING smol(k);
+
+-- This query has lower bound only - should trigger line 941 early return
+-- The function returns true immediately without checking page contents
+SELECT count(*) FROM t_lower_only WHERE k >= 5000;
+
+-- Verify correctness
+SELECT count(*) = 5001 AS correct_lower_only FROM t_lower_only WHERE k >= 5000;
+
+-- ============================================================================
+-- Test 2: Lines 970-971 - First key exceeds upper bound
+-- Condition: first_key > upper_bound → stop scan early
+-- This is triggered when advancing to next page during scan, and that page's
+-- first key exceeds the upper bound. Need data that spans multiple pages with
+-- a small range query that ends mid-index.
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_upper_stop CASCADE;
+CREATE UNLOGGED TABLE t_upper_stop (k int4);
+
+-- Create 100,000 rows to ensure multiple pages
+INSERT INTO t_upper_stop SELECT i FROM generate_series(1, 100000) i;
+
+ALTER TABLE t_upper_stop SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_upper_stop;
+
+CREATE INDEX t_upper_stop_smol_idx ON t_upper_stop USING smol(k);
+
+-- Query for small range at start: k BETWEEN 1 AND 100
+-- The scan will start at first page, read matching rows, then advance to next page
+-- That next page will have first_key > 100, triggering lines 970-971
+SELECT count(*) FROM t_upper_stop WHERE k BETWEEN 1 AND 100;
+
+-- Verify correctness
+SELECT count(*) = 100 AS correct_upper_stop FROM t_upper_stop WHERE k BETWEEN 1 AND 100;
+
+-- Test with strict upper bound (k < value)
+SELECT count(*) FROM t_upper_stop WHERE k >= 1 AND k < 50;
+
+SELECT count(*) = 49 AS correct_strict_upper FROM t_upper_stop WHERE k >= 1 AND k < 50;
+
+-- ============================================================================
+-- Test 3: Line 945 - Empty page check (nitems == 0)
+-- This is difficult to trigger naturally because SMOL packs data efficiently
+-- and doesn't create empty pages during normal operations.
+--
+-- The most likely scenario is internal tree pages that might have zero items
+-- during certain split/delete operations, but SMOL is read-only so this is
+-- extremely rare. Mark as defensive code.
+-- ============================================================================
+
+-- Note: Cannot easily create empty pages in SMOL's read-only index
+-- This check is defensive code for corruption or future write support
+-- Line 945 may remain uncovered as it's an edge case safety check
+
+-- Cleanup
+DROP TABLE t_lower_only CASCADE;
+DROP TABLE t_upper_stop CASCADE;

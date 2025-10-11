@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_zero_copy smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_key_rle_basic smol_catalog_corrupt smol_edgecases smol_force_parallel_rescan smol_multi_type smol_parallel_build smol_parallel_rescan_attempt smol_text_norle smol_cursor_features
+REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_debug_coverage smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_debug_log smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_zero_copy smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_key_rle_basic smol_catalog_corrupt smol_edgecases smol_force_parallel_rescan smol_multi_type smol_parallel_build smol_parallel_rescan_attempt smol_text_norle smol_cursor_features smol_coverage_100pct smol_coverage_complete smol_equality_stop smol_page_bounds_coverage smol_page_advance_bounds smol_backward_include_sizes smol_rle_include_sizes smol_runtime_keys_coverage smol_multilevel_btree smol_zerocopy_backward
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -289,6 +289,15 @@ coverage-html:
 		$(MAKE) coverage-report; \
 	fi
 
+# Check coverage percentage and fail if < 100% (excluding GCOV_EXCL)
+coverage-check:
+	@echo "[coverage] Checking coverage percentage..."
+	@if [ ! -f smol.c.gcov ]; then \
+		echo "[coverage] ERROR: No coverage data. Run 'make coverage' first." >&2; \
+		exit 2; \
+	fi
+	@scripts/coverage_check.sh smol.c 100
+
 # Complete coverage workflow
 coverage: coverage-clean coverage-build coverage-test coverage-report
 	@echo ""
@@ -321,5 +330,6 @@ coverage: coverage-clean coverage-build coverage-test coverage-report
 	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
 	@echo "[coverage] Review coverage_uncovered.txt for truly uncovered lines"
 	@echo "[coverage] Run 'make coverage-html' for HTML report"
+	@echo "[coverage] Run 'make coverage-check' to enforce 100% coverage"
 
 

@@ -1,0 +1,64 @@
+-- Test equality bound stop optimization (lines 980-981)
+-- This test verifies that when scanning for k=X, SMOL stops as soon as it finds a page where first_key > X
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- Create a table with carefully chosen data distribution
+-- We want to create a scenario where:
+-- 1. We search for k = 50000 (which DOES exist)
+-- 2. Value 50000 exists and spans to the END of one page
+-- 3. The NEXT page starts with a value > 50000 (e.g., 60000)
+-- 4. Scanner moves from page with 50000 to next page, sees first_key > 50000
+-- This triggers the equality stop optimization (lines 982-983)
+
+DROP TABLE IF EXISTS t_eq_stop CASCADE;
+CREATE UNLOGGED TABLE t_eq_stop (k int4);
+
+-- Insert data to create specific page layout:
+-- We need many rows to span multiple pages
+-- Each page holds ~2000 int4 keys
+
+-- Pages 1-23: keys 1-49997, then 3 copies of 50000 at END of page 23
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(1, 49997) i;
+
+INSERT INTO t_eq_stop
+SELECT 50000 FROM generate_series(1, 3) i;
+
+-- Page 24: keys 60000-62000 (first_key=60000 > 50000, should trigger stop!)
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(60000, 62000) i;
+
+ALTER TABLE t_eq_stop SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_eq_stop;
+
+CREATE INDEX t_eq_stop_smol_idx ON t_eq_stop USING smol(k);
+
+-- Verify page layout
+SELECT
+    leaf_pages >= 2 AS has_multiple_pages
+FROM smol_inspect('t_eq_stop_smol_idx');
+
+-- Test equality search that should trigger stop optimization
+-- The scan should:
+-- 1. find_first_leaf lands on page 23 (contains k=50000)
+-- 2. Scan that page, find 3 rows with k=50000
+-- 3. Move to NEXT page (page 24), call smol_page_matches_scan_bounds()
+-- 4. first_key=60000 > 50000, set *stop_scan_out=true
+-- 5. Return false, stop scan (lines 982-983 EXECUTED!)
+
+SELECT count(*) = 3 AS found_three_50000s
+FROM t_eq_stop WHERE k = 50000;
+
+-- Test with existing value at page start
+SELECT count(*) = 1 AS found_60000
+FROM t_eq_stop WHERE k = 60000;
+
+-- Cleanup
+DROP TABLE t_eq_stop CASCADE;
