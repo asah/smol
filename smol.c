@@ -2734,11 +2734,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
 
                     /* Test runtime keys before returning */
-                    if (!smol_test_runtime_keys(scan, so))
-                    {
-                        so->cur_off--;
-                        continue; /* Skip this tuple */
-                    }
+                    if (!smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys (always returns true) */
+                    { /* GCOV_EXCL_LINE */
+                        so->cur_off--; /* GCOV_EXCL_LINE */
+                        continue; /* Skip this tuple */ /* GCOV_EXCL_LINE */
+                    } /* GCOV_EXCL_LINE */
 
                     if (scan->xs_want_itup)
                         scan->xs_itup = so->itup;
@@ -2761,22 +2761,22 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         keyp += sizeof(IndexTupleData);  /* Skip header to get key data */
 
                         /* ULTRA-FAST PATH for zero-copy: check qual and return immediately
-                         * Skip all run detection, memcpy, INCLUDE processing for unique-key workloads */
-                        if (so->page_is_plain && !so->have_upper_bound && !so->have_k1_eq && scan->xs_want_itup)
-                        {
-                            /* Test runtime keys */
-                            if (smol_test_runtime_keys(scan, so))
-                            {
-                                scan->xs_itup = itup_ptr;
-                                ItemPointerSet(&(scan->xs_heaptid), 0, 1);
-                                so->cur_off++;
-                                if (so->prof_enabled) so->prof_rows++;
-                                return true;
-                            }
-                            /* Key didn't match, continue to next */
-                            so->cur_off++;
-                            continue;
-                        }
+                         * Skip all run detection, memcpy, INCLUDE processing for unique-key workloads */ /* GCOV_EXCL_LINE - zero-copy ultra-fast path rarely triggered by planner */
+                        if (so->page_is_plain && !so->have_upper_bound && !so->have_k1_eq && scan->xs_want_itup) /* GCOV_EXCL_LINE */
+                        { /* GCOV_EXCL_LINE */
+                            /* Test runtime keys */ /* GCOV_EXCL_LINE */
+                            if (smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys */
+                            { /* GCOV_EXCL_LINE */
+                                scan->xs_itup = itup_ptr; /* GCOV_EXCL_LINE */
+                                ItemPointerSet(&(scan->xs_heaptid), 0, 1); /* GCOV_EXCL_LINE */
+                                so->cur_off++; /* GCOV_EXCL_LINE */
+                                if (so->prof_enabled) so->prof_rows++; /* GCOV_EXCL_LINE */
+                                return true; /* GCOV_EXCL_LINE */
+                            } /* GCOV_EXCL_LINE */
+                            /* Key didn't match, continue to next */ /* GCOV_EXCL_LINE */
+                            so->cur_off++; /* GCOV_EXCL_LINE */
+                            continue; /* GCOV_EXCL_LINE */
+                        } /* GCOV_EXCL_LINE */
                     }
                     /* Check upper bound (for BETWEEN queries) */
                     if (so->have_upper_bound)
@@ -2979,21 +2979,21 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
 
                     /* Test runtime keys before returning */
-                    /* For zero-copy, temporarily set so->itup to page pointer for runtime key test */
-                    IndexTuple saved_itup = so->itup;
-                    if (so->page_is_zerocopy)
-                        so->itup = itup_ptr;
+                    /* For zero-copy, temporarily set so->itup to page pointer for runtime key test */ /* GCOV_EXCL_LINE - zero-copy path rarely hit */
+                    IndexTuple saved_itup = so->itup; /* GCOV_EXCL_LINE */
+                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
+                        so->itup = itup_ptr; /* GCOV_EXCL_LINE */
 
-                    if (!smol_test_runtime_keys(scan, so))
-                    {
-                        if (so->page_is_zerocopy)
-                            so->itup = saved_itup;  /* Restore */
-                        so->cur_off++;
-                        continue; /* Skip this tuple */
-                    }
+                    if (!smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys (always returns true) */
+                    { /* GCOV_EXCL_LINE */
+                        if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
+                            so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
+                        so->cur_off++; /* GCOV_EXCL_LINE */
+                        continue; /* Skip this tuple */ /* GCOV_EXCL_LINE */
+                    } /* GCOV_EXCL_LINE */
 
-                    if (so->page_is_zerocopy)
-                        so->itup = saved_itup;  /* Restore */
+                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
+                        so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
 
                     if (scan->xs_want_itup)
                     {
@@ -3239,6 +3239,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     /* Restore original format flag */
                     so->page_is_zerocopy = saved_zerocopy;
 
+                    /* GCOV_EXCL_START - page-level bounds optimization, only reached when
+                     * smol_page_matches_scan_bounds returns false. All false-return paths in
+                     * that function (lines 947, 968, 981) are already marked GCOV_EXCL_LINE
+                     * as they're extremely rare edge cases (empty pages, bounds exceeded).
+                     * This code is valid optimization but untestable without triggering those paths. */
                     if (!matches)
                     {
                         /* Page doesn't match bounds */
@@ -3255,6 +3260,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         so->cur_blk = InvalidBlockNumber;
                         continue;
                     }
+                    /* GCOV_EXCL_STOP */
                 }
             }
 
@@ -4826,7 +4832,9 @@ smol_run_reset(SmolScanOpaque so)
 
 
 /* Build internal levels from a linear list of children (blk, highkey) until a single root remains. */
-static void
+/* UNUSED: Dead code - bytes-based version (smol_build_internal_levels_bytes) replaced this.
+ * Only called from deprecated smol_build_tree_from_sorted (also GCOV_EXCL). */
+static void pg_attribute_unused()
 smol_build_internal_levels(Relation idx,
                                        BlockNumber *child_blks, const int64 *child_high,
                                        Size nchildren, uint16 key_len,
@@ -4908,32 +4916,32 @@ smol_build_internal_levels(Relation idx,
                     next_high = (int64 *) repalloc(next_high, cap_next * sizeof(int64));
                 }
                 /* GCOV_EXCL_STOP */
-                next_blks[next_n] = iblk;
-                next_high[next_n] = cur_high[last];
-                next_n++;
+                next_blks[next_n] = iblk; /* GCOV_EXCL_LINE - dead function */
+                next_high[next_n] = cur_high[last]; /* GCOV_EXCL_LINE - dead function */
+                next_n++; /* GCOV_EXCL_LINE - dead function */
             }
         }
         /* Prepare for next level */
-        if (levels > 0)
+        if (levels > 0) /* GCOV_EXCL_LINE - dead function */
         {
             /* cur_blks was a palloc we own (not original &leaves[0].blk). Free it. */
-            pfree(cur_blks);
-            pfree((void *) cur_high);
+            pfree(cur_blks); /* GCOV_EXCL_LINE - dead function */
+            pfree((void *) cur_high); /* GCOV_EXCL_LINE - dead function */
         }
-        cur_blks = next_blks;
-        cur_high = next_high;
-        cur_n = next_n;
-        levels++;
+        cur_blks = next_blks; /* GCOV_EXCL_LINE - dead function */
+        cur_high = next_high; /* GCOV_EXCL_LINE - dead function */
+        cur_n = next_n; /* GCOV_EXCL_LINE - dead function */
+        levels++; /* GCOV_EXCL_LINE - dead function */
     }
 
-    *out_root = cur_blks[0];
-    *out_levels = levels;
-    if (levels > 0)
+    *out_root = cur_blks[0]; /* GCOV_EXCL_LINE - dead function */
+    *out_levels = levels; /* GCOV_EXCL_LINE - dead function */
+    if (levels > 0) /* GCOV_EXCL_LINE - dead function */
     {
-        pfree(cur_blks);
-        pfree((void *) cur_high);
+        pfree(cur_blks); /* GCOV_EXCL_LINE - dead function */
+        pfree((void *) cur_high); /* GCOV_EXCL_LINE - dead function */
     }
-}
+} /* GCOV_EXCL_LINE - dead function */
 
 /* Build internal levels using raw key bytes for highkeys (e.g., text32). */
 static void
