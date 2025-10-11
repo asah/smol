@@ -14,10 +14,13 @@ CREATE UNLOGGED TABLE t_very_tall (k int4, i1 int4, i2 int4, i3 int4, i4 int4, i
 -- Insert rows with 16 INCLUDE columns to reduce tuples per leaf
 -- With 16 int4 INCLUDE columns (64 bytes), each tuple is ~68 bytes
 -- Page is 8KB, so ~120 tuples per leaf (vs 2000 for key-only)
--- 1200 rows = ~10 leaves (height 2), so backward scan of 10 tuples from end will need to cross leaf
+-- Need many leaves to get height >= 3:
+--   Height 2: ~120 tuples/leaf * ~100 leaves = ~12K rows
+--   Height 3: ~120 tuples/leaf * ~10K leaves = ~1.2M rows
+-- Use 2M rows to ensure height >= 3 and test smol_rightmost_in_subtree loop
 INSERT INTO t_very_tall
 SELECT i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
-FROM generate_series(1, 1200) i;
+FROM generate_series(1, 2000000) i;
 CREATE INDEX t_very_tall_smol ON t_very_tall USING smol(k) INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16);
 -- Backward scan triggers smol_prev_leaf navigation (lines 4067-4086)
 -- This should navigate the tall tree structure
@@ -41,26 +44,36 @@ SELECT smol_test_backward_scan('t_very_tall_smol'::regclass);
 SELECT smol_test_backward_scan('t_very_tall_smol'::regclass, 40000);
  smol_test_backward_scan 
 -------------------------
-                       0
+                      10
 (1 row)
 
 -- Query rightmost values (triggers rightmost leaf navigation lines 4042-4050)
 SELECT k FROM t_very_tall WHERE k >= 49990 ORDER BY k LIMIT 10;
- k 
----
-(0 rows)
+   k   
+-------
+ 49990
+ 49991
+ 49992
+ 49993
+ 49994
+ 49995
+ 49996
+ 49997
+ 49998
+ 49999
+(10 rows)
 
 -- Additional queries to ensure tree navigation is exercised
 SELECT count(*) FROM t_very_tall WHERE k >= 25000;
- count 
--------
-     0
+  count  
+---------
+ 1975001
 (1 row)
 
 SELECT count(*) FROM t_very_tall WHERE k <= 25000;
  count 
 -------
-  1200
+ 25000
 (1 row)
 
 -- ============================================================================

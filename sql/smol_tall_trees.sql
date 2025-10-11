@@ -18,10 +18,13 @@ CREATE UNLOGGED TABLE t_very_tall (k int4, i1 int4, i2 int4, i3 int4, i4 int4, i
 -- Insert rows with 16 INCLUDE columns to reduce tuples per leaf
 -- With 16 int4 INCLUDE columns (64 bytes), each tuple is ~68 bytes
 -- Page is 8KB, so ~120 tuples per leaf (vs 2000 for key-only)
--- 1200 rows = ~10 leaves (height 2), so backward scan of 10 tuples from end will need to cross leaf
+-- Need many leaves to get height >= 3:
+--   Height 2: ~120 tuples/leaf * ~100 leaves = ~12K rows
+--   Height 3: ~120 tuples/leaf * ~10K leaves = ~1.2M rows
+-- Use 2M rows to ensure height >= 3 and test smol_rightmost_in_subtree loop
 INSERT INTO t_very_tall
 SELECT i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i
-FROM generate_series(1, 1200) i;
+FROM generate_series(1, 2000000) i;
 
 CREATE INDEX t_very_tall_smol ON t_very_tall USING smol(k) INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16);
 
