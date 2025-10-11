@@ -51,8 +51,7 @@ GROUP BY t_outer.id;
                ->  Index Only Scan using t_inner_smol on public.t_inner
                      Output: NULL::integer, NULL::integer
                      Index Cond: (t_inner.k > (t_outer.id * 1000))
- Query Identifier: 6416337933281961315
-(19 rows)
+(18 rows)
 
 -- Execute it
 SELECT t_outer.id, COUNT(*)

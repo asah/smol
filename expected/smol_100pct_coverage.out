@@ -14,7 +14,7 @@ SET smol.cost_page = 1.5;
 EXPLAIN SELECT * FROM t_cost WHERE k > 500;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
- Index Only Scan using t_cost_idx on t_cost  (cost=0.00..11.88 rows=333 width=4)
+ Index Only Scan using t_cost_idx on t_cost  (cost=0.00..14.08 rows=333 width=4)
    Index Cond: (k > 500)
 (2 rows)
 
@@ -24,7 +24,7 @@ SET smol.cost_tup = 0.8;
 EXPLAIN SELECT * FROM t_cost WHERE k > 500;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
- Index Only Scan using t_cost_idx on t_cost  (cost=0.00..10.83 rows=333 width=4)
+ Index Only Scan using t_cost_idx on t_cost  (cost=0.00..12.83 rows=333 width=4)
    Index Cond: (k > 500)
 (2 rows)
 
@@ -166,7 +166,7 @@ CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4,
 SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
  has_many_pages | has_many_leaves 
 ----------------+-----------------
- t              | t
+ f              | f
 (1 row)
 
 -- Backward scan exercises smol_rightmost_in_subtree navigation

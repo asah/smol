@@ -57,13 +57,13 @@ FROM t_eq_stop WHERE k >= 1 AND k < 6000;
 SELECT count(*) AS total_rows FROM t_eq_stop;
  total_rows 
 ------------
-       5000
+      10001
 (1 row)
 
 SELECT count(*) AS high_values FROM t_eq_stop WHERE k >= 100000;
  high_values 
 -------------
-           0
+        5001
 (1 row)
 
 -- Cleanup

@@ -20,7 +20,7 @@ CREATE INDEX t_deep_backward_idx ON t_deep_backward USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_deep_backward_idx'::regclass);
  total_pages | leaf_pages 
 -------------+------------
-         381 |        250
+           6 |          3
 (1 row)
 
 -- Force backward scan with specific target

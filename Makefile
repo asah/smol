@@ -156,7 +156,7 @@ buildclean:
 rebuild:
 	@echo "Building and installing extension: make=$(MAKE)"
 	@set -euo pipefail; \
-	  touch smol.c && $(MAKE) && $(MAKE) install
+	  touch smol.c && $(MAKE) build
 
 build:
 	@echo "Building and installing extension: make=$(MAKE)"
@@ -204,7 +204,7 @@ pgcheck: build start
 # ---------------------------------------------------------------------------
 # Code Coverage Targets (Ubuntu 24.04/Docker only)
 # ---------------------------------------------------------------------------
-.PHONY: coverage coverage-build coverage-clean coverage-report coverage-html
+.PHONY: coverage coverage-build coverage-clean coverage-test coverage-html
 
 # Clean coverage artifacts
 coverage-clean:
@@ -217,7 +217,8 @@ coverage-clean:
 coverage-build: coverage-clean
 	@echo "[coverage] Building with coverage instrumentation..."
 	@$(MAKE) clean
-	@COVERAGE=1 $(MAKE) all install
+	@COVERAGE=1 $(MAKE) all
+	@sudo COVERAGE=1 $(MAKE) install
 	@echo "[coverage] Coverage build complete."
 
 # Run tests with coverage
@@ -233,45 +234,6 @@ coverage-test:
 	@sleep 3
 	@echo "[coverage] Test run complete."
 
-# Generate coverage report
-coverage-report:
-	@echo "[coverage] Generating coverage report..."
-	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov execution completed"
-	@if [ -f smol.c.gcov ]; then \
-		echo "[coverage] Coverage report generated: smol.c.gcov"; \
-		echo ""; \
-		echo "=== COVERAGE SUMMARY ==="; \
-		awk ' \
-			/GCOV_EXCL_START/ { excl=1; next } \
-			/GCOV_EXCL_STOP/ { excl=0; next } \
-			excl { next } \
-			/^ *-:/ { next } \
-			/^ *#####:.*GCOV_EXCL/ { next } \
-			/^ *#####:/ { uncov++ } \
-			/^ *[0-9]+:/ { cov++ } \
-			END { \
-				total = cov + uncov; \
-				if (total > 0) { \
-					pct = (cov * 100.0) / total; \
-					printf "Lines executed: %.2f%% (%d/%d)\n", pct, cov, total; \
-				} \
-			}' smol.c.gcov; \
-		echo ""; \
-		echo "=== UNCOVERED LINES (excluding GCOV_EXCL blocks) ==="; \
-		awk ' \
-			/GCOV_EXCL_START/ { excl=1 } \
-			/GCOV_EXCL_STOP/ { excl=0; next } \
-			/^ *#####:/ && excl==0 && !/GCOV_EXCL_LINE/ && !/GCOV_EXCL_START/ && !/DEFENSIVE_CHECK/ { \
-				line = $$0; \
-				gsub(/^ *#####: */, "", line); \
-				gsub(/:.*/, "", line); \
-				print line; \
-			}' smol.c.gcov | head -50 | \
-		awk '{printf "Line %s: not executed\n", $$1}'; \
-	else \
-		echo "[coverage] ERROR: No coverage data found. Run 'make coverage-test' first."; \
-	fi
-
 # Generate HTML coverage report using lcov
 coverage-html:
 	@echo "[coverage] Generating HTML coverage report..."
@@ -285,51 +247,36 @@ coverage-html:
 	@if [ -d coverage_html ]; then \
 		echo "[coverage] HTML report generated in coverage_html/index.html"; \
 	else \
-		echo "[coverage] HTML generation failed. Using text report instead."; \
-		$(MAKE) coverage-report; \
+		echo "[coverage] HTML generation failed."; \
+		echo "[coverage] Ensure smol.c.gcov exists or run 'make coverage' first."; \
 	fi
 
-# Check coverage percentage and fail if < 100% (excluding GCOV_EXCL)
-coverage-check:
+# Complete coverage workflow - build, test, report, and check
+coverage: coverage-clean coverage-build coverage-test
+	@echo "[coverage] Generating coverage report..."
+	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov execution completed"
 	@echo "[coverage] Checking coverage percentage..."
 	@if [ ! -f smol.c.gcov ]; then \
-		echo "[coverage] ERROR: No coverage data. Run 'make coverage' first." >&2; \
+		echo "[coverage] ERROR: No coverage data generated." >&2; \
 		exit 2; \
 	fi
-	@scripts/coverage_check.sh smol.c 100
-
-# Complete coverage workflow
-coverage: coverage-clean coverage-build coverage-test coverage-report
+	@scripts/calc_cov.sh
 	@echo ""
-	@echo "[coverage] Regenerating gcov with flushed data..."
-	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov regeneration completed"
-	@echo "[coverage] Extracting uncovered lines (excluding GCOV_EXCL blocks)..."
-	@awk ' \
-		/GCOV_EXCL_START/ { excl=1 } \
-		/GCOV_EXCL_STOP/ { excl=0; next } \
-		/^ *#####:/ && excl==0 && !/GCOV_EXCL_LINE/ && !/GCOV_EXCL_START/ && !/DEFENSIVE_CHECK/ { \
-			line = $$0; \
-			gsub(/^ *#####: */, "", line); \
-			gsub(/:.*/, "", line); \
-			print line; \
-		}' smol.c.gcov > coverage_uncovered.txt || true
-	@if [ -f coverage_uncovered.txt ]; then \
-		count=$$(wc -l < coverage_uncovered.txt 2>/dev/null || echo 0); \
-		echo "[coverage] Uncovered lines saved to coverage_uncovered.txt ($$count lines, excluding GCOV_EXCL blocks)"; \
-		if [ $$count -gt 0 ]; then \
-			echo "[coverage] First 10 uncovered lines:"; \
-			head -10 coverage_uncovered.txt | while read line; do \
-				echo "  Line $$line: $$(sed -n "$${line}p" smol.c | sed 's/^[[:space:]]*//;s/[[:space:]]*$$//')"; \
-			done; \
-		else \
-			echo "[coverage] 🎉 100% coverage achieved (excluding GCOV_EXCL blocks)!"; \
-		fi; \
-	fi
+	@echo "[coverage] Verifying 100% coverage target..."
+	@scripts/calc_cov.sh | awk '/Coverage: / { \
+		gsub(/%/, "", $$2); \
+		cov = $$2 + 0; \
+		if (cov < 100.00) { \
+			printf "[coverage] ERROR: Coverage is %.2f%%, target is 100.00%%\n", cov; \
+			exit 1; \
+		} else { \
+			printf "[coverage] ✓ Coverage is %.2f%% (meets target)\n", cov; \
+		} \
+	}'
 	@echo ""
-	@echo "[coverage] Full coverage analysis complete!"
+	@echo "[coverage] Coverage analysis complete!"
 	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
-	@echo "[coverage] Review coverage_uncovered.txt for truly uncovered lines"
+	@echo "[coverage] Run 'scripts/calc_cov.sh --condensed' for uncovered line details"
 	@echo "[coverage] Run 'make coverage-html' for HTML report"
-	@echo "[coverage] Run 'make coverage-check' to enforce 100% coverage"
 
 
