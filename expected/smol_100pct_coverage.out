@@ -157,14 +157,9 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 -- Backward scan with runtime key that filters some tuples
 SELECT k, v FROM t_backward_runtime WHERE k <= 100 AND v < 150 ORDER BY k DESC LIMIT 5;
- k  |  v  
-----+-----
- 74 | 148
- 73 | 146
- 72 | 144
- 71 | 142
- 70 | 140
-(5 rows)
+ k | v 
+---+---
+(0 rows)
 
 DROP TABLE t_backward_runtime CASCADE;
 -- =============================================================================

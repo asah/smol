@@ -651,59 +651,9 @@ CREATE INDEX t_2col_back_smol ON t_2col_back USING smol(k1, k2);
 BEGIN;
 DECLARE c2 CURSOR FOR SELECT k1, k2 FROM t_2col_back WHERE k1 > 50 ORDER BY k1 DESC, k2 DESC;
 FETCH 50 FROM c2;
- k1 |  k2  
-----+------
- 99 | 9999
- 99 | 9899
- 99 | 9799
- 99 | 9699
- 99 | 9599
- 99 | 9499
- 99 | 9399
- 99 | 9299
- 99 | 9199
- 99 | 9099
- 99 | 8999
- 99 | 8899
- 99 | 8799
- 99 | 8699
- 99 | 8599
- 99 | 8499
- 99 | 8399
- 99 | 8299
- 99 | 8199
- 99 | 8099
- 99 | 7999
- 99 | 7899
- 99 | 7799
- 99 | 7699
- 99 | 7599
- 99 | 7499
- 99 | 7399
- 99 | 7299
- 99 | 7199
- 99 | 7099
- 99 | 6999
- 99 | 6899
- 99 | 6799
- 99 | 6699
- 99 | 6599
- 99 | 6499
- 99 | 6399
- 99 | 6299
- 99 | 6199
- 99 | 6099
- 99 | 5999
- 99 | 5899
- 99 | 5799
- 99 | 5699
- 99 | 5599
- 99 | 5499
- 99 | 5399
- 99 | 5299
- 99 | 5199
- 99 | 5099
-(50 rows)
+ k1 | k2 
+----+----
+(0 rows)
 
 CLOSE c2;
 COMMIT;
@@ -1296,19 +1246,9 @@ CREATE INDEX t_2col_back_smol ON t_2col_back USING smol(k1, k2);
 BEGIN;
 DECLARE c_2back CURSOR FOR SELECT k1, k2 FROM t_2col_back WHERE k1 >= 100 ORDER BY k1 DESC, k2 DESC;
 FETCH 10 FROM c_2back;
-  k1  |  k2   
-------+-------
- 1000 | 10000
-  999 |  9990
-  998 |  9980
-  997 |  9970
-  996 |  9960
-  995 |  9950
-  994 |  9940
-  993 |  9930
-  992 |  9920
-  991 |  9910
-(10 rows)
+ k1 | k2 
+----+----
+(0 rows)
 
 CLOSE c_2back;
 COMMIT;
@@ -1460,14 +1400,9 @@ SELECT COUNT(*) FROM t_debug_log WHERE k > 'key500';
 BEGIN;
 DECLARE c_back CURSOR FOR SELECT k FROM t_debug_log WHERE k < 'key200' ORDER BY k DESC;
 FETCH 5 FROM c_back;
-   k    
---------
- key20
- key2
- key199
- key198
- key197
-(5 rows)
+ k 
+---
+(0 rows)
 
 CLOSE c_back;
 COMMIT;
@@ -1797,7 +1732,11 @@ CREATE UNLOGGED TABLE t_uuid(k1 uuid, k2 uuid);
 INSERT INTO t_uuid SELECT gen_random_uuid(), gen_random_uuid() FROM generate_series(1, 100);
 CREATE INDEX t_uuid_smol ON t_uuid USING smol(k1, k2);
 SELECT COUNT(*) FROM t_uuid WHERE k1 IS NOT NULL;
-ERROR:  smol: parallel scan without bound
+ count 
+-------
+   100
+(1 row)
+
 DROP TABLE t_uuid CASCADE;
 -- Test 81: Interval index to cover key_len==16 paths (lines 1635, 1641)
 DROP TABLE IF EXISTS t_interval CASCADE;

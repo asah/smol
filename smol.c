@@ -2130,14 +2130,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             uint16 n = smol_leaf_nitems(page);
             if (so->have_bound)
             {
+                /* For backward scan with lower bound (>=, >, or =):
+                 * Just start at the end and let the scan loop handle bound checking.
+                 * Don't try to position based on the bound here, as we need ALL entries
+                 * from the end down to (but not including) entries < bound. */
                 so->cur_off = n;
-                while (so->cur_off >= FirstOffsetNumber)
-                {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
-                    if (smol_cmp_keyptr_to_bound(so, keyp) <= 0)
-                        break;
-                    so->cur_off--;
-                }
             }
 #ifdef SMOL_PLANNER_BACKWARD_UPPER_ONLY
             else if (so->have_upper_bound)
@@ -2588,21 +2585,31 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 while (so->cur_off >= FirstOffsetNumber)
                 {
                     char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
-                    /* Check upper bound (for BETWEEN queries) */
-#ifdef SMOL_PLANNER_BACKWARD_UPPER
-                    /* NOTE: PostgreSQL planner doesn't generate backward scans with upper bounds.
-                     * For BETWEEN + ORDER BY DESC, it uses forward scan + sort. Enable when planner supports it. */
+                    /* For zero-copy pages, skip IndexTuple header to get key data */
+                    if (so->page_is_zerocopy)
+                        keyp += sizeof(IndexTupleData);
+                    /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
                     {
                         int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
                         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
                         {
-                            /* Exceeded upper bound, skip */
+                            /* Key exceeds upper bound, skip and continue */
                             so->cur_off--;
                             continue;
                         }
                     }
-#endif /* SMOL_PLANNER_BACKWARD_UPPER */
+                    /* Check lower bound - if we've gone below it, terminate scan */
+                    if (so->have_bound)
+                    {
+                        int c = smol_cmp_keyptr_to_bound(so, keyp);
+                        if (so->bound_strict ? (c <= 0) : (c < 0))
+                        {
+                            /* Gone below lower bound, stop scan */
+                            so->cur_blk = InvalidBlockNumber;
+                            break;
+                        }
+                    }
                     if (so->have_k1_eq)
                     { /* GCOV_EXCL_LINE - opening brace artifact, outer if shows 110 executions */
                             int c = smol_cmp_keyptr_to_bound(so, keyp); /* GCOV_EXCL_LINE - declaration artifact, outer if shows 110 executions */
@@ -2669,9 +2676,39 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             else if (so->key_len == 8) smol_copy8(so->itup_data, keyp); /* GCOV_EXCL_LINE - planner doesn't use backward scans with int8 in ways that reach this path */
                             else if (so->key_len == 16) smol_copy16(so->itup_data, keyp); /* GCOV_EXCL_LINE - key_len==16 rarely used in backward scans */
                             else smol_copy_small(so->itup_data, keyp, so->key_len); /* GCOV_EXCL_LINE - uncommon key lengths rarely used in backward scans */
+                            /* Copy INCLUDE columns */
+                            if (so->ninclude > 0)
+                            {
+                                uint16 n2 = smol_leaf_nitems(page);
+                                for (uint16 ii=0; ii<so->ninclude; ii++)
+                                {
+                                    char *ip;
+                                    /* Use cached pointers when available (fast paths) */
+                                    if (so->plain_inc_cached)
+                                        /* Plain page: base pointer + row offset */
+                                        ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
+                                    else if (so->rle_run_inc_cached)
+                                        /* RLE page with cached run: INCLUDE values constant within run */
+                                        ip = so->rle_run_inc_ptr[ii];
+                                    else
+                                        /* Slow path: compute pointer dynamically */
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+                                    char *dst = so->itup_data + so->inc_offs[ii];
+                                    /* common cases first */
+                                    if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
+                                    else if (so->inc_len[ii] == 8) smol_copy8(dst, ip);
+                                    else if (so->inc_len[ii] == 16) smol_copy16(dst, ip);
+                                    else if (so->inc_len[ii] == 2) smol_copy2(dst, ip);
+                                    else if (so->inc_len[ii] == 1) memcpy(dst, ip, 1);
+                                    else
+                                    {
+                                        SMOL_DEFENSIVE_CHECK(false, ERROR, /* GCOV_EXCL_LINE */
+                                            (errmsg("smol: unsupported INCLUDE column size %u", so->inc_len[ii])));
+                                    }
+                                }
+                            }
                         }
                     }
-                    /* include attrs handled in unified block below (supports varlena) */
                     if (smol_debug_log) /* GCOV_EXCL_START - debug logging in backward scans rarely enabled */
                     {
                         if (so->key_is_text32)
@@ -3170,6 +3207,13 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Pre-pin next leaf and rebuild cache for two-col */
             Buffer nbuf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
             Page np = BufferGetPage(nbuf);
+
+            /* For backward scans, set cur_off to last item in new page */
+            if (dir == BackwardScanDirection && !so->two_col)
+            {
+                uint16 n_new = smol_leaf_nitems(np);
+                so->cur_off = n_new;
+            }
 
             /* Page-level bounds checking: stop scan early for BETWEEN and equality queries
              * Only applies to single-column indexes with forward scans that have upper bounds or equality */
@@ -5261,14 +5305,38 @@ smol_log_page_summary(Relation idx)
               (unsigned) nblocks, nmeta, ninternal, nleaf);
 }
 
-/* Return rightmost leaf block number */
+/* Return rightmost leaf block number by scanning all pages */
 static BlockNumber
 smol_rightmost_leaf(Relation idx)
 {
-    SmolMeta meta;
-    smol_meta_read(idx, &meta);
-    BlockNumber cur = meta.root_blkno;
-    uint16 levels = meta.height;
+    BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
+    BlockNumber rightmost_leaf = InvalidBlockNumber;
+
+    /* Scan all blocks to find the rightmost leaf (highest block number that's a leaf) */
+    for (BlockNumber blk = 1; blk < nblocks; blk++)
+    {
+        Buffer buf = ReadBuffer(idx, blk);
+        Page page = BufferGetPage(buf);
+
+        if (!PageIsEmpty(page) && PageGetSpecialSize(page) == sizeof(SmolPageOpaqueData))
+        {
+            SmolPageOpaqueData *op = (SmolPageOpaqueData *) PageGetSpecialPointer(page);
+            if (op->flags & SMOL_F_LEAF)
+            {
+                rightmost_leaf = blk;
+            }
+        }
+        ReleaseBuffer(buf);
+    }
+
+    return rightmost_leaf;
+}
+
+/* Helper function: find rightmost leaf in a subtree */
+static BlockNumber
+smol_rightmost_in_subtree(Relation idx, BlockNumber root, uint16 levels)
+{
+    BlockNumber cur = root;
     while (levels > 1)
     {
         Buffer buf = ReadBuffer(idx, cur);
@@ -5284,47 +5352,79 @@ smol_rightmost_leaf(Relation idx)
     return cur;
 }
 
-/* Return previous leaf sibling by scanning root (height<=2 prototype)
- * NOTE: This is prototype code for backward scans on height=2 trees.
- * For height > 2, returns InvalidBlockNumber (backward scans not fully implemented).
- * In practice, backward scans may use other mechanisms or be limited to single-page results.
- */
-/* GCOV_EXCL_START - prototype function for height<=2 trees, not triggered by PostgreSQL planner */
+/* Helper function: recursively find previous leaf by walking tree */
+static BlockNumber
+smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target, uint16 levels, bool *found)
+{
+    if (levels == 1)
+    {
+        /* Leaf level - check if this is our target */
+        if (node == target)
+        {
+            *found = true;
+            return InvalidBlockNumber; /* No previous sibling at this level */
+        }
+        return node;
+    }
+
+    /* Internal node - scan children */
+    Buffer buf = ReadBuffer(idx, node);
+    Page page = BufferGetPage(buf);
+    OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+    BlockNumber prev_child = InvalidBlockNumber;
+    BlockNumber result = InvalidBlockNumber;
+
+    for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+    {
+        char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+        BlockNumber child;
+        memcpy(&child, itp, sizeof(BlockNumber));
+
+        /* Recursively search this child subtree */
+        BlockNumber candidate = smol_find_prev_leaf_recursive(idx, child, target, levels - 1, found);
+
+        if (*found)
+        {
+            /* Target was found in this subtree */
+            if (candidate != InvalidBlockNumber)
+            {
+                /* Candidate is in this subtree */
+                result = candidate;
+            }
+            else if (prev_child != InvalidBlockNumber)
+            {
+                /* Target was first in this subtree, return rightmost of previous sibling */
+                result = smol_rightmost_in_subtree(idx, prev_child, levels - 1);
+            }
+            else
+            {
+                /* Target was in first child, no previous leaf */
+                result = InvalidBlockNumber;
+            }
+            ReleaseBuffer(buf);
+            return result;
+        }
+
+        prev_child = child;
+    }
+
+    ReleaseBuffer(buf);
+    return InvalidBlockNumber;
+}
+
+/* Return previous leaf sibling by walking tree (works for any height) */
 static BlockNumber
 smol_prev_leaf(Relation idx, BlockNumber cur)
 {
     SmolMeta meta;
-    Buffer rbuf;
-    Page rpage;
-    OffsetNumber maxoff;
-    BlockNumber prev = InvalidBlockNumber;
     smol_meta_read(idx, &meta);
-    SMOL_DEFENSIVE_CHECK(meta.height <= 2, WARNING,
-        (errmsg("smol_prev_leaf: called with height=%u > 2 (prototype limitation)", (unsigned)meta.height)));
+
     if (meta.height <= 1)
         return InvalidBlockNumber;
-    rbuf = ReadBuffer(idx, meta.root_blkno);
-    rpage = BufferGetPage(rbuf);
-    maxoff = PageGetMaxOffsetNumber(rpage);
-    for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-    {
-        char *itp = (char *) PageGetItem(rpage, PageGetItemId(rpage, off));
-        BlockNumber child;
-        memcpy(&child, itp, sizeof(BlockNumber));
-        if (child == cur)
-        {
-            if (off > FirstOffsetNumber)
-            {
-                char *pitp = (char *) PageGetItem(rpage, PageGetItemId(rpage, off - 1));
-                memcpy(&prev, pitp, sizeof(BlockNumber));
-            }
-            break;
-        }
-    }
-    ReleaseBuffer(rbuf);
-    return prev;
+
+    bool found = false;
+    return smol_find_prev_leaf_recursive(idx, meta.root_blkno, cur, meta.height, &found);
 }
-/* GCOV_EXCL_STOP */
 
 /* Build callbacks and comparators */
 static void

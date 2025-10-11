@@ -23,16 +23,16 @@ SET enable_bitmapscan = off;
 SELECT k, v FROM t_backward_text WHERE k >= 'key_00050' ORDER BY k DESC LIMIT 10;
      k     |  v   
 -----------+------
- key_00054 | 2254
- key_00054 | 3354
- key_00054 | 4354
- key_00054 |  254
- key_00054 | 3254
- key_00054 | 3654
- key_00054 |  654
- key_00054 |  754
- key_00054 | 4254
- key_00054 | 2654
+ key_00099 | 4199
+ key_00099 | 1899
+ key_00099 | 1099
+ key_00099 | 3399
+ key_00099 | 3599
+ key_00099 |  699
+ key_00099 |  999
+ key_00099 | 4499
+ key_00099 |  299
+ key_00099 | 4399
 (10 rows)
 
 -- Test with equality bound (targets lines 1931-1932: have_k1_eq termination

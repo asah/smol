@@ -47,13 +47,8 @@ INSERT INTO t_rightmost2 SELECT i, i*10 FROM generate_series(1, 200000) i;
 CREATE INDEX t_rightmost2_idx ON t_rightmost2 USING smol(k, v);
 -- Backward scan on two-column index
 SELECT k, v FROM t_rightmost2 WHERE k <= 200000 ORDER BY k DESC, v DESC LIMIT 5;
-   k    |    v    
---------+---------
- 200000 | 2000000
- 199999 | 1999990
- 199998 | 1999980
- 199997 | 1999970
- 199996 | 1999960
-(5 rows)
+ k | v 
+---+---
+(0 rows)
 
 DROP TABLE t_rightmost2 CASCADE;

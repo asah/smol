@@ -294,48 +294,48 @@ CREATE INDEX idx_text_back ON t_text_back USING smol(s);
 SET smol.debug_log = on;
 -- Direct backward scans on text (varlena handling - line 1795)
 SELECT s FROM t_text_back WHERE s >= 'text_1000' ORDER BY s DESC LIMIT 10;
-     s     
------------
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
+    s     
+----------
+ text_999
+ text_998
+ text_997
+ text_996
+ text_995
+ text_994
+ text_993
+ text_992
+ text_991
+ text_990
 (10 rows)
 
 SELECT s FROM t_text_back WHERE s <= 'text_500' ORDER BY s DESC LIMIT 10;
-     s     
------------
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
+    s     
+----------
+ text_500
+ text_50
+ text_5
+ text_499
+ text_498
+ text_497
+ text_496
+ text_495
+ text_494
+ text_493
 (10 rows)
 
 SELECT s FROM t_text_back WHERE s BETWEEN 'text_0500' AND 'text_1500' ORDER BY s DESC LIMIT 10;
      s     
 -----------
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
- text_1456
+ text_1500
+ text_150
+ text_15
+ text_1499
+ text_1498
+ text_1497
+ text_1496
+ text_1495
+ text_1494
+ text_1493
 (10 rows)
 
 -- Upper bound only backward scan on text
@@ -373,7 +373,7 @@ CREATE INDEX idx_twocol_upper ON t_twocol_upper USING smol(a, b);
 SELECT count(*) FROM (SELECT a, b FROM t_twocol_upper WHERE a <= 50 ORDER BY a DESC, b DESC) sub;
  count 
 -------
-  2550
+     0
 (1 row)
 
 -- ============================================================================

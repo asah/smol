@@ -40,7 +40,7 @@ FROM (VALUES (1), (2), (3), (4), (5)) v(id);
                  Index Searches: 0
                  Buffers: shared hit=259
  Planning:
-   Buffers: shared hit=18
+   Buffers: shared hit=21
 (12 rows)
 
 SELECT v.id, (

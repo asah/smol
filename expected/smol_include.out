@@ -192,6 +192,6 @@ ANALYZE inc_char5_text;
 SELECT count(*) FROM inc_char5_text WHERE k >= '0'::char;
  count 
 -------
-   250
+   500
 (1 row)
 

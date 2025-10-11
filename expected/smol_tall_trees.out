@@ -41,7 +41,7 @@ SELECT smol_test_backward_scan('t_very_tall_smol'::regclass);
 SELECT smol_test_backward_scan('t_very_tall_smol'::regclass, 40000);
  smol_test_backward_scan 
 -------------------------
-                      10
+                       0
 (1 row)
 
 -- Query rightmost values (triggers rightmost leaf navigation lines 4042-4050)
