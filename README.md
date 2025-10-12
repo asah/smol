@@ -140,7 +140,7 @@ Usage
 
 Tests
 - Run regression tests: `make install && make start && make installcheck && make stop`
-- Coverage workflow and troubleshooting: see `COVERAGE.md`
+- Code coverage: make coverage
 
  
 

@@ -243,20 +243,53 @@ coverage: coverage-clean coverage-build coverage-test
 	@scripts/calc_cov.sh
 	@echo ""
 	@echo "[coverage] Verifying 100% coverage target..."
-	@scripts/calc_cov.sh | awk '/Coverage: / { \
-		gsub(/%/, "", $$2); \
-		cov = $$2 + 0; \
-		if (cov < 100.00) { \
-			printf "[coverage] ERROR: Coverage is %.2f%%, target is 100.00%%\n", cov; \
-			exit 1; \
-		} else { \
-			printf "[coverage] ✓ Coverage is %.2f%% (meets target)\n", cov; \
+	@scripts/calc_cov.sh | awk ' \
+		/Excluded covered:/ { excl_cov = $$4 + 0 } \
+		/Coverage: / { \
+			gsub(/%/, "", $$2); \
+			cov = $$2 + 0; \
 		} \
-	}'
+		END { \
+			failed = 0; \
+			if (cov < 100.00) { \
+				printf "[coverage] ✗ ERROR: Coverage is %.2f%%, target is 100.00%%\n", cov; \
+				failed = 1; \
+			} else { \
+				printf "[coverage] ✓ Coverage is %.2f%% (meets target)\n", cov; \
+			} \
+			if (excl_cov > 0) { \
+				printf "[coverage] ✗ ERROR: Found %d \"Excluded covered\" lines\n", excl_cov; \
+				printf "[coverage]\n"; \
+				printf "[coverage] What are \"Excluded covered\" lines?\n"; \
+				printf "[coverage] ═══════════════════════════════════════════\n"; \
+				printf "[coverage] These are lines marked with GCOV_EXCL_LINE (or in GCOV_EXCL_START/STOP blocks)\n"; \
+				printf "[coverage] that are ACTUALLY covered by tests. This means:\n"; \
+				printf "[coverage]   • The code IS being tested\n"; \
+				printf "[coverage]   • But it is marked as excluded from coverage\n"; \
+				printf "[coverage]   • This is a waste - the exclusion marker should be removed!\n"; \
+				printf "[coverage]\n"; \
+				printf "[coverage] How to fix:\n"; \
+				printf "[coverage] ──────────\n"; \
+				printf "[coverage] 1. Run: ./scripts/calc_cov.sh -e\n"; \
+				printf "[coverage] 2. Review the listed lines with GCOV_EXCL markers\n"; \
+				printf "[coverage] 3. Remove the GCOV_EXCL_LINE, GCOV_EXCL_START, or GCOV_EXCL_STOP markers\n"; \
+				printf "[coverage] 4. Re-run: make coverage\n"; \
+				printf "[coverage]\n"; \
+				printf "[coverage] Why this matters:\n"; \
+				printf "[coverage] ────────────────\n"; \
+				printf "[coverage] Only truly untestable code should be excluded (e.g., unreachable error paths,\n"; \
+				printf "[coverage] platform-specific code). If tests already cover it, the exclusion is misleading.\n"; \
+				printf "[coverage]\n"; \
+				failed = 1; \
+			} \
+			if (failed) exit 1; \
+		} \
+	'
 	@echo ""
-	@echo "[coverage] Coverage analysis complete!"
+	@echo "[coverage] ✓ Coverage analysis complete!"
 	@echo "[coverage] Review smol.c.gcov for line-by-line coverage"
-	@echo "[coverage] Run 'scripts/calc_cov.sh --condensed' for uncovered line details"
+	@echo "[coverage] Run 'scripts/calc_cov.sh -v' for uncovered line details"
+	@echo "[coverage] Run 'scripts/calc_cov.sh -e' for excluded covered line details"
 	@echo "[coverage] Run 'make coverage-html' for HTML report"
 
 
