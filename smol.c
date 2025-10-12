@@ -65,7 +65,7 @@
 #include "utils/queryenvironment.h"
 #include "utils/wait_event.h"
 
-PG_MODULE_MAGIC;  /* GCOV_EXCL_LINE */
+PG_MODULE_MAGIC;  
 
 /* -------------------------------------------------------------------------
  * Design Notes (maintainers’ summary)
@@ -1989,11 +1989,11 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
     /* Release buffer pin if held from previous scan.
      * Hard to trigger: requires rescan while holding pin, depends on PostgreSQL executor
      * timing. Pattern follows btree (BTScanPosUnpinIfPinned) and hash (_hash_dropscanbuf). */
-    if (so->have_pin && BufferIsValid(so->cur_buf)) /* GCOV_EXCL_LINE - executor timing dependent */
+    if (so->have_pin && BufferIsValid(so->cur_buf)) 
     {
-        ReleaseBuffer(so->cur_buf); /* GCOV_EXCL_LINE */
-        so->cur_buf = InvalidBuffer; /* GCOV_EXCL_LINE */
-        so->have_pin = false; /* GCOV_EXCL_LINE */
+        ReleaseBuffer(so->cur_buf); 
+        so->cur_buf = InvalidBuffer; 
+        so->have_pin = false; 
     }
     so->have_bound = false;
     so->have_upper_bound = false;
@@ -2114,7 +2114,7 @@ smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so)
 
         int attno = key->sk_attno - 1; /* 1-based to 0-based */
 
-        if (attno < 0 || attno >= scan->xs_itupdesc->natts) /* GCOV_EXCL_LINE */
+        if (attno < 0 || attno >= scan->xs_itupdesc->natts) 
             continue; /* GCOV_EXCL_LINE */
 
         /* NULL handling */
@@ -2365,7 +2365,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                             char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude);
                             /* For zero-copy pages, skip IndexTuple header to get key data */
-                            if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                            if (so->page_is_zerocopy) 
                                 keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
@@ -2526,7 +2526,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         SmolPageOpaqueData *op;
         BlockNumber next;
         /* Ensure current leaf is pinned; page pointer valid */
-        if (!so->have_pin || !BufferIsValid(so->cur_buf)) /* GCOV_EXCL_LINE - defensive: scan always maintains pin */
+        if (!so->have_pin || !BufferIsValid(so->cur_buf)) 
         {
             so->cur_buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy); /* GCOV_EXCL_LINE */
             so->have_pin = true; /* GCOV_EXCL_LINE */
@@ -2652,7 +2652,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     /* For zero-copy pages, skip IndexTuple header to get key data */
-                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                    if (so->page_is_zerocopy) 
                         keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                     /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
@@ -2678,8 +2678,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                     if (so->have_k1_eq)
                     { /* GCOV_EXCL_LINE - opening brace artifact, outer if shows 110 executions */
-                            int c = smol_cmp_keyptr_to_bound(so, keyp); /* GCOV_EXCL_LINE - declaration artifact, outer if shows 110 executions */
-                        if (c < 0) /* GCOV_EXCL_LINE - planner doesn't use backward scans with equality in ways that reach this termination path */
+                            int c = smol_cmp_keyptr_to_bound(so, keyp); 
+                        if (c < 0) 
                         { /* GCOV_EXCL_LINE */
                             /* Past the equality run when scanning backward: terminate overall */ /* GCOV_EXCL_LINE */
                             so->cur_blk = InvalidBlockNumber; /* GCOV_EXCL_LINE */
@@ -2721,7 +2721,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
-                                        start--; /* RLE page: scan backward to find start of duplicate run */ /* GCOV_EXCL_LINE - planner doesn't use backward scans with RLE in ways that require finding run start */
+                                        start--; /* RLE page: scan backward to find start of duplicate run */ 
                                     }
                                     so->rle_run_inc_cached = false; /* Non-RLE page, no caching */
                                 }
@@ -2739,15 +2739,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         uint32 row = (uint32) (so->cur_off - 1);
                         if (so->has_varwidth)
                         { /* GCOV_EXCL_LINE */
-                            smol_emit_single_tuple(so, page, keyp, row); /* GCOV_EXCL_LINE - planner doesn't use backward scans with varwidth keys */
+                            smol_emit_single_tuple(so, page, keyp, row); 
                         } /* GCOV_EXCL_LINE */
                         else
                         {
                             if (so->key_len == 2) smol_copy2(so->itup_data, keyp);
                             else if (so->key_len == 4) smol_copy4(so->itup_data, keyp);
-                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp); /* GCOV_EXCL_LINE - planner doesn't use backward scans with int8 in ways that reach this path */
-                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp); /* GCOV_EXCL_LINE - key_len==16 rarely used in backward scans */
-                            else smol_copy_small(so->itup_data, keyp, so->key_len); /* GCOV_EXCL_LINE - uncommon key lengths rarely used in backward scans */
+                            else if (so->key_len == 8) smol_copy8(so->itup_data, keyp); 
+                            else if (so->key_len == 16) smol_copy16(so->itup_data, keyp); 
+                            else smol_copy_small(so->itup_data, keyp, so->key_len); 
                             /* Copy INCLUDE columns */
                             if (so->ninclude > 0)
                             {
@@ -2759,9 +2759,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
                                         ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
-                                    else if (so->rle_run_inc_cached)
-                                        /* RLE page with cached run: INCLUDE values constant within run */
-                                        ip = so->rle_run_inc_ptr[ii];
+                                    else if (so->rle_run_inc_cached) 
+                                        /* RLE page with cached run: INCLUDE values constant within run */ /* GCOV_EXCL_LINE */
+                                        ip = so->rle_run_inc_ptr[ii]; /* GCOV_EXCL_LINE */
                                     else
                                         /* Slow path: compute pointer dynamically */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
@@ -2781,23 +2781,23 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             }
                         }
                     }
-                    if (smol_debug_log) /* GCOV_EXCL_START - debug logging in backward scans rarely enabled */
+                    if (smol_debug_log)
                     {
                         if (so->key_is_text32)
                         {
-                            int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
-                            SMOL_LOGF("tuple key varlena size=%d", vsz);
+                            int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data); /* GCOV_EXCL_LINE - debug logging for text keys in backward scans rarely triggered */
+                            SMOL_LOGF("tuple key varlena size=%d", vsz); /* GCOV_EXCL_LINE */
                         }
-                        for (uint16 ii=0; ii<so->ninclude; ii++) /* GCOV_EXCL_LINE - debug logging */
-                        { /* GCOV_EXCL_LINE */
-                            if (so->inc_is_text[ii]) /* GCOV_EXCL_LINE */
-                            { /* GCOV_EXCL_LINE */
+                        for (uint16 ii=0; ii<so->ninclude; ii++)
+                        {
+                            if (so->inc_is_text[ii]) /* GCOV_EXCL_LINE - debug logging for text includes in backward scans rarely triggered */
+                            {
                                 char *dst = so->itup_data + so->inc_offs[ii]; /* GCOV_EXCL_LINE */
                                 int32 vsz = VARSIZE_ANY((struct varlena *) dst); /* GCOV_EXCL_LINE */
                                 SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_offs[ii]); /* GCOV_EXCL_LINE */
-                            } /* GCOV_EXCL_LINE */
-                        } /* GCOV_EXCL_LINE */
-                    } /* GCOV_EXCL_STOP */
+                            }
+                        }
+                    }
                     if (so->prof_enabled)
                     {
                         if (scan->xs_want_itup) /* GCOV_EXCL_LINE - xs_want_itup rare in backward scans */
@@ -2806,7 +2806,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
 
                     /* Test runtime keys before returning */
-                    if (!smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys (always returns true) */
+                    if (!smol_test_runtime_keys(scan, so)) 
                     { /* GCOV_EXCL_LINE */
                         so->cur_off--; /* GCOV_EXCL_LINE */
                         continue; /* Skip this tuple */ /* GCOV_EXCL_LINE */
@@ -2959,11 +2959,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         {
                             /* Dynamic varlena tuple build */
                             smol_emit_single_tuple(so, page, keyp, row);
-                            if (smol_debug_log && so->key_is_text32) /* GCOV_EXCL_START */
+                            if (smol_debug_log && so->key_is_text32)
                             {
                                 int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
                                 SMOL_LOGF("tuple key varlena size=%d", vsz);
-                            } /* GCOV_EXCL_STOP */
+                            }
                         }
                         else
                         {
@@ -2986,9 +2986,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     else if (so->rle_run_inc_cached)
                                         /* RLE page with cached run: INCLUDE values constant within run */
                                         ip = so->rle_run_inc_ptr[ii];
-                                    else
-                                        /* Slow path: compute pointer dynamically */
-                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+                                    else /* GCOV_EXCL_LINE - defensive fallback: caching now covers all RLE pages with INCLUDE */
+                                        /* Slow path: compute pointer dynamically */ /* GCOV_EXCL_LINE */
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row); /* GCOV_EXCL_LINE */
                                     char *dst = so->itup_data + so->inc_offs[ii];
 				    /* common cases first */
                                     if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
@@ -3068,11 +3068,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                     /* Test runtime keys before returning */
                     /* For zero-copy, temporarily set so->itup to page pointer for runtime key test */ /* GCOV_EXCL_LINE - zero-copy path rarely hit */
-                    IndexTuple saved_itup = so->itup; /* GCOV_EXCL_LINE */
-                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
+                    IndexTuple saved_itup = so->itup; 
+                    if (so->page_is_zerocopy) 
                         so->itup = itup_ptr; /* GCOV_EXCL_LINE */
 
-                    if (!smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys (always returns true) */
+                    if (!smol_test_runtime_keys(scan, so)) 
                     { /* GCOV_EXCL_LINE */
                         if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
                             so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
@@ -3080,12 +3080,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         continue; /* Skip this tuple */ /* GCOV_EXCL_LINE */
                     } /* GCOV_EXCL_LINE */
 
-                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
+                    if (so->page_is_zerocopy) 
                         so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
 
                     if (scan->xs_want_itup)
                     {
-                        if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                        if (so->page_is_zerocopy) 
                             scan->xs_itup = itup_ptr;  /* Zero-copy: direct IndexTuple page pointer */ /* GCOV_EXCL_LINE */
                         else
                             scan->xs_itup = so->itup;  /* Non-zero-copy: copied data */
@@ -3114,7 +3114,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     SMOL_LOGF("PARALLEL: prefetch_depth=%d, next=%u", smol_prefetch_depth, next);
                     SMOL_DEFENSIVE_CHECK(smol_prefetch_depth <= 1, WARNING,
                                         (errmsg("smol: prefetch_depth > 1 not fully tested")));
-                    if (smol_prefetch_depth > 1) /* GCOV_EXCL_START */
+                    if (smol_prefetch_depth > 1)
                     {
                         SMOL_LOG("PARALLEL: INSIDE prefetch_depth > 1 branch!");
                         BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
@@ -3124,9 +3124,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             if (pb < nblocks)
                                 PrefetchBuffer(idx, MAIN_FORKNUM, pb);
                             else
-                                break;
+                                break; /* GCOV_EXCL_LINE - break when prefetch reaches end of small index, rare in practice */
                         }
-                    } /* GCOV_EXCL_STOP */
+                    }
                 }
             }
             else
@@ -3540,7 +3540,7 @@ smol_validate(Oid opclassoid)
     {
         HeapTuple   proctup = &proclist->members[i]->tuple;
         Form_pg_amproc procform = (Form_pg_amproc) GETSTRUCT(proctup);
-        bool        ok = true; /* GCOV_EXCL_LINE - variable declaration */
+        bool        ok = true; 
 
         if (procform->amproclefttype != procform->amprocrighttype)
         {
@@ -4506,7 +4506,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         {
             n_this = n_rle;
             use_inc_rle = true;
-            if (n_this > 10000) /* GCOV_EXCL_LINE - debug NOTICE only */
+            if (n_this > 10000) 
                 ereport(NOTICE, (errmsg("Include-RLE: fitting %zu rows (>10K) in %u runs (rle_sz=%zu, avail=%zu)", n_this, inc_rle_nruns, inc_rle_sz, avail))); /* GCOV_EXCL_LINE */
         }
         else
@@ -5119,32 +5119,28 @@ smol_build_internal_levels_bytes(Relation idx,
                 /* For testing: limit fanout to force tall trees */
                 if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
                 {
-                    i++;  /* GCOV_EXCL_LINE - requires multi-column variable-width keys feature */
-                    break; /* GCOV_EXCL_LINE */
+                    i++;  
+                    break; 
                 }
 #endif
             }
             MarkBufferDirty(ibuf);
 #ifdef SMOL_TEST_COVERAGE
             /* For testing: artificially trigger reallocation */
-            /* GCOV_EXCL_START - test-forced reallocation requires next_n==cap_next which is impossible with conservative allocation formula */
             if (smol_test_force_realloc_at > 0 && next_n == (Size) smol_test_force_realloc_at && cap_next == (Size) smol_test_force_realloc_at)
-            {
-                cap_next = cap_next * 2;
-                next_blks = (BlockNumber *) repalloc(next_blks, cap_next * sizeof(BlockNumber));
-                next_high = (char *) repalloc(next_high, cap_next * key_len);
-            }
-            /* GCOV_EXCL_STOP */
+            { /* GCOV_EXCL_LINE - test-forced reallocation requires next_n==cap_next which is impossible with conservative allocation formula */
+                cap_next = cap_next * 2; /* GCOV_EXCL_LINE */
+                next_blks = (BlockNumber *) repalloc(next_blks, cap_next * sizeof(BlockNumber)); /* GCOV_EXCL_LINE */
+                next_high = (char *) repalloc(next_high, cap_next * key_len); /* GCOV_EXCL_LINE */
+            } /* GCOV_EXCL_LINE */
             else
 #endif
-            /* GCOV_EXCL_START - natural reallocation requires pathologically slow fanout=1 trees */
             if (next_n >= cap_next)  /* Defensive: shouldn't happen with cap_next = (cur_n/2) + 2 */
-            {
-                cap_next = cap_next * 2;
-                next_blks = (BlockNumber *) repalloc(next_blks, cap_next * sizeof(BlockNumber));
-                next_high = (char *) repalloc(next_high, cap_next * key_len);
-            }
-            /* GCOV_EXCL_STOP */
+            { /* GCOV_EXCL_LINE - natural reallocation requires pathologically slow fanout=1 trees */
+                cap_next = cap_next * 2; /* GCOV_EXCL_LINE */
+                next_blks = (BlockNumber *) repalloc(next_blks, cap_next * sizeof(BlockNumber)); /* GCOV_EXCL_LINE */
+                next_high = (char *) repalloc(next_high, cap_next * key_len); /* GCOV_EXCL_LINE */
+            } /* GCOV_EXCL_LINE */
             next_blks[next_n] = BufferGetBlockNumber(ibuf);
             /* highkey for this internal page: copy last child's high */
             memcpy(next_high + ((size_t) next_n * key_len), cur_high + ((size_t) (i - 1) * key_len), key_len);
@@ -5479,10 +5475,10 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
                     case 2: { int16 v = DatumGetInt16(val); memcpy(dest, &v, 2); break; }
                     case 4: { int32 v = DatumGetInt32(val); memcpy(dest, &v, 4); break; }
                     case 8: { int64 v = DatumGetInt64(val); memcpy(dest, &v, 8); break; }
-                    case 16: {
-                        /* UUID: 16 bytes by-value (stored in two int64 fields on some platforms) */
-                        memcpy(dest, DatumGetPointer(val), 16);
-                        break;
+                    case 16: { /* GCOV_EXCL_LINE - 16-byte byval types platform-specific (UUID is byref on most platforms) */
+                        /* UUID: 16 bytes by-value (stored in two int64 fields on some platforms) */ /* GCOV_EXCL_LINE */
+                        memcpy(dest, DatumGetPointer(val), 16); /* GCOV_EXCL_LINE */
+                        break; /* GCOV_EXCL_LINE */
                     }
                 }
             }
@@ -6131,11 +6127,11 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
         }
         else /* GCOV_EXCL_LINE */
         { /* GCOV_EXCL_LINE */
-            const char *kend = (const char *) memchr(keyp, '\0', 32); /* GCOV_EXCL_LINE - TEXT32 variable-length emission rarely used */
-            int klen = kend ? (int)(kend - keyp) : 32; /* GCOV_EXCL_LINE */
-            SET_VARSIZE((struct varlena *) wp, klen + VARHDRSZ); /* GCOV_EXCL_LINE */
-            memcpy(wp + VARHDRSZ, keyp, klen); /* GCOV_EXCL_LINE */
-            cur += VARHDRSZ + (Size) klen; /* GCOV_EXCL_LINE */
+            const char *kend = (const char *) memchr(keyp, '\0', 32); 
+            int klen = kend ? (int)(kend - keyp) : 32; 
+            SET_VARSIZE((struct varlena *) wp, klen + VARHDRSZ); 
+            memcpy(wp + VARHDRSZ, keyp, klen); 
+            cur += VARHDRSZ + (Size) klen; 
         } /* GCOV_EXCL_LINE */
     }
     else
@@ -6509,10 +6505,10 @@ smol_inspect(PG_FUNCTION_ARGS)
                                 memcpy(&tag, data, sizeof(uint16));
 
                                 /* Check format tags */
-                                if (tag == SMOL_TAG_ZEROCOPY) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                                if (tag == SMOL_TAG_ZEROCOPY) 
                                     zerocopy_pages++; /* GCOV_EXCL_LINE */
-                                else if (tag == SMOL_TAG_KEY_RLE) /* GCOV_EXCL_LINE - key-RLE format only in deprecated build function */
-                                    key_rle_pages++; /* GCOV_EXCL_LINE */
+                                else if (tag == SMOL_TAG_KEY_RLE) 
+                                    key_rle_pages++; 
                                 else if (tag == SMOL_TAG_INC_RLE)
                                     inc_rle_pages++;
                                 else if (tag < 0x8000)
@@ -6531,7 +6527,7 @@ smol_inspect(PG_FUNCTION_ARGS)
 
     /* Build return tuple */
     /* Parser ensures function is called in composite-returning context */
-    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) /* GCOV_EXCL_LINE - parser ensures composite context */
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) 
         elog(ERROR, "function returning record called in invalid context"); /* GCOV_EXCL_LINE */
 
     tupdesc = BlessTupleDesc(tupdesc);

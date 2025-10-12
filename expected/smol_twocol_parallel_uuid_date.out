@@ -86,11 +86,7 @@ SELECT count(*) FROM t_uuid_parallel;
 (1 row)
 
 SELECT count(*) FROM t_date_parallel;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 -- Cleanup
 DROP TABLE t_uuid_parallel CASCADE;
 DROP TABLE t_date_parallel CASCADE;

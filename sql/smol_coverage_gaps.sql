@@ -1,64 +1,117 @@
--- Additional coverage tests for uncovered code paths
+-- Test to cover remaining coverage gaps
+-- Covers: Text RLE, UUID RLE, RLE INCLUDE caching
+
 CREATE EXTENSION IF NOT EXISTS smol;
 
--- Test 1: Empty two-column index
-DROP TABLE IF EXISTS t_empty_twocol CASCADE;
-CREATE UNLOGGED TABLE t_empty_twocol(k int4, v int4);
--- Create two-column index on empty table (covers lines 1486-1492)
-CREATE INDEX t_empty_twocol_smol ON t_empty_twocol USING smol(k, v);
--- Verify it works after inserting data
-INSERT INTO t_empty_twocol VALUES (1, 100), (2, 200);
-SELECT COUNT(*) FROM t_empty_twocol WHERE k >= 1;
-DROP TABLE t_empty_twocol CASCADE;
+-- Test 1: Text RLE with heavy duplicates (covers lines 5307-5342)
+CREATE UNLOGGED TABLE test_text_rle(k text COLLATE "C", v int);
+-- Insert text with heavy duplicates to trigger RLE
+INSERT INTO test_text_rle
+SELECT
+    CASE (i % 5)
+        WHEN 0 THEN 'apple'
+        WHEN 1 THEN 'banana'
+        WHEN 2 THEN 'cherry'
+        WHEN 3 THEN 'date'
+        ELSE 'elderberry'
+    END,
+    i
+FROM generate_series(1, 10000) i
+ORDER BY 1, 2;
 
--- Test 2: Equality bound that stops scan across pages
-DROP TABLE IF EXISTS t_equality_bound CASCADE;
-CREATE UNLOGGED TABLE t_equality_bound(k int4);
--- Insert enough data to span multiple pages
-INSERT INTO t_equality_bound SELECT i FROM generate_series(1, 100000) i;
-CREATE INDEX t_equality_bound_smol ON t_equality_bound USING smol(k);
--- Equality query that should stop early (covers lines 977-978)
-SELECT COUNT(*) FROM t_equality_bound WHERE k = 50000;
-DROP TABLE t_equality_bound CASCADE;
+-- Create index with text key (should trigger text RLE path)
+CREATE INDEX test_text_rle_idx ON test_text_rle USING smol(k);
 
--- Test 3: Upper bound check with zero-copy format
-DROP TABLE IF EXISTS t_zerocopy_bound CASCADE;
-CREATE UNLOGGED TABLE t_zerocopy_bound(k int8);
--- Insert unique values to trigger zero-copy format
-INSERT INTO t_zerocopy_bound SELECT i FROM generate_series(1, 10000) i;
--- Force zero-copy format
-SET smol.enable_zero_copy = on;
-CREATE INDEX t_zerocopy_bound_smol ON t_zerocopy_bound USING smol(k);
-RESET smol.enable_zero_copy;
-SET enable_seqscan = off;
-SET enable_bitmapscan = off;
--- Upper bound query on zero-copy page (covers line 952, 977-978)
-SELECT COUNT(*) FROM t_zerocopy_bound WHERE k < 5000;
-SELECT COUNT(*) FROM t_zerocopy_bound WHERE k BETWEEN 1000 AND 2000;
-DROP TABLE t_zerocopy_bound CASCADE;
+-- Verify RLE is used
+SELECT key_rle_pages > 0 AS text_rle_used
+FROM smol_inspect('test_text_rle_idx');
 
--- Test 4: Runtime parameter filtering (covers lines 2042, 2047)
--- Note: This is tricky to trigger as it requires specific scan key conditions
--- that PostgreSQL planner generates. The code handles BTGreaterEqualStrategyNumber
--- and BTLessStrategyNumber on attribute 2 in two-column indexes.
-DROP TABLE IF EXISTS t_runtime_filter CASCADE;
-CREATE UNLOGGED TABLE t_runtime_filter(k int4, v int4);
-INSERT INTO t_runtime_filter SELECT i, i*2 FROM generate_series(1, 1000) i;
-CREATE INDEX t_runtime_filter_smol ON t_runtime_filter USING smol(k, v);
-SET enable_seqscan = off;
-SET enable_bitmapscan = off;
--- Query with bounds on both columns
-SELECT COUNT(*) FROM t_runtime_filter WHERE k >= 100 AND v < 500;
-DROP TABLE t_runtime_filter CASCADE;
+-- Query to ensure index works
+SELECT k, count(*) FROM test_text_rle WHERE k >= 'banana' GROUP BY k ORDER BY k;
 
--- Test 5: Empty page detection (lines 940, 944)
--- This is difficult to create naturally, but we can try with a very sparse index
-DROP TABLE IF EXISTS t_sparse CASCADE;
-CREATE UNLOGGED TABLE t_sparse(k int4);
--- Single value
-INSERT INTO t_sparse VALUES (1);
-CREATE INDEX t_sparse_smol ON t_sparse USING smol(k);
--- Query with bounds
-SELECT COUNT(*) FROM t_sparse WHERE k >= 0;
-SELECT COUNT(*) FROM t_sparse WHERE k > 1000;
-DROP TABLE t_sparse CASCADE;
+-- Test 2: UUID with duplicates (covers lines 5482-5485: case 16)
+CREATE UNLOGGED TABLE test_uuid_rle(k uuid, v int);
+-- Insert UUIDs with heavy duplicates
+INSERT INTO test_uuid_rle
+SELECT
+    ('00000000-0000-0000-0000-00000000000' || (i % 10)::text)::uuid,
+    i
+FROM generate_series(1, 10000) i
+ORDER BY 1, 2;
+
+-- Create index with UUID key (should trigger case 16 in key extraction)
+CREATE INDEX test_uuid_rle_idx ON test_uuid_rle USING smol(k);
+
+-- Verify RLE is used
+SELECT key_rle_pages > 0 AS uuid_rle_used
+FROM smol_inspect('test_uuid_rle_idx');
+
+-- Query to ensure index works
+SELECT k, count(*) FROM test_uuid_rle WHERE k >= '00000000-0000-0000-0000-000000000005'::uuid GROUP BY k ORDER BY k;
+
+-- Test 3: RLE INCLUDE caching - forward scan with INCLUDE (covers line 2764 via forward scan)
+CREATE UNLOGGED TABLE test_rle_inc_cache(k int4, inc1 int4, inc2 int4);
+-- Heavy duplicates to trigger RLE
+INSERT INTO test_rle_inc_cache
+SELECT (i % 10)::int4, (i % 100)::int4, (i % 100)::int4
+FROM generate_series(1, 20000) i
+ORDER BY 1, 2, 3;
+
+CREATE INDEX test_rle_inc_cache_idx ON test_rle_inc_cache USING smol(k) INCLUDE (inc1, inc2);
+
+-- Verify include-RLE is used
+SELECT inc_rle_pages > 0 AS inc_rle_used
+FROM smol_inspect('test_rle_inc_cache_idx');
+
+-- Large scan to trigger RLE INCLUDE caching
+SELECT k, inc1, inc2, count(*) FROM test_rle_inc_cache WHERE k <= 5 GROUP BY k, inc1, inc2 ORDER BY k, inc1, inc2 LIMIT 20;
+
+-- Test 4: Backward scan with INCLUDE to cover line 2764 (rle_run_inc_cached in backward path)
+-- Note: Backward scans are rare, but cursors can trigger them
+BEGIN;
+DECLARE c_back_inc SCROLL CURSOR FOR SELECT k, inc1, inc2 FROM test_rle_inc_cache WHERE k <= 3 ORDER BY k;
+MOVE FORWARD ALL FROM c_back_inc;
+FETCH BACKWARD 5 FROM c_back_inc;
+CLOSE c_back_inc;
+COMMIT;
+
+-- Test 5: Debug logging for text32 in backward scans (covers lines 2788-2789, 2793-2797)
+SET smol.debug_log = true;
+SET enable_seqscan = false;  -- Force index usage
+CREATE UNLOGGED TABLE test_text32_back(k text COLLATE "C", inc text COLLATE "C");
+-- Use padded keys to get proper lexicographic ordering
+INSERT INTO test_text32_back SELECT 'key' || lpad((i % 100)::text, 3, '0'), 'val' || i::text FROM generate_series(1, 1000) i ORDER BY 1, 2;
+CREATE INDEX test_text32_back_idx ON test_text32_back USING smol(k) INCLUDE (inc);
+ANALYZE test_text32_back;
+-- Index-only backward scan to trigger debug logging
+-- Must use WHERE condition that benefits from index
+SELECT k, inc FROM test_text32_back WHERE k >= 'key010' AND k < 'key050' ORDER BY k DESC LIMIT 5;
+SET enable_seqscan = true;
+SET smol.debug_log = false;
+
+-- Test 6: Prefetch depth > 1 with break (covers line 3127)
+-- Create small index and set prefetch_depth to trigger break when reaching end
+SET smol.prefetch_depth = 3;
+CREATE UNLOGGED TABLE test_prefetch_small(k int4);
+INSERT INTO test_prefetch_small SELECT i FROM generate_series(1, 100) i;
+CREATE INDEX test_prefetch_small_idx ON test_prefetch_small USING smol(k);
+-- Parallel scan with prefetch to cover break path
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SELECT COUNT(*) FROM test_prefetch_small WHERE k > 50;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET smol.prefetch_depth;
+
+-- Cleanup
+DROP TABLE test_text_rle CASCADE;
+DROP TABLE test_uuid_rle CASCADE;
+DROP TABLE test_rle_inc_cache CASCADE;
+DROP TABLE test_text32_back CASCADE;
+DROP TABLE test_prefetch_small CASCADE;
