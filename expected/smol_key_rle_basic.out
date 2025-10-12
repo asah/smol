@@ -25,7 +25,7 @@ SELECT
 FROM smol_inspect('rle_dates_smol_idx');
  has_rle_pages | no_zerocopy_pages | good_compression 
 ---------------+-------------------+------------------
- f             | f                 | f
+ t             | t                 | t
 (1 row)
 
 -- Verify correctness: count rows for each date
@@ -57,7 +57,7 @@ SELECT
 FROM smol_inspect('rle_single_smol_idx');
  all_pages_rle | full_compression 
 ---------------+------------------
- f             | f
+ t             | t
 (1 row)
 
 -- Verify correctness
@@ -88,7 +88,7 @@ SELECT
 FROM smol_inspect('rle_mixed_smol_idx');
  all_pages_accounted | has_some_rle | has_some_zerocopy_or_none 
 ---------------------+--------------+---------------------------
- t                   | f            | t
+ t                   | t            | t
 (1 row)
 
 -- Verify correctness

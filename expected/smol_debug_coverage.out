@@ -273,7 +273,6 @@ NOTICE:  table "t_uuid_back" does not exist, skipping
 CREATE UNLOGGED TABLE t_uuid_back (u uuid);
 INSERT INTO t_uuid_back SELECT gen_random_uuid() FROM generate_series(1, 1000);
 CREATE INDEX idx_uuid_back ON t_uuid_back USING smol(u);
-ERROR:  unexpected byval==false
 -- Backward scan on UUID (16-byte key)
 SELECT count(*) FROM (SELECT u FROM t_uuid_back ORDER BY u DESC LIMIT 100) sub;
  count 

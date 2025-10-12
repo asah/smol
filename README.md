@@ -68,6 +68,9 @@ See `assignments.sql` for an example.
 
 CREATE INDEX idxname ON tblname USING smol (keyfield) INCLUDE (other, fields, you, want);
 
+-- IMPORTANT: Always run ANALYZE after index creation for optimal performance
+ANALYZE tblname;
+
 SELECT keyfield, COUNT(*) FROM tblname GROUP BY 1;
 
 SELECT keyfield, other, fields, COUNT(*) FROM tblname GROUP BY 1,2,3;

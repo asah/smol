@@ -247,21 +247,347 @@ class Benchmark:
         # Cleanup
         run_sql(f"DROP TABLE {table_name} CASCADE;")
 
-    def run_quick(self):
-        """Quick benchmark suite - basic comparison"""
-        self.print_header("QUICK BENCHMARK SUITE")
+    def run_case_type(self, case_id, engine, dtype, rows, distinct_values, warm):
+        """Run benchmark for a specific integer type with RLE-friendly data"""
+        safe_case_id = case_id.replace('.', '_').replace('-', '_')
+        table_name = f"bench_{safe_case_id}"
+        idx_name = f"{table_name}_{engine}"
 
-        self.print_subheader("Test 1: Unique Keys, No INCLUDE (1M rows)")
+        print(f"  {colorize('▸', Colors.OKBLUE)} {case_id:8s} {engine:5s} "
+              f"dtype={dtype} rows={rows:,} distinct={distinct_values} "
+              f"{'warm' if warm else 'cold':4s}", end='', flush=True)
+
+        # Drop existing
+        run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+        # Create and populate table with duplicates (sorted for RLE)
+        create_sql = f"""
+        CREATE TABLE {table_name}(k {dtype});
+        INSERT INTO {table_name}
+        SELECT (i % {distinct_values})::{dtype}
+        FROM generate_series(1, {rows}) i
+        ORDER BY 1;
+        ALTER TABLE {table_name} SET (autovacuum_enabled = off);
+        VACUUM (FREEZE, ANALYZE) {table_name};
+        """
+        run_sql(create_sql)
+
+        # Build index
+        create_idx_sql = f"CREATE INDEX {idx_name} ON {table_name} USING {engine}(k);"
+        build_ms = run_sql_timing(create_idx_sql)
+
+        # Get index size
+        size_result = run_sql(f"SELECT pg_relation_size('{idx_name}');")
+        if not size_result or not size_result.strip():
+            print(f"\n{colorize('✗ Error:', Colors.FAIL)} Index '{idx_name}' does not exist")
+            return None
+        size_bytes = int(size_result)
+        size_mb = size_bytes / (1024 * 1024)
+
+        # Configure query
+        run_sql(f"SET max_parallel_workers_per_gather = 0;")
+        run_sql("SET enable_seqscan = off;")
+        run_sql("SET enable_bitmapscan = off;")
+        run_sql("SET enable_indexonlyscan = on;")
+
+        # Warm cache if requested
+        threshold = distinct_values // 2
+        if warm:
+            run_sql(f"SELECT count(*) FROM {table_name} WHERE k >= {threshold};")
+
+        # Run query with EXPLAIN
+        query_sql = f"""
+        EXPLAIN (ANALYZE, TIMING ON, BUFFERS ON, FORMAT JSON)
+        SELECT count(*)
+        FROM {table_name}
+        WHERE k >= {threshold};
+        """
+
+        try:
+            explain_json = run_sql(query_sql)
+            stats = parse_explain_json(explain_json)
+        except (json.JSONDecodeError, ValueError):
+            stats = {
+                'exec_time': run_sql_timing(f"SELECT count(*) FROM {table_name} WHERE k >= {threshold};"),
+                'plan_time': 0,
+                'buffers': {'shared_hit': 0, 'shared_read': 0, 'shared_written': 0},
+                'rows': 0
+            }
+
+        # Calculate speedup
+        speedup_str = ""
+        if len(self.results) > 0 and self.results[-1]['case_id'] == case_id:
+            prev = self.results[-1]
+            speedup = prev['exec_time'] / stats['exec_time'] if stats['exec_time'] > 0 else 0
+            if speedup > 1.1:
+                speedup_str = colorize(f" ({speedup:.1f}x faster)", Colors.OKGREEN)
+            elif speedup < 0.9:
+                speedup_str = colorize(f" ({1/speedup:.1f}x slower)", Colors.FAIL)
+
+        print(f" → {stats['exec_time']:7.1f}ms  {size_mb:6.2f}MB{speedup_str}")
+
+        # Record result
+        self.results.append({
+            'case_id': case_id,
+            'engine': engine,
+            'rows': rows,
+            'duplicates': f'{distinct_values}_distinct',
+            'selectivity': 0.5,
+            'includes': 0,
+            'warm': warm,
+            'workers': 0,
+            'build_ms': build_ms,
+            'size_mb': size_mb,
+            'exec_time': stats['exec_time'],
+            'plan_time': stats['plan_time'],
+            'shared_read': stats['buffers']['shared_read'],
+            'shared_hit': stats['buffers']['shared_hit'],
+        })
+
+        # Cleanup
+        run_sql(f"DROP TABLE {table_name} CASCADE;")
+
+    def run_case_text(self, case_id, engine, rows, distinct_values, warm):
+        """Run benchmark for text type with RLE-friendly data"""
+        safe_case_id = case_id.replace('.', '_').replace('-', '_')
+        table_name = f"bench_{safe_case_id}"
+        idx_name = f"{table_name}_{engine}"
+
+        print(f"  {colorize('▸', Colors.OKBLUE)} {case_id:8s} {engine:5s} "
+              f"dtype=text rows={rows:,} distinct={distinct_values} "
+              f"{'warm' if warm else 'cold':4s}", end='', flush=True)
+
+        # Drop existing
+        run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+        # Generate distinct text values
+        text_values = ['admin', 'client', 'guest', 'user', 'manager',
+                       'operator', 'viewer', 'editor', 'owner', 'member'][:distinct_values]
+
+        # Create and populate table with duplicates (sorted for RLE)
+        create_sql = f"""
+        CREATE TABLE {table_name}(k text COLLATE "C");
+        INSERT INTO {table_name}
+        SELECT CASE (i % {distinct_values})
+        """
+        for i, val in enumerate(text_values):
+            create_sql += f"  WHEN {i} THEN '{val}'\n"
+        create_sql += f"""  ELSE 'unknown'
+        END
+        FROM generate_series(1, {rows}) i
+        ORDER BY 1;
+        ALTER TABLE {table_name} SET (autovacuum_enabled = off);
+        VACUUM (FREEZE, ANALYZE) {table_name};
+        """
+        run_sql(create_sql)
+
+        # Build index
+        create_idx_sql = f"CREATE INDEX {idx_name} ON {table_name} USING {engine}(k);"
+        build_ms = run_sql_timing(create_idx_sql)
+
+        # Get index size
+        size_result = run_sql(f"SELECT pg_relation_size('{idx_name}');")
+        if not size_result or not size_result.strip():
+            print(f"\n{colorize('✗ Error:', Colors.FAIL)} Index '{idx_name}' does not exist")
+            return None
+        size_bytes = int(size_result)
+        size_mb = size_bytes / (1024 * 1024)
+
+        # Configure query
+        run_sql(f"SET max_parallel_workers_per_gather = 0;")
+        run_sql("SET enable_seqscan = off;")
+        run_sql("SET enable_bitmapscan = off;")
+        run_sql("SET enable_indexonlyscan = on;")
+
+        # Warm cache if requested
+        threshold_val = text_values[distinct_values // 2] if distinct_values > 1 else text_values[0]
+        if warm:
+            run_sql(f"SELECT count(*) FROM {table_name} WHERE k >= '{threshold_val}';")
+
+        # Run query with EXPLAIN
+        query_sql = f"""
+        EXPLAIN (ANALYZE, TIMING ON, BUFFERS ON, FORMAT JSON)
+        SELECT count(*)
+        FROM {table_name}
+        WHERE k >= '{threshold_val}';
+        """
+
+        try:
+            explain_json = run_sql(query_sql)
+            stats = parse_explain_json(explain_json)
+        except (json.JSONDecodeError, ValueError):
+            stats = {
+                'exec_time': run_sql_timing(f"SELECT count(*) FROM {table_name} WHERE k >= '{threshold_val}';"),
+                'plan_time': 0,
+                'buffers': {'shared_hit': 0, 'shared_read': 0, 'shared_written': 0},
+                'rows': 0
+            }
+
+        # Calculate speedup
+        speedup_str = ""
+        if len(self.results) > 0 and self.results[-1]['case_id'] == case_id:
+            prev = self.results[-1]
+            speedup = prev['exec_time'] / stats['exec_time'] if stats['exec_time'] > 0 else 0
+            if speedup > 1.1:
+                speedup_str = colorize(f" ({speedup:.1f}x faster)", Colors.OKGREEN)
+            elif speedup < 0.9:
+                speedup_str = colorize(f" ({1/speedup:.1f}x slower)", Colors.FAIL)
+
+        print(f" → {stats['exec_time']:7.1f}ms  {size_mb:6.2f}MB{speedup_str}")
+
+        # Record result
+        self.results.append({
+            'case_id': case_id,
+            'engine': engine,
+            'rows': rows,
+            'duplicates': f'{distinct_values}_distinct',
+            'selectivity': 0.5,
+            'includes': 0,
+            'warm': warm,
+            'workers': 0,
+            'build_ms': build_ms,
+            'size_mb': size_mb,
+            'exec_time': stats['exec_time'],
+            'plan_time': stats['plan_time'],
+            'shared_read': stats['buffers']['shared_read'],
+            'shared_hit': stats['buffers']['shared_hit'],
+        })
+
+        # Cleanup
+        run_sql(f"DROP TABLE {table_name} CASCADE;")
+
+    def run_case_uuid(self, case_id, engine, rows, distinct_values, warm):
+        """Run benchmark for UUID type with RLE-friendly data"""
+        safe_case_id = case_id.replace('.', '_').replace('-', '_')
+        table_name = f"bench_{safe_case_id}"
+        idx_name = f"{table_name}_{engine}"
+
+        print(f"  {colorize('▸', Colors.OKBLUE)} {case_id:8s} {engine:5s} "
+              f"dtype=uuid rows={rows:,} distinct={distinct_values} "
+              f"{'warm' if warm else 'cold':4s}", end='', flush=True)
+
+        # Drop existing
+        run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+        # Create and populate table with duplicates (sorted for RLE)
+        create_sql = f"""
+        CREATE TABLE {table_name}(k uuid);
+        INSERT INTO {table_name}
+        SELECT ('00000000-0000-0000-0000-' || lpad((i % {distinct_values})::text, 12, '0'))::uuid
+        FROM generate_series(1, {rows}) i
+        ORDER BY 1;
+        ALTER TABLE {table_name} SET (autovacuum_enabled = off);
+        VACUUM (FREEZE, ANALYZE) {table_name};
+        """
+        run_sql(create_sql)
+
+        # Build index
+        create_idx_sql = f"CREATE INDEX {idx_name} ON {table_name} USING {engine}(k);"
+        build_ms = run_sql_timing(create_idx_sql)
+
+        # Get index size
+        size_result = run_sql(f"SELECT pg_relation_size('{idx_name}');")
+        if not size_result or not size_result.strip():
+            print(f"\n{colorize('✗ Error:', Colors.FAIL)} Index '{idx_name}' does not exist")
+            return None
+        size_bytes = int(size_result)
+        size_mb = size_bytes / (1024 * 1024)
+
+        # Configure query
+        run_sql(f"SET max_parallel_workers_per_gather = 0;")
+        run_sql("SET enable_seqscan = off;")
+        run_sql("SET enable_bitmapscan = off;")
+        run_sql("SET enable_indexonlyscan = on;")
+
+        # Warm cache if requested
+        threshold = distinct_values // 2
+        threshold_uuid = f"'00000000-0000-0000-0000-{threshold:012d}'::uuid"
+        if warm:
+            run_sql(f"SELECT count(*) FROM {table_name} WHERE k >= {threshold_uuid};")
+
+        # Run query with EXPLAIN
+        query_sql = f"""
+        EXPLAIN (ANALYZE, TIMING ON, BUFFERS ON, FORMAT JSON)
+        SELECT count(*)
+        FROM {table_name}
+        WHERE k >= {threshold_uuid};
+        """
+
+        try:
+            explain_json = run_sql(query_sql)
+            stats = parse_explain_json(explain_json)
+        except (json.JSONDecodeError, ValueError):
+            stats = {
+                'exec_time': run_sql_timing(f"SELECT count(*) FROM {table_name} WHERE k >= {threshold_uuid};"),
+                'plan_time': 0,
+                'buffers': {'shared_hit': 0, 'shared_read': 0, 'shared_written': 0},
+                'rows': 0
+            }
+
+        # Calculate speedup
+        speedup_str = ""
+        if len(self.results) > 0 and self.results[-1]['case_id'] == case_id:
+            prev = self.results[-1]
+            speedup = prev['exec_time'] / stats['exec_time'] if stats['exec_time'] > 0 else 0
+            if speedup > 1.1:
+                speedup_str = colorize(f" ({speedup:.1f}x faster)", Colors.OKGREEN)
+            elif speedup < 0.9:
+                speedup_str = colorize(f" ({1/speedup:.1f}x slower)", Colors.FAIL)
+
+        print(f" → {stats['exec_time']:7.1f}ms  {size_mb:6.2f}MB{speedup_str}")
+
+        # Record result
+        self.results.append({
+            'case_id': case_id,
+            'engine': engine,
+            'rows': rows,
+            'duplicates': f'{distinct_values}_distinct',
+            'selectivity': 0.5,
+            'includes': 0,
+            'warm': warm,
+            'workers': 0,
+            'build_ms': build_ms,
+            'size_mb': size_mb,
+            'exec_time': stats['exec_time'],
+            'plan_time': stats['plan_time'],
+            'shared_read': stats['buffers']['shared_read'],
+            'shared_hit': stats['buffers']['shared_hit'],
+        })
+
+        # Cleanup
+        run_sql(f"DROP TABLE {table_name} CASCADE;")
+
+    def run_quick(self):
+        """Quick benchmark suite - basic comparison with multiple datatypes"""
+        self.print_header("QUICK BENCHMARK SUITE - Multi-Datatype Tests")
+
+        self.print_subheader("Test 1: int4 - Unique Keys, No INCLUDE (1M rows)")
         self.run_case('q1', 'btree', 1000000, 'unique', 0.5, 0, True)
         self.run_case('q1', 'smol', 1000000, 'unique', 0.5, 0, True)
 
-        self.print_subheader("Test 2: Duplicate Keys with INCLUDE (1M rows, 1000 distinct)")
+        self.print_subheader("Test 2: int4 - Duplicate Keys with INCLUDE (1M rows, 1000 distinct)")
         self.run_case('q2', 'btree', 1000000, 'dup1k', 0.5, 2, True)
         self.run_case('q2', 'smol', 1000000, 'dup1k', 0.5, 2, True)
 
-        self.print_subheader("Test 3: High Selectivity (return 50% of rows)")
+        self.print_subheader("Test 3: int4 - High Selectivity (return 50% of rows)")
         self.run_case('q3', 'btree', 1000000, 'unique', 0.5, 2, True)
         self.run_case('q3', 'smol', 1000000, 'unique', 0.5, 2, True)
+
+        self.print_subheader("Test 4: int2 - RLE Compression (1M rows, 50 distinct)")
+        self.run_case_type('q4', 'btree', 'int2', 1000000, 50, True)
+        self.run_case_type('q4', 'smol', 'int2', 1000000, 50, True)
+
+        self.print_subheader("Test 5: int8 - RLE Compression (1M rows, 100 distinct)")
+        self.run_case_type('q5', 'btree', 'int8', 1000000, 100, True)
+        self.run_case_type('q5', 'smol', 'int8', 1000000, 100, True)
+
+        self.print_subheader("Test 6: text - RLE Compression (1M rows, 10 distinct strings)")
+        self.run_case_text('q6', 'btree', 1000000, 10, True)
+        self.run_case_text('q6', 'smol', 1000000, 10, True)
+
+        self.print_subheader("Test 7: UUID - RLE Compression (1M rows, 20 distinct UUIDs)")
+        self.run_case_uuid('q7', 'btree', 1000000, 20, True)
+        self.run_case_uuid('q7', 'smol', 1000000, 20, True)
 
     def run_full(self):
         """Full comprehensive benchmark"""

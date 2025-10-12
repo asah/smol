@@ -64,13 +64,13 @@ RUN ./configure \
   && make install \
   && (cd contrib/pg_buffercache && make install)
 
-#RUN /usr/local/pgsql/bin/pg_config
-
 # PATH
 WORKDIR /home/postgresql
 ENV PATH="/usr/local/pgsql/bin:${PATH}"
 
 EXPOSE 5432
+
+COPY bashrc .bashrc
 
 # make stop && make install && make start && su - postgres bash -c '/usr/local/pgsql/bin/psql -f bench/thrash.sql' | tee results/thrash.out
 # git config user.email "140002+asah@users.noreply.github.com" && git config user.name "Adam Sah"

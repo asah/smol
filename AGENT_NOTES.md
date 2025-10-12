@@ -3,10 +3,15 @@
 This file summarizes the hard‑won details needed to work on the `smol`
 PostgreSQL 18 index access method in this repo.
 
+Personality
+- you are an expert database computer science researcher and postgresql internals engineer, channeling the behaviors of Michael Stonebraker, Jim Gray, Andreas Freund, Tom Lane, Robert Haas and others.
+- you are neutral in your assessments, skeptical of claims by default and require multiple points of evidence and logic to believe things let alone make assessments.
+
 Working Notes
 - User-facing overview lives in `README.md`.
 - Benchmarking docs and usage are consolidated in `BENCHMARKING.md`.
 - Use Docker helpers if you prefer a clean PG18 toolchain, or run bare `make` targets locally; always connect as OS user `postgres` when using psql in the container (`make dpsql`).
+- **Performance troubleshooting:** See `PERFORMANCE_TROUBLESHOOTING.md` for common issues (especially missing ANALYZE).
 
 ## Goals & Constraints
 - Ordered semantics; read‑only index. Enforce read-only at the AM level
@@ -627,11 +632,19 @@ scripts/calc_cov.sh --condensed  # Shows uncovered lines grouped by section
 - Parallel scans: not implemented yet; keep `max_parallel_workers_per_gather=0` during correctness runs.
 
 ## Performance: When and Why SMOL Wins
-- Duplicate-heavy keys (long equal-key runs) + constant INCLUDEs: SMOL’s RLE plus dup-caching collapses per-run work to ~O(1) copies, while BTREE IOS still copies INCLUDE bytes per row. The gap scales with INCLUDE width.
+- Duplicate-heavy keys (long equal-key runs) + constant INCLUDEs: SMOL's RLE plus dup-caching collapses per-run work to ~O(1) copies, while BTREE IOS still copies INCLUDE bytes per row. The gap scales with INCLUDE width.
 - Space efficiency: SMOL indexes are 2–6× smaller on the scenarios we tested. Smaller indexes stay memory-resident longer; BTREE spills sooner and slows down.
 - Selectivity regimes where wins are largest:
   - Mid/high selectivity (e.g., 12%–50%) equality on the leading key: SMOL frequently uses IOS with zero heap fetches; BTREE often prefers Seq Scan at higher selectivity or does more per-row work even under IOS.
   - COUNT(*) scenarios: SMOL shows 2–8× speedups as selectivity grows, due to fewer pages and reduced per-row overhead.
   - SUM over INCLUDEs: SMOL leads by ~1.1–1.8× without include‑RLE; we expect larger wins once include‑RLE writer is enabled.
+
+### Critical Performance Requirement: Table Statistics
+**ALWAYS run ANALYZE after bulk loads or index creation!** Without table statistics (`reltuples=0`):
+- PostgreSQL planner won't enable parallel workers
+- Single-threaded scans can be 4-10x slower than parallel
+- SMOL may appear slower than BTREE due to lack of parallelism
+- Example: 706ms single-threaded → 173ms with 4 workers after ANALYZE
+- See `PERFORMANCE_TROUBLESHOOTING.md` for details
 
 ## 

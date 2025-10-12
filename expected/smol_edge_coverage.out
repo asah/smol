@@ -178,7 +178,6 @@ CREATE UNLOGGED TABLE t_uuid_back_real (u uuid);
 INSERT INTO t_uuid_back_real
 SELECT md5(i::text)::uuid FROM generate_series(1, 1000) i;
 CREATE INDEX idx_uuid_back_real ON t_uuid_back_real USING smol(u);
-ERROR:  unexpected byval==false
 -- Backward scan on UUID
 SELECT u FROM t_uuid_back_real ORDER BY u DESC LIMIT 5;
                   u                   

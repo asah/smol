@@ -5195,6 +5195,10 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
     char *leaf_high = NULL; /* bytes array nleaves*key_len */
     char lastkey[32];
     Size remaining = nkeys;
+
+    /* Allocate scratch buffer for page construction (reused across pages) */
+    char *scratch = (char *) palloc(BLCKSZ);
+
     while (remaining > 0)
     {
         Buffer buf = smol_extend(idx);
@@ -5202,10 +5206,12 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Page page = BufferGetPage(buf);
         Size fs = PageGetFreeSpace(page);
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
-        Size header = sizeof(uint16);
-        Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
-        SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
-        Size n_this = (remaining < max_n) ? remaining : max_n;
+
+        /* Calculate max tuples for plain format */
+        Size header_plain = sizeof(uint16);
+        Size max_n_plain = (avail > header_plain) ? ((avail - header_plain) / key_len) : 0;
+        SMOL_DEFENSIVE_CHECK(max_n_plain > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
+        Size n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
 
 #ifdef SMOL_TEST_COVERAGE
         /* Test GUC: cap tuples per page to force taller trees */
@@ -5213,9 +5219,8 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
             n_this = (Size) smol_test_max_tuples_per_page;
 #endif
 
-        char *scratch = (char *) palloc(header + n_this * key_len);
-        memcpy(scratch, &n_this, sizeof(uint16));
-        char *p = scratch + header;
+        /* Collect n_this tuples into a buffer for RLE analysis */
+        char *keys_buf = (char *) palloc(n_this * key_len);
         for (Size i = 0; i < n_this; i++)
         {
             IndexTuple itup = tuplesort_getindextuple(ts, true);
@@ -5224,27 +5229,110 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
             bool isnull;
             Datum val = index_getattr(itup, 1, idx->rd_att, &isnull);
             if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
-            text *t = DatumGetTextPP(val); int blen = VARSIZE_ANY_EXHDR(t);
+
+            text *t = DatumGetTextPP(val);
+            int blen = VARSIZE_ANY_EXHDR(t);
             const char *src = VARDATA_ANY(t);
             if (blen > (int) key_len) ereport(ERROR,(errmsg("smol text key exceeds cap")));
-            if (blen > 0) memcpy(p, src, blen);
-            if (blen < (int) key_len) memset(p + blen, 0, key_len - blen);
+
+            char *dest = keys_buf + (i * key_len);
+            if (blen > 0) memcpy(dest, src, blen);
+            if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
+
             if (smol_debug_log && i < (Size) smol_log_sample_n) /* GCOV_EXCL_START */
             {
                 int h = (blen < smol_log_hex_limit) ? blen : smol_log_hex_limit;
-                char *hx = smol_hex((const char *) p, h, h);
+                char *hx = smol_hex(dest, h, h);
                 SMOL_LOGF("build text key[%zu] blen=%d hex=%s", (size_t) i, blen, hx);
                 pfree(hx);
             } /* GCOV_EXCL_STOP */
-            if (i == n_this - 1) memcpy(lastkey, p, key_len);
+
+            if (i == n_this - 1) memcpy(lastkey, dest, key_len);
             /* Do not pfree itup - owned by tuplesort */
-            p += key_len;
         }
-        Size sz = header + n_this * key_len;
+
+        /* Analyze for RLE opportunities */
+        bool use_rle = false;
+        Size rle_sz = 0;
+        uint16 rle_nruns = 0;
+
+        {
+            Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
+            while (pos < n_this)
+            {
+                Size run = 1;
+                const char *k0 = keys_buf + (pos * key_len);
+                while (pos + run < n_this)
+                {
+                    const char *k1 = keys_buf + ((pos + run) * key_len);
+                    if (memcmp(k0, k1, key_len) != 0)
+                        break;
+                    run++;
+                }
+                nr++;
+                sz_runs += key_len + sizeof(uint16);
+                pos += run;
+            }
+            rle_sz = sizeof(uint16) * 3 + sz_runs; /* tag + nitems + nruns + runs */
+            rle_nruns = nr;
+
+            Size plain_sz = sizeof(uint16) + n_this * key_len;
+            double uniqueness_ratio = (double) rle_nruns / (double) n_this;
+
+            /* Use RLE if it saves space and data isn't too unique */
+            if (rle_sz < plain_sz && rle_sz <= avail && uniqueness_ratio < smol_rle_uniqueness_threshold)
+            {
+                use_rle = true;
+                SMOL_LOGF("Text RLE format: n=%zu nruns=%u uniqueness=%.3f rle_sz=%zu plain_sz=%zu",
+                         n_this, rle_nruns, uniqueness_ratio, rle_sz, plain_sz);
+            }
+        }
+
+        /* Write page with chosen format */
+        Size sz;
+        if (use_rle)
+        {
+            /* RLE format: [tag][nitems][nruns][runs...] where run = [key][count] */
+            uint16 tag = SMOL_TAG_KEY_RLE;
+            char *p = scratch;
+            uint16 nitems16 = (uint16) n_this;
+            memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+
+            Size pos = 0;
+            while (pos < n_this)
+            {
+                Size run = 1;
+                const char *k0 = keys_buf + (pos * key_len);
+                while (pos + run < n_this)
+                {
+                    const char *k1 = keys_buf + ((pos + run) * key_len);
+                    if (memcmp(k0, k1, key_len) != 0)
+                        break;
+                    run++;
+                }
+                memcpy(p, k0, key_len); p += key_len;
+                uint16 cnt16 = (uint16) run;
+                memcpy(p, &cnt16, sizeof(uint16)); p += sizeof(uint16);
+                pos += run;
+            }
+            sz = (Size) (p - scratch);
+        }
+        else
+        {
+            /* Plain format: [uint16 n][keys...] */
+            uint16 n16 = (uint16) n_this;
+            memcpy(scratch, &n16, sizeof(uint16));
+            memcpy(scratch + sizeof(uint16), keys_buf, n_this * key_len);
+            sz = sizeof(uint16) + n_this * key_len;
+        }
+
         OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
         SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
-            (errmsg("smol: failed to add leaf payload (text)")));
-        pfree(scratch);
+            (errmsg("smol: failed to add leaf payload (text%s)", use_rle ? " RLE" : "")));
+
+        pfree(keys_buf);
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
@@ -5269,6 +5357,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         nleaves++;
         remaining -= n_this;
     }
+    pfree(scratch);
     /* set meta or build internal */
     if (nleaves == 1)
     {
@@ -5316,10 +5405,14 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
     Size nleaves = 0, aleaves = 0;
     BlockNumber *leaves = NULL;
     char *leaf_high = NULL; /* byte array for highkeys */
-    char lastkey[8]; /* buffer for last key (max 8 bytes) */
+    char lastkey[16]; /* buffer for last key (max 16 bytes for UUID) */
     Size remaining = nkeys;
     IndexTuple itup;
     memset(lastkey, 0, sizeof(lastkey));
+
+    /* Allocate scratch buffer for page construction (reused across pages) */
+    char *scratch = (char *) palloc(BLCKSZ);
+
     while (remaining > 0)
     {
         Buffer buf = smol_extend(idx);
@@ -5327,10 +5420,12 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         Page page = BufferGetPage(buf);
         Size fs = PageGetFreeSpace(page);
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
-        Size header = sizeof(uint16);
-        Size max_n = (avail > header) ? ((avail - header) / key_len) : 0;
-        SMOL_DEFENSIVE_CHECK(max_n > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
-        Size n_this = (remaining < max_n) ? remaining : max_n;
+
+        /* Calculate max tuples for plain format */
+        Size header_plain = sizeof(uint16);
+        Size max_n_plain = (avail > header_plain) ? ((avail - header_plain) / key_len) : 0;
+        SMOL_DEFENSIVE_CHECK(max_n_plain > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
+        Size n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
 
 #ifdef SMOL_TEST_COVERAGE
         /* Test GUC: cap tuples per page to force taller trees */
@@ -5338,9 +5433,8 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
             n_this = (Size) smol_test_max_tuples_per_page;
 #endif
 
-        char *scratch = (char *) palloc(header + n_this * key_len);
-        memcpy(scratch, &n_this, sizeof(uint16));
-        char *p = scratch + header;
+        /* Collect n_this tuples into a buffer for RLE analysis */
+        char *keys_buf = (char *) palloc(n_this * key_len);
         for (Size i = 0; i < n_this; i++)
         {
             itup = tuplesort_getindextuple(ts, true);
@@ -5350,25 +5444,119 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
             bool isnull;
             Datum val = index_getattr(itup, 1, idx->rd_att, &isnull);
             if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
-            /* PostgreSQL type system guarantees byval types are 1, 2, 4, or 8 bytes */
-            SMOL_DEFENSIVE_CHECK(key_len == 0 || (key_len & (key_len - 1)) == 0, ERROR,
-                                (errmsg("key_len %d is not a power of two", (int) key_len)));
-            SMOL_DEFENSIVE_CHECK(byval, ERROR, (errmsg("unexpected byval==false")));
-            switch (key_len)
+
+            char *dest = keys_buf + (i * key_len);
+            if (byval)
             {
-                case 1: { char v = DatumGetChar(val); memcpy(p, &v, 1); if (i == n_this - 1) memcpy(lastkey, &v, 1); break; }
-                case 2: { int16 v = DatumGetInt16(val); memcpy(p, &v, 2); if (i == n_this - 1) memcpy(lastkey, &v, 2); break; }
-                case 4: { int32 v = DatumGetInt32(val); memcpy(p, &v, 4); if (i == n_this - 1) memcpy(lastkey, &v, 4); break; }
-                case 8: { int64 v = DatumGetInt64(val); memcpy(p, &v, 8); if (i == n_this - 1) memcpy(lastkey, &v, 8); break; }
+                /* PostgreSQL type system guarantees byval types are 1, 2, 4, 8, or 16 bytes */
+                SMOL_DEFENSIVE_CHECK(key_len == 1 || key_len == 2 || key_len == 4 || key_len == 8 || key_len == 16, ERROR,
+                                    (errmsg("key_len %d must be 1,2,4,8, or 16 for byval types", (int) key_len)));
+                switch (key_len)
+                {
+                    case 1: { char v = DatumGetChar(val); memcpy(dest, &v, 1); break; }
+                    case 2: { int16 v = DatumGetInt16(val); memcpy(dest, &v, 2); break; }
+                    case 4: { int32 v = DatumGetInt32(val); memcpy(dest, &v, 4); break; }
+                    case 8: { int64 v = DatumGetInt64(val); memcpy(dest, &v, 8); break; }
+                    case 16: {
+                        /* UUID: 16 bytes by-value (stored in two int64 fields on some platforms) */
+                        memcpy(dest, DatumGetPointer(val), 16);
+                        break;
+                    }
+                }
             }
+            else
+            {
+                /* Fixed-length by-ref type */
+                memcpy(dest, DatumGetPointer(val), key_len);
+            }
+
+            if (i == n_this - 1)
+                memcpy(lastkey, dest, key_len);
             /* Do not pfree itup - owned by tuplesort */
-            p += key_len;
         }
-        Size sz = header + n_this * key_len;
+
+        /* Analyze for RLE opportunities */
+        bool use_rle = false;
+        Size rle_sz = 0;
+        uint16 rle_nruns = 0;
+
+        {
+            Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
+            while (pos < n_this)
+            {
+                Size run = 1;
+                const char *k0 = keys_buf + (pos * key_len);
+                while (pos + run < n_this)
+                {
+                    const char *k1 = keys_buf + ((pos + run) * key_len);
+                    if (memcmp(k0, k1, key_len) != 0)
+                        break;
+                    run++;
+                }
+                nr++;
+                sz_runs += key_len + sizeof(uint16);
+                pos += run;
+            }
+            rle_sz = sizeof(uint16) * 3 + sz_runs; /* tag + nitems + nruns + runs */
+            rle_nruns = nr;
+
+            Size plain_sz = sizeof(uint16) + n_this * key_len;
+            double uniqueness_ratio = (double) rle_nruns / (double) n_this;
+
+            /* Use RLE if it saves space and data isn't too unique */
+            if (rle_sz < plain_sz && rle_sz <= avail && uniqueness_ratio < smol_rle_uniqueness_threshold)
+            {
+                use_rle = true;
+                SMOL_LOGF("RLE format: n=%zu nruns=%u uniqueness=%.3f rle_sz=%zu plain_sz=%zu",
+                         n_this, rle_nruns, uniqueness_ratio, rle_sz, plain_sz);
+            }
+        }
+
+        /* Write page with chosen format */
+        Size sz;
+        if (use_rle)
+        {
+            /* RLE format: [tag][nitems][nruns][runs...] where run = [key][count] */
+            uint16 tag = SMOL_TAG_KEY_RLE;
+            char *p = scratch;
+            uint16 nitems16 = (uint16) n_this;
+            memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
+            memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+
+            Size pos = 0;
+            while (pos < n_this)
+            {
+                Size run = 1;
+                const char *k0 = keys_buf + (pos * key_len);
+                while (pos + run < n_this)
+                {
+                    const char *k1 = keys_buf + ((pos + run) * key_len);
+                    if (memcmp(k0, k1, key_len) != 0)
+                        break;
+                    run++;
+                }
+                memcpy(p, k0, key_len); p += key_len;
+                uint16 cnt16 = (uint16) run;
+                memcpy(p, &cnt16, sizeof(uint16)); p += sizeof(uint16);
+                pos += run;
+            }
+            sz = (Size) (p - scratch);
+        }
+        else
+        {
+            /* Plain format: [uint16 n][keys...] */
+            uint16 n16 = (uint16) n_this;
+            memcpy(scratch, &n16, sizeof(uint16));
+            memcpy(scratch + sizeof(uint16), keys_buf, n_this * key_len);
+            sz = sizeof(uint16) + n_this * key_len;
+        }
+
         OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
         SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
-            (errmsg("smol: failed to add leaf payload (fixed)")));
-        pfree(scratch);
+            (errmsg("smol: failed to add leaf payload (fixed%s)", use_rle ? " RLE" : "")));
+
+        pfree(keys_buf);
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
@@ -5393,6 +5581,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         nleaves++;
         remaining -= n_this;
     }
+    pfree(scratch);
     /* set meta or build internal */
     if (nleaves == 1)
     {
