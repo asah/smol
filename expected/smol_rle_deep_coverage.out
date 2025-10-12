@@ -374,8 +374,12 @@ SELECT k, count(*), min(v1) FROM t_text_multirle WHERE k >= 'textkey050' AND k <
      k      | count | min  
 ------------+-------+------
  textkey050 |    30 | 1500
- textkey051 |   150 | 1530
-(2 rows)
+ textkey051 |    30 | 1530
+ textkey052 |    30 | 1560
+ textkey053 |    30 | 1590
+ textkey054 |    30 | 1620
+ textkey055 |    30 | 1650
+(6 rows)
 
 SELECT k, v1, v2, v3 FROM t_text_multirle WHERE k = 'textkey025' ORDER BY v1 LIMIT 5;
      k      | v1  |  v2  | v3  

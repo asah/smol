@@ -3249,6 +3249,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         so->cur_group = 0;
         so->pos_in_group = 0;
         so->leaf_n = 0; so->leaf_i = 0;
+        smol_run_reset(so);  /* Reset RLE run state when moving to new page */
         if (BlockNumberIsValid(so->cur_blk))
         {
             if (scan->parallel_scan && dir != BackwardScanDirection)
@@ -4935,6 +4936,9 @@ smol_run_reset(SmolScanOpaque so)
     so->run_key_len = 0;
     so->run_inc_evaluated = false;
     so->rle_run_inc_cached = false;
+    so->run_key_built = false;  /* Reset cached varlena key blob for RLE runs */
+    for (int i = 0; i < 16; i++)
+        so->run_inc_built[i] = false;  /* Reset cached varlena INCLUDE blobs for RLE runs */
 }
 
 
