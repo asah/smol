@@ -258,6 +258,7 @@ static void smol_run_synthetic_tests(void);
 static char *smol_hex(const char *buf, int len, int maxbytes);
 
 /* Forward decls for copy helpers (needed by _PG_init synthetic tests) */
+static inline void smol_copy1(char *dst, const char *src);
 static inline void smol_copy2(char *dst, const char *src);
 static inline void smol_copy4(char *dst, const char *src);
 static inline void smol_copy8(char *dst, const char *src);
@@ -586,20 +587,68 @@ static uint16 g_key_len1 = 0, g_key_len2 = 0;
 static bool g_byval1 = false, g_byval2 = false;
 static FmgrInfo g_cmp1, g_cmp2;
 static Oid g_coll1 = InvalidOid, g_coll2 = InvalidOid;
+static Oid g_typoid1 = InvalidOid, g_typoid2 = InvalidOid;
 static int
 smol_pair_qsort_cmp(const void *pa, const void *pb)
 {
     uint32 ia = *(const uint32 *) pa, ib = *(const uint32 *) pb;
     char *a1 = g_k1buf + (size_t) ia * g_key_len1;
     char *b1 = g_k1buf + (size_t) ib * g_key_len1;
-    Datum da1 = g_byval1 ? (g_key_len1==1?CharGetDatum(*a1): g_key_len1==2?Int16GetDatum(*(int16*)a1): g_key_len1==4?Int32GetDatum(*(int32*)a1): Int64GetDatum(*(int64*)a1)) : PointerGetDatum(a1);
-    Datum db1 = g_byval1 ? (g_key_len1==1?CharGetDatum(*b1): g_key_len1==2?Int16GetDatum(*(int16*)b1): g_key_len1==4?Int32GetDatum(*(int32*)b1): Int64GetDatum(*(int64*)b1)) : PointerGetDatum(b1);
-    int32 r1 = DatumGetInt32(FunctionCall2Coll(&g_cmp1, g_coll1, da1, db1)); if (r1 != 0) return r1;
+
+    /* Fast path: inline comparison for common integer types */
+    int32 r1;
+    if (g_typoid1 == INT2OID && g_key_len1 == 2)
+    {
+        int16 v1 = *(int16*)a1, v2 = *(int16*)b1;
+        r1 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else if (g_typoid1 == INT4OID && g_key_len1 == 4)
+    {
+        int32 v1 = *(int32*)a1, v2 = *(int32*)b1;
+        r1 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else if (g_typoid1 == INT8OID && g_key_len1 == 8)
+    {
+        int64 v1 = *(int64*)a1, v2 = *(int64*)b1;
+        r1 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else
+    {
+        /* Generic path: use FunctionCall2Coll for other types */
+        Datum da1 = g_byval1 ? (g_key_len1==1?CharGetDatum(*a1): g_key_len1==2?Int16GetDatum(*(int16*)a1): g_key_len1==4?Int32GetDatum(*(int32*)a1): Int64GetDatum(*(int64*)a1)) : PointerGetDatum(a1);
+        Datum db1 = g_byval1 ? (g_key_len1==1?CharGetDatum(*b1): g_key_len1==2?Int16GetDatum(*(int16*)b1): g_key_len1==4?Int32GetDatum(*(int32*)b1): Int64GetDatum(*(int64*)b1)) : PointerGetDatum(b1);
+        r1 = DatumGetInt32(FunctionCall2Coll(&g_cmp1, g_coll1, da1, db1));
+    }
+    if (r1 != 0) return r1;
+
     char *a2 = g_k2buf + (size_t) ia * g_key_len2;
     char *b2 = g_k2buf + (size_t) ib * g_key_len2;
-    Datum da2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*a2): g_key_len2==2?Int16GetDatum(*(int16*)a2): g_key_len2==4?Int32GetDatum(*(int32*)a2): Int64GetDatum(*(int64*)a2)) : PointerGetDatum(a2);
-    Datum db2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*b2): g_key_len2==2?Int16GetDatum(*(int16*)b2): g_key_len2==4?Int32GetDatum(*(int32*)b2): Int64GetDatum(*(int64*)b2)) : PointerGetDatum(b2);
-    int32 r2 = DatumGetInt32(FunctionCall2Coll(&g_cmp2, g_coll2, da2, db2)); return r2;
+
+    /* Fast path: inline comparison for common integer types */
+    int32 r2;
+    if (g_typoid2 == INT2OID && g_key_len2 == 2)
+    {
+        int16 v1 = *(int16*)a2, v2 = *(int16*)b2;
+        r2 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else if (g_typoid2 == INT4OID && g_key_len2 == 4)
+    {
+        int32 v1 = *(int32*)a2, v2 = *(int32*)b2;
+        r2 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else if (g_typoid2 == INT8OID && g_key_len2 == 8)
+    {
+        int64 v1 = *(int64*)a2, v2 = *(int64*)b2;
+        r2 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else
+    {
+        /* Generic path: use FunctionCall2Coll for other types */
+        Datum da2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*a2): g_key_len2==2?Int16GetDatum(*(int16*)a2): g_key_len2==4?Int32GetDatum(*(int32*)a2): Int64GetDatum(*(int64*)a2)) : PointerGetDatum(a2);
+        Datum db2 = g_byval2 ? (g_key_len2==1?CharGetDatum(*b2): g_key_len2==2?Int16GetDatum(*(int16*)b2): g_key_len2==4?Int32GetDatum(*(int32*)b2): Int64GetDatum(*(int64*)b2)) : PointerGetDatum(b2);
+        r2 = DatumGetInt32(FunctionCall2Coll(&g_cmp2, g_coll2, da2, db2));
+    }
+    return r2;
 }
 
 /* qsort comparator for fixed-size byte keys (uses g_k1buf/g_key_len1) */
@@ -770,6 +819,7 @@ typedef struct SmolScanOpaqueData
     /* INCLUDE metadata (single-col path) */
     uint16      ninclude;
     uint16      inc_len[16];
+    uint32      inc_cumul_offs[16]; /* cumulative offsets: inc_cumul_offs[i] = sum(inc_len[0..i-1]) */
     char        inc_align[16];
     uint16      inc_offs[16];   /* offsets inside tuple data area (from data_off) */
     void      (*inc_copy[16])(char *dst, const char *src);
@@ -881,7 +931,7 @@ static bool smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
                                      const uint16 *inc_lens, uint16 ninc);
 static inline char *smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n,
                                       const uint16 *inc_lens, uint16 ninc,
-                                      uint16 inc_idx, uint32 row);
+                                      uint16 inc_idx, uint32 row, const uint32 *inc_cumul_offs);
 /* Build single-column tuple in-place with dynamic varlena offsets */
 static inline void smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 row);
 /* Two-column row-major helpers (generic fixed-length)
@@ -1047,10 +1097,10 @@ static inline uint32 smol_norm32(int32 v);
 static inline uint16 smol_norm16(int16 v);
 /* single-col + INCLUDE helpers */
 static inline char *smol1_payload(Page page) { ItemId iid = PageGetItemId(page, FirstOffsetNumber); return (char *) PageGetItem(page, iid); }
-static inline char *smol1_inc_ptr(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, uint16 ninc, uint16 inc_idx, uint32 row)
+static inline char *smol1_inc_ptr(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, uint16 ninc, uint16 inc_idx, uint32 row, const uint32 *inc_cumul_offs)
 {
     char *base = smol1_payload(page) + sizeof(uint16) + (size_t) n * key_len;
-    for (uint16 i = 0; i < inc_idx; i++) base += (size_t) n * inc_lens[i];
+    base += (size_t) n * inc_cumul_offs[inc_idx];  /* O(1) using precomputed cumulative offsets */
     return base + (size_t) row * inc_lens[inc_idx];
 }
 
@@ -1416,12 +1466,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             {
                 /* Two-key path: sort pairs then write with INCLUDE */
                 /* Use index-based sort (qsort) to easily apply permutation to INCLUDE columns */
-                FmgrInfo cmp1, cmp2; Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation; Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
+                FmgrInfo cmp1, cmp2;
+                Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+                Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
+                Oid typoid1 = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+                Oid typoid2 = TupleDescAttr(RelationGetDescr(index), 1)->atttypid;
                 fmgr_info_copy(&cmp1, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
                 fmgr_info_copy(&cmp2, index_getprocinfo(index, 2, 1), CurrentMemoryContext);
                 uint32 *idx = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
                 /* set global comparator context */
-                g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
+                g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; g_typoid1 = typoid1; g_typoid2 = typoid2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
                 qsort(idx, n, sizeof(uint32), smol_pair_qsort_cmp);
                 INSTR_TIME_SET_CURRENT(t_sort_end);
                 /* Apply permutation to INCLUDE columns */
@@ -1713,12 +1767,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             else
             {
                 /* Generic comparison-based sort via index permutation */
-                FmgrInfo cmp1, cmp2; Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation; Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
+                FmgrInfo cmp1, cmp2;
+                Oid coll1 = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
+                Oid coll2 = TupleDescAttr(RelationGetDescr(index), 1)->attcollation;
+                Oid typoid1 = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+                Oid typoid2 = TupleDescAttr(RelationGetDescr(index), 1)->atttypid;
                 fmgr_info_copy(&cmp1, index_getprocinfo(index, 1, 1), CurrentMemoryContext);
                 fmgr_info_copy(&cmp2, index_getprocinfo(index, 2, 1), CurrentMemoryContext);
                 idx = (uint32 *) MemoryContextAllocHuge(CurrentMemoryContext, n * sizeof(uint32)); for (Size i=0;i<n;i++) idx[i] = (uint32) i;
                 /* set global comparator context */
-                g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
+                g_k1buf = k1buf; g_k2buf = k2buf; g_key_len1 = key_len; g_key_len2 = key_len2; g_byval1 = cctx.byval1; g_byval2 = cctx.byval2; g_coll1 = coll1; g_coll2 = coll2; g_typoid1 = typoid1; g_typoid2 = typoid2; memcpy(&g_cmp1, &cmp1, sizeof(FmgrInfo)); memcpy(&g_cmp2, &cmp2, sizeof(FmgrInfo));
                 qsort(idx, n, sizeof(uint32), smol_pair_qsort_cmp);
                 INSTR_TIME_SET_CURRENT(t_sort_end);
             }
@@ -1912,6 +1970,14 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
                 Oid attoid = att->atttypid;
                 so->inc_is_text[i] = (attoid == TEXTOID);
             }
+            /* Precompute cumulative offsets for O(1) INCLUDE pointer arithmetic */
+            uint32 cumul = 0;
+            for (uint16 i=0;i<so->ninclude;i++)
+            {
+                so->inc_cumul_offs[i] = cumul;
+                cumul += so->inc_len[i];
+            }
+            so->inc_cumul_offs[so->ninclude] = cumul;  /* Total for "skip all includes" case */
         }
         so->align1 = align1;
         so->align2 = align2;
@@ -1956,7 +2022,16 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         if (so->two_col)
             so->copy2_fn = (so->key_len2 == 2) ? smol_copy2 : (so->key_len2 == 4) ? smol_copy4 : smol_copy8;
         for (uint16 i=0;i<so->ninclude;i++)
-            so->inc_copy[i] = (so->inc_len[i] == 2) ? smol_copy2 : (so->inc_len[i] == 4) ? smol_copy4 : smol_copy8;
+        {
+            /* Precompute copy function for each INCLUDE column to eliminate hot-path if-else chain */
+            if (so->inc_len[i] == 1) so->inc_copy[i] = smol_copy1;
+            else if (so->inc_len[i] == 2) so->inc_copy[i] = smol_copy2;
+            else if (so->inc_len[i] == 4) so->inc_copy[i] = smol_copy4;
+            else if (so->inc_len[i] == 8) so->inc_copy[i] = smol_copy8;
+            else if (so->inc_len[i] == 16) so->inc_copy[i] = smol_copy16;
+            else
+                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_len[i]);
+        }
         /* comparator + key type props */
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
         get_typlenbyvalalign(so->atttypid, &so->key_typlen, &so->key_byval, &so->align1);
@@ -2564,11 +2639,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (tag != 0x8001u && tag != 0x8003u && tag != SMOL_TAG_ZEROCOPY)
             {
                 uint16 n = tag; /* First u16 is count, not a tag */
-                char *p = base + sizeof(uint16) + (size_t) n * so->key_len;
+                char *base_ptr = base + sizeof(uint16) + (size_t) n * so->key_len;
+                /* Use precomputed cumulative offsets for O(1) per-column computation */
                 for (uint16 ii = 0; ii < so->ninclude; ii++)
                 {
-                    so->plain_inc_base[ii] = p;
-                    p += (size_t) n * so->inc_len[ii];
+                    so->plain_inc_base[ii] = base_ptr + (size_t) n * so->inc_cumul_offs[ii];
                 }
                 so->plain_inc_cached = true;
             }
@@ -2764,19 +2839,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         ip = so->rle_run_inc_ptr[ii]; /* GCOV_EXCL_LINE */
                                     else
                                         /* Slow path: compute pointer dynamically */
-                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs);
                                     char *dst = so->itup_data + so->inc_offs[ii];
-                                    /* common cases first */
-                                    if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
-                                    else if (so->inc_len[ii] == 8) smol_copy8(dst, ip);
-                                    else if (so->inc_len[ii] == 16) smol_copy16(dst, ip);
-                                    else if (so->inc_len[ii] == 2) smol_copy2(dst, ip);
-                                    else if (so->inc_len[ii] == 1) memcpy(dst, ip, 1);
-                                    else
-                                    {
-                                        SMOL_DEFENSIVE_CHECK(false, ERROR, /* GCOV_EXCL_LINE */
-                                            (errmsg("smol: unsupported INCLUDE column size %u", so->inc_len[ii])));
-                                    }
+                                    /* Use precomputed copy function (eliminates if-else chain overhead) */
+                                    so->inc_copy[ii](dst, ip);
                                 }
                             }
                         }
@@ -2922,7 +2988,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         {
                                             so->rle_run_inc_ptr[ii] = smol1_inc_ptr_any(page, so->key_len, n,
                                                                                          so->inc_len, so->ninclude,
-                                                                                         ii, start - 1);
+                                                                                         ii, start - 1, so->inc_cumul_offs);
                                         }
                                         so->rle_run_inc_cached = true;
                                     }
@@ -2988,20 +3054,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         ip = so->rle_run_inc_ptr[ii];
                                     else /* GCOV_EXCL_LINE - defensive fallback: caching now covers all RLE pages with INCLUDE */
                                         /* Slow path: compute pointer dynamically */ /* GCOV_EXCL_LINE */
-                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row); /* GCOV_EXCL_LINE */
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs); /* GCOV_EXCL_LINE */
                                     char *dst = so->itup_data + so->inc_offs[ii];
-				    /* common cases first */
-                                    if (so->inc_len[ii] == 4) smol_copy4(dst, ip);
-                                    else if (so->inc_len[ii] == 8) smol_copy8(dst, ip);
-                                    else if (so->inc_len[ii] == 16) smol_copy16(dst, ip);
-                                    else if (so->inc_len[ii] == 2) smol_copy2(dst, ip);
-                                    else if (so->inc_len[ii] == 1) memcpy(dst, ip, 1);
-                                    else
-                                    {
-                                        SMOL_DEFENSIVE_CHECK(false, ERROR, /* GCOV_EXCL_LINE */
-                                            (errmsg("smol: unsupported INCLUDE column size %u", so->inc_len[ii])));
-                                        /* smol_copy_small(dst, ip, so->inc_len[ii]); */
-                                    }
+                                    /* Use precomputed copy function (eliminates if-else chain overhead) */
+                                    so->inc_copy[ii](dst, ip);
                                 }
                             }
                         }
@@ -3019,10 +3075,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 {
                                     bool all_eq = true;
                                     uint16 start = so->run_start_off, end = so->run_end_off;
-                                    char *firstp = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(start - 1));
+                                    char *firstp = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(start - 1), so->inc_cumul_offs);
                                     for (uint16 off = start + 1; off <= end; off++)
                                     {
-                                        char *p2 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(off - 1));
+                                        char *p2 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(off - 1), so->inc_cumul_offs);
                                         if (memcmp(firstp, p2, so->inc_len[ii]) != 0)
                                         { all_eq = false; break; }
                                     }
@@ -3039,7 +3095,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     for (uint16 ii=0; ii<so->ninclude; ii++)
                                     {
                                         if (!so->inc_const[ii]) continue;
-                                        char *ip0 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(so->run_start_off - 1));
+                                        char *ip0 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(so->run_start_off - 1), so->inc_cumul_offs);
                                         if (so->inc_is_text[ii])
                                         {
                                             int ilen0 = 0; while (ilen0 < so->inc_len[ii] && ip0[ilen0] != '\0') ilen0++;
@@ -4903,7 +4959,7 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
  * plain single-key+INCLUDE and include-RLE layout (tag 0x8003).
  */
 static inline char *
-smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, uint16 ninc, uint16 inc_idx, uint32 row)
+smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, uint16 ninc, uint16 inc_idx, uint32 row, const uint32 *inc_cumul_offs)
 {
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *base = (char *) PageGetItem(page, iid);
@@ -4912,7 +4968,7 @@ smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, u
     {
         /* Plain layout: [u16 n][keys][inc1 block][inc2 block]... */
         char *p = base + sizeof(uint16) + (size_t) n * key_len;
-        for (uint16 i = 0; i < inc_idx; i++) p += (size_t) n * inc_lens[i];
+        p += (size_t) n * inc_cumul_offs[inc_idx];  /* O(1) using precomputed cumulative offsets */
         return p + (size_t) row * inc_lens[inc_idx];
     }
     if (tag == 0x8003u)
@@ -4930,12 +4986,12 @@ smol1_inc_ptr_any(Page page, uint16 key_len, uint16 n, const uint16 *inc_lens, u
             if (row < acc + cnt)
             {
                 /* return pointer to include value for this run/column */
-                for (uint16 i = 0; i < inc_idx; i++) incp += inc_lens[i];
+                incp += inc_cumul_offs[inc_idx];  /* O(1) using precomputed cumulative offsets */
                 return incp;
             }
             acc += cnt;
             /* advance to next run */
-            for (uint16 i = 0; i < ninc; i++) incp += inc_lens[i];
+            incp += inc_cumul_offs[ninc];  /* O(1) using precomputed cumulative offsets */
             rp = incp;
         }
         return NULL; /* GCOV_EXCL_LINE */
@@ -6032,6 +6088,12 @@ smol_parallel_sort_worker(Datum arg) /* GCOV_EXCL_START - parallel build not int
  * the compiler optimize call sites.
  */
 static inline void
+smol_copy1(char *dst, const char *src)
+{
+    *dst = *src;
+}
+
+static inline void
 smol_copy2(char *dst, const char *src)
 {
     if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 1) == 0)
@@ -6151,7 +6213,7 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
         {
             cur = att_align_nominal(cur, so->inc_align[ii]);
             wp = base + cur;
-            char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
+            char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs);
             if (so->inc_is_text[ii])
             {
                 if (so->run_active && so->inc_const[ii] && so->run_inc_built[ii] && so->run_inc_vl_len[ii] > 0)

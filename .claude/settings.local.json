@@ -73,7 +73,13 @@
       "Bash(timeout 180 make installcheck)",
       "Bash(COVERAGE=1 make all)",
       "Bash(COVERAGE=1 make clean all)",
-      "Bash(time:*)"
+      "Bash(time:*)",
+      "Bash(if [ -f /home/postgres/smol.c.gcov ])",
+      "Bash(then head -20 /home/postgres/smol.c.gcov)",
+      "Bash(else echo \"No gcov file found\")",
+      "Bash(fi)",
+      "Bash(sed:*)",
+      "Bash(do sed -n \"$linep\" /home/postgres/smol.c.gcov)"
     ],
     "deny": [],
     "ask": []
