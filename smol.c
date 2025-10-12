@@ -697,9 +697,10 @@ static StrategyNumber smol_translatecmptype(CompareType cmptype, Oid opfamily);
 #define SMOL_META_VERSION 1
 
 /* Leaf page format tags */
-#define SMOL_TAG_ZEROCOPY 0x8000u  /* Zero-copy format: [tag][nitems][keys...] - no memcpy */
-#define SMOL_TAG_KEY_RLE  0x8001u  /* Key-RLE: [tag][nitems][nruns][runs...] */
-#define SMOL_TAG_INC_RLE  0x8003u  /* Include-RLE: [tag][nitems][nruns][runs...] */
+#define SMOL_TAG_ZEROCOPY  0x8000u  /* Zero-copy format: [tag][nitems][keys...] - no memcpy */
+#define SMOL_TAG_KEY_RLE   0x8001u  /* Key-RLE V1: [tag][nitems][nruns][runs...] */
+#define SMOL_TAG_KEY_RLE_V2 0x8002u  /* Key-RLE V2: [tag][nitems][nruns][continues_byte][runs...] - runs can continue across pages */
+#define SMOL_TAG_INC_RLE   0x8003u  /* Include-RLE: [tag][nitems][nruns][runs...] */
 
 typedef struct SmolMeta
 {
@@ -855,6 +856,14 @@ typedef struct SmolScanOpaqueData
     char        run_key[16];    /* store up to 16 bytes of fixed-length key */
     int16       run_text_klen;  /* cached varlena key length for current run (text32) */
     bool        page_is_plain;  /* true when current page is plain (not RLE) - set once per page */
+    /* RLE run caching to avoid O(m) scans in smol_leaf_keyptr_ex */
+    uint16      rle_cached_run_idx;      /* current cached RLE run index (0-based) */
+    uint32      rle_cached_run_acc;      /* accumulated offset before current run */
+    uint32      rle_cached_run_end;      /* last offset in current run (1-based) */
+    char       *rle_cached_run_keyptr;   /* pointer to current run's key */
+    BlockNumber rle_cached_page_blk;     /* which page the cache is valid for */
+    uint64      rle_cache_hits;          /* cache hit counter for debugging */
+    uint64      rle_cache_misses;        /* cache miss counter for debugging */
     bool        page_is_zerocopy; /* true when current page uses zero-copy format (tag 0x8000) */
     /* Cached page metadata (opt #5): nitems and format cached once per page */
     uint16      cur_page_nitems;    /* cached nitems for current page */
@@ -876,6 +885,10 @@ typedef struct SmolScanOpaqueData
     bool        run_inc_built[16];
     int16       run_inc_vl_len[16];
     char        run_inc_vl[16][VARHDRSZ + 32];
+    /* V2 RLE continuation support: tracks if last run on previous page continues to current page */
+    bool        prev_page_last_run_active;     /* true if previous page's last run continues */
+    char        prev_page_last_run_key[16];    /* key from previous page's last run */
+    int16       prev_page_last_run_text_klen;  /* text length from previous page's last run */
     /* key type flags */
     bool        key_is_text32;  /* true when key type is text/varchar packed to 32B */
     bool        has_varwidth;   /* any varlena field present in tuple (key or includes) */
@@ -1925,6 +1938,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->cur_off = InvalidOffsetNumber;
     so->cur_buf = InvalidBuffer;
     so->have_pin = false;
+    so->rle_cached_page_blk = InvalidBlockNumber;  /* Initialize RLE cache as invalid */
     so->have_bound = false;
     so->have_k1_eq = false;
     so->bound_strict = false;
@@ -2051,6 +2065,9 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_bsteps = 0;
     so->run_key_built = false;
     for (int i=0;i<16;i++){ so->run_inc_built[i]=false; so->run_inc_vl_len[i]=0; }
+    /* Initialize V2 continuation support */
+    so->prev_page_last_run_active = false;
+    so->prev_page_last_run_text_klen = 0;
     /* Initialize adaptive prefetch counters */
     so->pages_scanned = 0;
     so->adaptive_prefetch_depth = 0;
@@ -2227,6 +2244,110 @@ smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so)
     return true;
 }
 
+/*
+ * smol_leaf_keyptr_cached
+ * Cached version of smol_leaf_keyptr_ex for RLE pages during sequential scans.
+ *
+ * For RLE pages, smol_leaf_keyptr_ex does O(m) work scanning through runs.
+ * When scanning sequentially, this becomes O(n*m) which is extremely slow.
+ * This function caches the current RLE run position to provide O(1) lookups
+ * for sequential scans within the same run, and O(1) amortized across a page.
+ */
+static inline char *
+smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len,
+                        uint16 inc_len[], uint16 ninc, uint32 inc_cumul_offs[])
+{
+    /* Check if we need to invalidate cache (changed pages or first call) */
+    if (so->rle_cached_page_blk != so->cur_blk || so->rle_cached_run_keyptr == NULL)
+    {
+        /* New page or uninitialized - reset cache */
+        so->rle_cached_page_blk = so->cur_blk;
+        so->rle_cached_run_idx = 0;
+        so->rle_cached_run_acc = 0;
+        so->rle_cached_run_end = 0;
+        so->rle_cached_run_keyptr = NULL;
+    }
+
+    /* Check if idx is within cached run */
+    if (so->rle_cached_run_keyptr != NULL &&
+        idx >= (so->rle_cached_run_acc + 1) &&
+        idx <= so->rle_cached_run_end)
+    {
+        /* Cache hit - return cached key pointer */
+        so->rle_cache_hits++;
+        return so->rle_cached_run_keyptr;
+    }
+
+    /* Cache miss */
+    so->rle_cache_misses++;
+
+    /* Cache miss - need to find the run containing idx */
+    ItemId iid = PageGetItemId(page, FirstOffsetNumber);
+    char *p = (char *) PageGetItem(page, iid);
+    uint16 tag;
+    memcpy(&tag, p, sizeof(uint16));
+
+    /* Only cache for RLE pages */
+    if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2))
+    {
+        /* Not an RLE page - fall back to regular function */
+        return smol_leaf_keyptr_ex(page, idx, key_len, inc_len, ninc, inc_cumul_offs);
+    }
+
+    /* RLE page - scan runs from last cached position */
+    uint16 nitems, nruns;
+    memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
+    memcpy(&nruns, p + sizeof(uint16) * 2, sizeof(uint16));
+
+    char *rp = p + sizeof(uint16) * 3;
+    if (tag == SMOL_TAG_KEY_RLE_V2)
+        rp++;  /* Skip continues_byte */
+
+    /* Start from cached position if valid, otherwise from beginning */
+    uint16 start_run = 0;
+    uint32 acc = 0;
+
+    if (so->rle_cached_run_keyptr != NULL && idx > so->rle_cached_run_end)
+    {
+        /* Forward scan - start from next run after cached */
+        start_run = so->rle_cached_run_idx + 1;
+        acc = so->rle_cached_run_end;
+
+        /* Advance rp to the start of start_run */
+        for (uint16 r = 0; r < start_run; r++)
+        {
+            uint16 cnt;
+            memcpy(&cnt, rp + key_len, sizeof(uint16));
+            rp += (size_t) key_len + sizeof(uint16);
+        }
+    }
+
+    /* Scan runs to find idx */
+    for (uint16 r = start_run; r < nruns; r++)
+    {
+        char *k = rp;
+        uint16 cnt;
+        memcpy(&cnt, rp + key_len, sizeof(uint16));
+
+        if (idx <= acc + cnt)
+        {
+            /* Found it - update cache */
+            so->rle_cached_run_idx = r;
+            so->rle_cached_run_acc = acc;
+            so->rle_cached_run_end = acc + cnt;
+            so->rle_cached_run_keyptr = k;
+            return k;
+        }
+
+        acc += cnt;
+        rp += (size_t) key_len + sizeof(uint16);
+    }
+
+    /* Should not reach here - idx out of range */
+    ereport(ERROR, (errmsg("smol: cached keyptr index %u out of range [1,%u]", idx, nitems)));
+    return NULL;  /* unreachable */
+}
+
 static bool
 smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -2291,6 +2412,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         break;
                     so->cur_off--;
                 }
+                /* If all values exceed upper bound, cur_off is now invalid */
+                if (so->cur_off < FirstOffsetNumber)
+                    so->cur_off = n + 1; /* Set to end-of-page marker */
             }
 #endif
             else
@@ -2604,10 +2728,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
     }
 
+    uint32 page_visit_count = 0;
     while (BlockNumberIsValid(so->cur_blk))
     {
         SmolPageOpaqueData *op;
         BlockNumber next;
+
+        /* Safety check: detect infinite page loops */
+        if (++page_visit_count > 10000)
+            ereport(ERROR, (errmsg("smol: infinite page loop detected, visited >10000 pages, cur_blk=%u", so->cur_blk)));
+
         /* Ensure current leaf is pinned; page pointer valid */
         if (!so->have_pin || !BufferIsValid(so->cur_buf)) 
         {
@@ -2624,7 +2754,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         so->page_is_zerocopy = (tag == SMOL_TAG_ZEROCOPY);
 
         /* Opt #5: Cache page metadata once per page (nitems and format) */
-        if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE)
+        if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+            tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE)
         {
             /* Tagged formats: [u16 tag][u16 nitems][...] */
             uint16 nitems;
@@ -2634,8 +2765,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 so->cur_page_format = 1;
             else if (tag == SMOL_TAG_KEY_RLE)
                 so->cur_page_format = 2;
-            else /* SMOL_TAG_INC_RLE */
+            else if (tag == SMOL_TAG_INC_RLE)
                 so->cur_page_format = 3;
+            else /* SMOL_TAG_KEY_RLE_V2 */
+                so->cur_page_format = 4;
         }
         else
         {
@@ -2752,6 +2885,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             uint16 n = so->cur_page_nitems; /* Opt #5: use cached nitems */
             if (dir == BackwardScanDirection)
             {
+                /* Initialize cur_off for backward scans on new pages */
+                if (so->cur_off == InvalidOffsetNumber)
+                    so->cur_off = n;
+
                 while (so->cur_off >= FirstOffsetNumber)
                 {
                     char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
@@ -2917,9 +3054,13 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             }
             else
             {
+                /* Initialize cur_off for forward scans on new pages */
+                if (so->cur_off == InvalidOffsetNumber || so->cur_off == 0)
+                    so->cur_off = FirstOffsetNumber;
+
                 while (so->cur_off <= n)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     /* For zero-copy pages, keyp points to IndexTuple header; adjust to key data */
                     IndexTuple itup_ptr = NULL;
                     if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
@@ -3988,75 +4129,80 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
              */
             Size remaining = nkeys - i;
 
-            /* Step 1: Compute for zero-copy format (largest per-tuple overhead) */
-            Size zero_copy_tuple_sz = sizeof(IndexTupleData) + key_len; /* 8B header + key */
-            Size header_zerocopy = sizeof(uint16) * 2; /* tag + nitems */
-            Size max_n_zerocopy = (avail > header_zerocopy) ? ((avail - header_zerocopy) / zero_copy_tuple_sz) : 0;
-            Size n_this = (remaining < max_n_zerocopy) ? remaining : max_n_zerocopy;
+            /* PHASE 1: INCREMENTAL RLE PACKING
+             * Pack tuples one-by-one, tracking RLE state, until page is full.
+             * This maximizes tuples per page for low-cardinality data.
+             */
+            Size n_this = 0;
+            uint16 rle_nruns = 0;
+            Size rle_current_size = sizeof(uint16) * 4;  /* tag + nitems + nruns + continues_byte */
+            char rle_current_key[32];
+            uint16 rle_current_count = 0;
+            bool rle_has_key = false;
+
+            /* Try incremental RLE packing first */
+            Size j = 0;
+            while (i + j < nkeys)
+            {
+                const char *k = (const char *) keys + ((size_t)(i + j) * key_len);
+                Size delta_size = 0;
+
+                if (rle_has_key && memcmp(k, rle_current_key, key_len) == 0)
+                {
+                    /* Extends current run - no size increase (just counter++) */
+                    delta_size = 0;
+                }
+                else
+                {
+                    /* New run needed */
+                    delta_size = key_len + sizeof(uint16);
+                }
+
+                /* Would this overflow the page? */
+                if (rle_current_size + delta_size > avail)
+                    break;  /* Page full */
+
+                /* Add this tuple */
+                if (!rle_has_key || memcmp(k, rle_current_key, key_len) != 0)
+                {
+                    /* Start new run */
+                    if (key_len <= sizeof(rle_current_key))
+                        memcpy(rle_current_key, k, key_len);
+                    rle_current_count = 1;
+                    rle_nruns++;
+                    rle_current_size += delta_size;
+                    rle_has_key = true;
+                }
+                else
+                {
+                    /* Extend run */
+                    rle_current_count++;
+                }
+
+                n_this++;
+                j++;
 
 #ifdef SMOL_TEST_COVERAGE
-            /* Test GUC: cap tuples per page to force taller trees */
-            if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
-                n_this = (Size) smol_test_max_tuples_per_page;
+                /* Test GUC: cap tuples per page */
+                if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
+                    break;
 #endif
+            }
 
             SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
                 (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u avail=%zu)", key_len, (size_t) avail)));
 
-            bool use_rle = false;
+            /* Decide format: always use RLE V2 for packed data */
+            bool use_rle = true;
             bool use_zero_copy = false;
-            Size rle_sz = 0;
-            uint16 rle_nruns = 0;
+            double uniqueness_ratio = (double) rle_nruns / (double) n_this;
 
-            /* Step 2: Analyze n_this tuples to compute RLE savings */
+            /* Check if we should fall back to plain format */
+            Size plain_sz = sizeof(uint16) + n_this * key_len;
+            if (rle_current_size >= plain_sz || uniqueness_ratio >= smol_rle_uniqueness_threshold)
             {
-                const char *base = (const char *) keys + ((size_t) i * key_len);
-                Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
-                while (pos < n_this)
-                {
-                    Size run = 1;
-                    const char *k0 = base + (size_t) pos * key_len;
-                    while (pos + run < n_this)
-                    {
-                        const char *k1 = base + (size_t) (pos + run) * key_len;
-                        if (memcmp(k0, k1, key_len) != 0)
-                            break;
-                        run++;
-                    }
-                    nr++;
-                    sz_runs += (size_t) key_len + sizeof(uint16);
-                    pos += run;
-                }
-                rle_sz = sizeof(uint16) * 3 + sz_runs; /* tag + nitems + nruns + runs */
-                rle_nruns = nr;
-
-                /* Step 3: Compute sizes for all formats based on n_this tuples */
-                Size zero_copy_sz = header_zerocopy + n_this * zero_copy_tuple_sz;
-                Size plain_sz = sizeof(uint16) + n_this * key_len;
-                double uniqueness_ratio = (double) rle_nruns / (double) n_this;
-
-                /* Step 4: Per-page format decision (no global size limit in auto mode) */
-                bool zero_copy_allowed = false;
-                if (smol_enable_zero_copy == ZERO_COPY_ON)
-                    zero_copy_allowed = true;
-                else if (smol_enable_zero_copy == ZERO_COPY_AUTO)
-                    zero_copy_allowed = (uniqueness_ratio >= smol_rle_uniqueness_threshold);
-                /* ZERO_COPY_OFF: zero_copy_allowed remains false */
-
-                /* Choose format: zero-copy > RLE > plain */
-                if (zero_copy_allowed && zero_copy_sz <= avail)
-                {
-                    /* Use zero-copy for this page */
-                    use_zero_copy = true;
-                    SMOL_LOGF("page format=zero-copy: n=%zu uniqueness=%.3f sz=%zu/%zu",
-                             n_this, uniqueness_ratio, zero_copy_sz, avail);
-                }
-                else if (rle_sz < plain_sz && rle_sz <= avail)
-                {
-                    /* RLE provides compression benefit */
-                    use_rle = true;
-                }
-                /* else: use plain format (no tags) */
+                /* Plain is better or data is too unique for RLE */
+                use_rle = false;
             }
 
             if (use_zero_copy)
@@ -4094,12 +4240,28 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             }
             else if (use_rle)
             {
-                uint16 tag = SMOL_TAG_KEY_RLE;
+                /* PHASE 2: RLE V2 with continuation detection */
+                uint16 tag = SMOL_TAG_KEY_RLE_V2;
                 char *p = scratch;
                 uint16 nitems16 = (uint16) n_this;
                 memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
                 memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
                 memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+
+                /* Continuation detection: check if first key matches previous page's last key */
+                uint8 continues_byte = 0;
+                const char *first_key = (const char *) keys + ((size_t) i * key_len);
+                static char prev_page_last_key[32];
+                static bool prev_page_has_key = false;
+
+                if (prev_page_has_key && key_len <= 32 &&
+                    memcmp(first_key, prev_page_last_key, key_len) == 0)
+                {
+                    continues_byte = 1;  /* First run continues from previous page */
+                }
+                *p++ = continues_byte;
+
+                /* Write RLE runs */
                 const char *base = (const char *) keys + ((size_t) i * key_len);
                 Size pos = 0;
                 while (pos < n_this)
@@ -4118,10 +4280,19 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                     memcpy(p, &cnt16, sizeof(uint16)); p += sizeof(uint16);
                     pos += run;
                 }
+
+                /* Remember last key for next page's continuation detection */
+                const char *last_key = (const char *) keys + ((size_t)(i + n_this - 1) * key_len);
+                if (key_len <= 32)
+                {
+                    memcpy(prev_page_last_key, last_key, key_len);
+                    prev_page_has_key = true;
+                }
+
                 Size sz = (Size) (p - scratch);
                 OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
                 SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, ERROR,
-                    (errmsg("smol: failed to add leaf payload (RLE)")));
+                    (errmsg("smol: failed to add leaf payload (RLE V2)")));
                 added = n_this;
             }
             else
@@ -4827,7 +4998,8 @@ smol_leaf_nitems(Page page)
     char *p = (char *) PageGetItem(page, iid);
     uint16 tag;
     memcpy(&tag, p, sizeof(uint16));
-    if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE)
+    if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+        tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE)
     {
         /* Tagged formats: [u16 tag][u16 nitems][...] */
         uint16 nitems;
@@ -4862,7 +5034,7 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
         Size tuple_size = sizeof(IndexTupleData) + key_len; /* GCOV_EXCL_LINE */
         return p + sizeof(uint16) * 2 + ((size_t)(idx - 1)) * tuple_size; /* GCOV_EXCL_LINE */
     }
-    else if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE))
+    else if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE))
     {
         /* Plain payload: [u16 n][keys...] (no tag, n is first uint16) */
         uint16 n = tag;
@@ -4870,7 +5042,7 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
                             (errmsg("smol: leaf keyptr index %u out of range [1,%u]", idx, n)));
         return p + sizeof(uint16) + ((size_t)(idx - 1)) * key_len;
     }
-    /* RLE payload: [u16 tag(SMOL_TAG_KEY_RLE|SMOL_TAG_INC_RLE)][u16 nitems][u16 nruns][runs]* */
+    /* RLE payload: [u16 tag(SMOL_TAG_KEY_RLE|SMOL_TAG_KEY_RLE_V2|SMOL_TAG_INC_RLE)][u16 nitems][u16 nruns][continues_byte?][runs]* */
     {
         uint16 nitems, nruns;
         memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
@@ -4878,6 +5050,9 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
         SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR,
                             (errmsg("smol: RLE keyptr index %u out of range [1,%u]", idx, nitems)));
         char *rp = p + sizeof(uint16) * 3; /* first run */
+        /* V2 format has continues_byte after nruns */
+        if (tag == SMOL_TAG_KEY_RLE_V2)
+            rp++;  /* Skip continues_byte */
         uint32 acc = 0;
         for (uint16 r = 0; r < nruns; r++)
         {
@@ -4933,7 +5108,8 @@ smol_leaf_is_rle(Page page)
     char *p = (char *) PageGetItem(page, iid);
     uint16 tag; memcpy(&tag, p, sizeof(uint16));
     /* Zero-copy and RLE formats have tags; plain format uses nitems as first u16 */
-    return (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE);
+    return (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+            tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE);
 }
 
 /* For RLE payloads, compute 1-based [run_start, run_end] that contains idx - extended version with include support */
@@ -4945,7 +5121,7 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
     uint16 tag; memcpy(&tag, p, sizeof(uint16));
-    if (!(tag == 0x8001u || tag == 0x8003u))
+    if (!(tag == 0x8001u || tag == 0x8002u || tag == 0x8003u))
         return false;
     uint16 nitems, nruns;
     memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
@@ -4954,6 +5130,9 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
                         (errmsg("smol: RLE run check index %u out of range [1,%u]", idx, nitems)));
     uint32 acc = 0;
     char *rp = p + sizeof(uint16) * 3;
+    /* V2 format has continues_byte after nruns */
+    if (tag == 0x8002u)
+        rp++;  /* Skip continues_byte */
     for (uint16 r = 0; r < nruns; r++)
     {
         uint16 cnt; memcpy(&cnt, rp + key_len, sizeof(uint16));
@@ -5515,6 +5694,14 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
     /* Allocate scratch buffer for page construction (reused across pages) */
     char *scratch = (char *) palloc(BLCKSZ);
 
+    /* Phase 2: V2 continuation tracking across pages (per-build state) */
+    char prev_page_last_key[16];
+    bool prev_page_has_key = false;
+
+    /* Pending tuple from previous page (when page filled up) */
+    char *pending_key = NULL;
+    bool has_pending = false;
+
     while (remaining > 0)
     {
         Buffer buf = smol_extend(idx);
@@ -5523,109 +5710,187 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         Size fs = PageGetFreeSpace(page);
         Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
 
-        /* Calculate max tuples for plain format */
-        Size header_plain = sizeof(uint16);
-        Size max_n_plain = (avail > header_plain) ? ((avail - header_plain) / key_len) : 0;
-        SMOL_DEFENSIVE_CHECK(max_n_plain > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
-        Size n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
+        /* PHASE 1: INCREMENTAL RLE PACKING
+         * Pack tuples one-by-one, tracking RLE state, until page is full.
+         */
+        Size n_this = 0;
+        uint16 rle_nruns = 0;
+        Size rle_current_size = sizeof(uint16) * 4;  /* tag + nitems + nruns + continues_byte */
+        char rle_current_key[16];
+        uint16 rle_current_count = 0;
+        bool rle_has_key = false;
 
-#ifdef SMOL_TEST_COVERAGE
-        /* Test GUC: cap tuples per page to force taller trees */
-        if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
-            n_this = (Size) smol_test_max_tuples_per_page;
-#endif
+        /* Dynamic buffer for keys on this page */
+        Size keys_buf_cap = 256;  /* initial capacity */
+        Size keys_buf_len = 0;
+        char *keys_buf = (char *) palloc(keys_buf_cap * key_len);
 
-        /* Collect n_this tuples into a buffer for RLE analysis */
-        char *keys_buf = (char *) palloc(n_this * key_len);
-        for (Size i = 0; i < n_this; i++)
+        /* Process pending tuple from previous page first */
+        if (has_pending)
         {
+            memcpy(keys_buf, pending_key, key_len);
+            keys_buf_len = 1;
+            n_this = 1;
+            memcpy(rle_current_key, pending_key, key_len);
+            rle_current_count = 1;
+            rle_nruns = 1;
+            rle_current_size += key_len + sizeof(uint16);
+            rle_has_key = true;
+            has_pending = false;
+        }
+
+        /* Fetch and pack tuples incrementally until page full */
+        while (remaining > 0)
+        {
+            /* Fetch next tuple */
             itup = tuplesort_getindextuple(ts, true);
-            SMOL_DEFENSIVE_CHECK(itup != NULL, ERROR,
-                                (errmsg("smol: unexpected end of tuplesort stream")));
-            /* Extract the key value from the index tuple */
+            if (itup == NULL)
+            {
+                /* Don't modify remaining here - it will be decremented by n_this at end of page loop */
+                break;
+            }
+
+            /* Extract key value */
             bool isnull;
             Datum val = index_getattr(itup, 1, idx->rd_att, &isnull);
             if (isnull) ereport(ERROR,(errmsg("smol does not support NULL values")));
 
-            char *dest = keys_buf + (i * key_len);
+            char key_scratch[16];
+            char *k = key_scratch;
             if (byval)
             {
-                /* PostgreSQL type system guarantees byval types are 1, 2, 4, 8, or 16 bytes */
                 SMOL_DEFENSIVE_CHECK(key_len == 1 || key_len == 2 || key_len == 4 || key_len == 8 || key_len == 16, ERROR,
                                     (errmsg("key_len %d must be 1,2,4,8, or 16 for byval types", (int) key_len)));
                 switch (key_len)
                 {
-                    case 1: { char v = DatumGetChar(val); memcpy(dest, &v, 1); break; }
-                    case 2: { int16 v = DatumGetInt16(val); memcpy(dest, &v, 2); break; }
-                    case 4: { int32 v = DatumGetInt32(val); memcpy(dest, &v, 4); break; }
-                    case 8: { int64 v = DatumGetInt64(val); memcpy(dest, &v, 8); break; }
-                    case 16: { /* GCOV_EXCL_LINE - 16-byte byval types platform-specific (UUID is byref on most platforms) */
-                        /* UUID: 16 bytes by-value (stored in two int64 fields on some platforms) */ /* GCOV_EXCL_LINE */
-                        memcpy(dest, DatumGetPointer(val), 16); /* GCOV_EXCL_LINE */
+                    case 1: { char v = DatumGetChar(val); memcpy(k, &v, 1); break; }
+                    case 2: { int16 v = DatumGetInt16(val); memcpy(k, &v, 2); break; }
+                    case 4: { int32 v = DatumGetInt32(val); memcpy(k, &v, 4); break; }
+                    case 8: { int64 v = DatumGetInt64(val); memcpy(k, &v, 8); break; }
+                    case 16: { /* GCOV_EXCL_LINE */
+                        memcpy(k, DatumGetPointer(val), 16); /* GCOV_EXCL_LINE */
                         break; /* GCOV_EXCL_LINE */
                     }
                 }
             }
             else
             {
-                /* Fixed-length by-ref type */
-                memcpy(dest, DatumGetPointer(val), key_len);
+                memcpy(k, DatumGetPointer(val), key_len);
             }
 
-            if (i == n_this - 1)
-                memcpy(lastkey, dest, key_len);
-            /* Do not pfree itup - owned by tuplesort */
+            /* Calculate delta size for this tuple */
+            Size delta_size = 0;
+            if (rle_has_key && memcmp(k, rle_current_key, key_len) == 0)
+            {
+                /* Extends current run - no size increase */
+                delta_size = 0;
+            }
+            else
+            {
+                /* New run needed */
+                delta_size = key_len + sizeof(uint16);
+            }
+
+#ifdef SMOL_TEST_COVERAGE
+            /* Apply test GUC limit */
+            if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
+            {
+                /* Page full due to test limit - save tuple for next page */
+                if (!pending_key) pending_key = (char *) palloc(key_len);
+                memcpy(pending_key, k, key_len);
+                has_pending = true;
+                break;
+            }
+#endif
+
+            /* Check nitems limit (uint16 max - must stay below 65535 to avoid overflow in scan loop) */
+            if (n_this >= 65534)
+            {
+                /* Reached maximum tuples per page - save for next page */
+                if (!pending_key) pending_key = (char *) palloc(key_len);
+                memcpy(pending_key, k, key_len);
+                has_pending = true;
+                break;
+            }
+
+            /* Would this overflow the page? */
+            if (rle_current_size + delta_size > avail)
+            {
+                /* Page full - save tuple for next page */
+                if (!pending_key) pending_key = (char *) palloc(key_len);
+                memcpy(pending_key, k, key_len);
+                has_pending = true;
+                break;
+            }
+
+            /* Add this tuple to the page */
+            if (keys_buf_len == keys_buf_cap)
+            {
+                keys_buf_cap *= 2;
+                keys_buf = (char *) repalloc(keys_buf, keys_buf_cap * key_len);
+            }
+            memcpy(keys_buf + (keys_buf_len * key_len), k, key_len);
+            keys_buf_len++;
+
+            if (!rle_has_key || memcmp(k, rle_current_key, key_len) != 0)
+            {
+                /* Start new run */
+                memcpy(rle_current_key, k, key_len);
+                rle_current_count = 1;
+                rle_nruns++;
+                rle_current_size += delta_size;
+                rle_has_key = true;
+            }
+            else
+            {
+                /* Extend run */
+                rle_current_count++;
+            }
+
+            n_this++;
+            /* NOTE: remaining is decremented at end of outer loop */
         }
 
-        /* Analyze for RLE opportunities */
+        SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR, (errmsg("smol: no tuples fit on page (key_len=%u)", key_len)));
+
+        /* Save last key for highkey */
+        memcpy(lastkey, keys_buf + ((n_this - 1) * key_len), key_len);
+
+        /* Decide format: use RLE if it's beneficial */
         bool use_rle = false;
-        Size rle_sz = 0;
-        uint16 rle_nruns = 0;
+        Size rle_sz = rle_current_size;
+        Size plain_sz = sizeof(uint16) + n_this * key_len;
+        double uniqueness_ratio = (double) rle_nruns / (double) n_this;
 
+        if (rle_sz < plain_sz && rle_sz <= avail && uniqueness_ratio < smol_rle_uniqueness_threshold)
         {
-            Size pos = 0; Size sz_runs = 0; uint16 nr = 0;
-            while (pos < n_this)
-            {
-                Size run = 1;
-                const char *k0 = keys_buf + (pos * key_len);
-                while (pos + run < n_this)
-                {
-                    const char *k1 = keys_buf + ((pos + run) * key_len);
-                    if (memcmp(k0, k1, key_len) != 0)
-                        break;
-                    run++;
-                }
-                nr++;
-                sz_runs += key_len + sizeof(uint16);
-                pos += run;
-            }
-            rle_sz = sizeof(uint16) * 3 + sz_runs; /* tag + nitems + nruns + runs */
-            rle_nruns = nr;
-
-            Size plain_sz = sizeof(uint16) + n_this * key_len;
-            double uniqueness_ratio = (double) rle_nruns / (double) n_this;
-
-            /* Use RLE if it saves space and data isn't too unique */
-            if (rle_sz < plain_sz && rle_sz <= avail && uniqueness_ratio < smol_rle_uniqueness_threshold)
-            {
-                use_rle = true;
-                SMOL_LOGF("RLE format: n=%zu nruns=%u uniqueness=%.3f rle_sz=%zu plain_sz=%zu",
-                         n_this, rle_nruns, uniqueness_ratio, rle_sz, plain_sz);
-            }
+            use_rle = true;
+            SMOL_LOGF("RLE format: n=%zu nruns=%u uniqueness=%.3f rle_sz=%zu plain_sz=%zu",
+                     n_this, rle_nruns, uniqueness_ratio, rle_sz, plain_sz);
         }
 
         /* Write page with chosen format */
         Size sz;
         if (use_rle)
         {
-            /* RLE format: [tag][nitems][nruns][runs...] where run = [key][count] */
-            uint16 tag = SMOL_TAG_KEY_RLE;
+            /* PHASE 2: RLE V2 with continuation detection */
+            uint16 tag = SMOL_TAG_KEY_RLE_V2;
             char *p = scratch;
             uint16 nitems16 = (uint16) n_this;
             memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
             memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
             memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
 
+            /* Continuation detection: check if first key matches previous page's last key */
+            uint8 continues_byte = 0;
+            const char *first_key = keys_buf;
+            if (prev_page_has_key && memcmp(first_key, prev_page_last_key, key_len) == 0)
+            {
+                continues_byte = 1;  /* First run continues from previous page */
+            }
+            *p++ = continues_byte;
+
+            /* Write RLE runs */
             Size pos = 0;
             while (pos < n_this)
             {
@@ -5644,6 +5909,10 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
                 pos += run;
             }
             sz = (Size) (p - scratch);
+
+            /* Remember last key for next page's continuation detection */
+            memcpy(prev_page_last_key, lastkey, key_len);
+            prev_page_has_key = true;
         }
         else
         {
@@ -5652,10 +5921,14 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
             memcpy(scratch, &n16, sizeof(uint16));
             memcpy(scratch + sizeof(uint16), keys_buf, n_this * key_len);
             sz = sizeof(uint16) + n_this * key_len;
+
+            /* Track last key even for plain format (next page might use RLE) */
+            memcpy(prev_page_last_key, lastkey, key_len);
+            prev_page_has_key = true;
         }
 
         OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
-        SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
+        SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, ERROR,
             (errmsg("smol: failed to add leaf payload (fixed%s)", use_rle ? " RLE" : "")));
 
         pfree(keys_buf);
@@ -6595,10 +6868,10 @@ smol_inspect(PG_FUNCTION_ARGS)
                                 memcpy(&tag, data, sizeof(uint16));
 
                                 /* Check format tags */
-                                if (tag == SMOL_TAG_ZEROCOPY) 
+                                if (tag == SMOL_TAG_ZEROCOPY)
                                     zerocopy_pages++; /* GCOV_EXCL_LINE */
-                                else if (tag == SMOL_TAG_KEY_RLE) 
-                                    key_rle_pages++; 
+                                else if (tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2)
+                                    key_rle_pages++;
                                 else if (tag == SMOL_TAG_INC_RLE)
                                     inc_rle_pages++;
                                 else if (tag < 0x8000)
