@@ -638,63 +638,56 @@ class Benchmark:
         CREATE UNLOGGED TABLE {table_name}(k int4, inc1 int4, inc2 int4);
         INSERT INTO {table_name}
         SELECT (i % 50)::int4, (i % 10000)::int4, (i % 10000)::int4
-        FROM generate_series(1, 10000000) i
+        FROM generate_series(1, 5000000) i
         ORDER BY 1, 2, 3;
         ALTER TABLE {table_name} SET (autovacuum_enabled = off);
         VACUUM (FREEZE, ANALYZE) {table_name};
         """
+        runs = 3
+        # Query that scans significant portion of index
+        query_settings = f"SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; SET max_parallel_workers_per_gather=8;"
+        query = f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k <= 20 GROUP BY 1, 2;"
+
+        print(f"creating table {table_name}: {create_sql}")
         run_sql(create_sql)
+        print(f"testing with query {query}")
 
         # Build both indexes
+        run_sql(f"DROP INDEX {table_name}_smol;")  # Only BTREE active
         run_sql(f"CREATE INDEX {table_name}_btree ON {table_name}(k) INCLUDE (inc1, inc2);")
         btree_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_btree');"))
 
-        run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
-        smol_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_smol');"))
-
-        run_sql("SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexonlyscan = on; SET max_parallel_workers_per_gather = 0;")
-
-        # Test BTREE: Run same query 100 times with cache eviction
-        # BTREE is 300MB → evict after each query to simulate cold cache
-        print(f"\n{colorize('Testing BTREE:', Colors.BOLD)} 100x same query (evict index after each query)")
-
-        run_sql(f"DROP INDEX {table_name}_smol;")  # Only BTREE active
+        # Test BTREE
+        print(f"\n{colorize('Testing BTREE:', Colors.BOLD)} {runs}x same query")
         btree_idx_name = f"{table_name}_btree"
 
-        # Query that scans significant portion of index
-        query = f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k >= 0 AND k < 25 GROUP BY 1, 2;"
-
-        # First query to warm up
+        # Test BTREE
         flush_caches(btree_idx_name)
-        run_sql(query)
-
         start = time.time()
-        for i in range(100):
-            flush_caches(btree_idx_name)  # Evict BTREE index before each query
-            run_sql(query)
+        for i in range(runs):
+            run_sql(query_settings + query)
         btree_time_ms = (time.time() - start) * 1000
+        print(f"  BTREE: {btree_time_ms:7.1f}ms total (avg {btree_time_ms/runs:.1f}ms/query), {btree_size/(1024*1024):6.1f}MB index")
+        print(f"  BTREE SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{btree_idx_name}'))")}")
+        print(f"  BTREE EXPLAIN: {run_sql('EXPLAIN (buffers, analyze) '+query)}")
 
-        print(f"  BTREE: {btree_time_ms:7.1f}ms total (avg {btree_time_ms/100:.1f}ms/query), {btree_size/(1024*1024):6.1f}MB index")
-
-        # Test SMOL: Same 100 queries WITHOUT cache eviction
-        # SMOL is 2.5MB → stays cached throughout all queries
-        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} 100x same query (index stays cached)")
+        # Test SMOL
+        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} {runs}x same query")
 
         run_sql(f"DROP INDEX {table_name}_btree;")  # Only SMOL active
         run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
+        smol_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_smol');"))
         smol_idx_name = f"{table_name}_smol"
 
-        # First query to load into cache
         flush_caches(smol_idx_name)
-        run_sql(query)
-
         start = time.time()
-        for i in range(100):
-            # NO cache eviction - SMOL stays warm
-            run_sql(query)
+        for i in range(runs):
+            run_sql(query_settings + query)
         smol_time_ms = (time.time() - start) * 1000
-
-        print(f"  SMOL:  {smol_time_ms:7.1f}ms total (avg {smol_time_ms/100:.1f}ms/query), {smol_size/(1024*1024):6.1f}MB index")
+        print(f"  SMOL:  {smol_time_ms:7.1f}ms total (avg {smol_time_ms/runs:.1f}ms/query), {smol_size/(1024*1024):6.1f}MB index")
+        print(f"  SMOL SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{smol_idx_name}'))")}")
+        print(f"  SMOL INSPECT: {run_sql("select smol_inspect('{smol_idx_name}')")}")
+        print(f"  SMOL EXPLAIN: {run_sql(query_settings+'EXPLAIN (buffers, analyze) '+query)}")
 
         # Calculate speedup
         speedup = btree_time_ms / smol_time_ms if smol_time_ms > 0 else 0

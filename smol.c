@@ -2723,6 +2723,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                             break;
                                         start--; /* RLE page: scan backward to find start of duplicate run */ /* GCOV_EXCL_LINE - planner doesn't use backward scans with RLE in ways that require finding run start */
                                     }
+                                    so->rle_run_inc_cached = false; /* Non-RLE page, no caching */
+                                }
+                                else
+                                {
+                                    /* RLE bounds found - cache disabled for backward scans (rare path) */
+                                    so->rle_run_inc_cached = false;
                                 }
                                 so->run_start_off = start;
                                 so->run_end_off = so->cur_off; /* not used in backward path */
@@ -2753,9 +2759,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
                                         ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
-                                    else if (so->rle_run_inc_cached) /* GCOV_EXCL_LINE - RLE INCLUDE caching not yet implemented (rle_run_inc_cached never set to true) */
-                                        /* RLE page with cached run: INCLUDE values constant within run */ /* GCOV_EXCL_LINE */
-                                        ip = so->rle_run_inc_ptr[ii]; /* GCOV_EXCL_LINE */
+                                    else if (so->rle_run_inc_cached)
+                                        /* RLE page with cached run: INCLUDE values constant within run */
+                                        ip = so->rle_run_inc_ptr[ii];
                                     else
                                         /* Slow path: compute pointer dynamically */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
@@ -2906,8 +2912,24 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 }
                                 else
                                 {
-                                    /* RLE bounds found - TODO: cache INCLUDE pointers (disabled due to correctness bug) */
-                                    so->rle_run_inc_cached = false;
+                                    /* RLE bounds found - cache INCLUDE pointers for this run */
+                                    if (so->ninclude > 0)
+                                    {
+                                        /* In include-RLE (tag 0x8003), all tuples in a run share the same INCLUDE values.
+                                         * Cache pointers to these values to avoid repeated linear searches through runs.
+                                         * This optimization is critical for sequential scans returning many rows. */
+                                        for (uint16 ii = 0; ii < so->ninclude; ii++)
+                                        {
+                                            so->rle_run_inc_ptr[ii] = smol1_inc_ptr_any(page, so->key_len, n,
+                                                                                         so->inc_len, so->ninclude,
+                                                                                         ii, start - 1);
+                                        }
+                                        so->rle_run_inc_cached = true;
+                                    }
+                                    else
+                                    {
+                                        so->rle_run_inc_cached = false;
+                                    }
                                 }
                                 so->run_start_off = start; /* not used in forward path */
                                 so->run_end_off = end;
@@ -2961,9 +2983,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
                                         ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
-                                    else if (so->rle_run_inc_cached) /* GCOV_EXCL_LINE - RLE INCLUDE caching not yet implemented (rle_run_inc_cached never set to true) */
-                                        /* RLE page with cached run: INCLUDE values constant within run */ /* GCOV_EXCL_LINE */
-                                        ip = so->rle_run_inc_ptr[ii]; /* GCOV_EXCL_LINE */
+                                    else if (so->rle_run_inc_cached)
+                                        /* RLE page with cached run: INCLUDE values constant within run */
+                                        ip = so->rle_run_inc_ptr[ii];
                                     else
                                         /* Slow path: compute pointer dynamically */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row);
