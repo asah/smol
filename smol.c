@@ -793,6 +793,7 @@ typedef struct SmolScanOpaqueData
     /* Scankeys for runtime filtering (all predicates) */
     ScanKey     runtime_keys;
     int         n_runtime_keys;
+    bool        need_runtime_key_test; /* cached: true if runtime key testing needed (opt #4) */
 
     /* type/width info (leading key always present; second key optional) */
     Oid         atttypid;       /* INT2OID/INT4OID/INT8OID */
@@ -855,6 +856,9 @@ typedef struct SmolScanOpaqueData
     int16       run_text_klen;  /* cached varlena key length for current run (text32) */
     bool        page_is_plain;  /* true when current page is plain (not RLE) - set once per page */
     bool        page_is_zerocopy; /* true when current page uses zero-copy format (tag 0x8000) */
+    /* Cached page metadata (opt #5): nitems and format cached once per page */
+    uint16      cur_page_nitems;    /* cached nitems for current page */
+    uint8       cur_page_format;    /* cached format: 0=plain, 1=zerocopy, 2=key_rle, 3=inc_rle */
     /* Cached INCLUDE column base pointers for plain pages (performance optimization) */
     char       *plain_inc_base[16]; /* base pointer for each INCLUDE column on plain pages */
     bool        plain_inc_cached;   /* true when plain_inc_base[] is valid for current page */
@@ -922,7 +926,7 @@ static bool smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so);
 static void smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n);
 static uint16 smol_leaf_nitems(Page page);
 static char *smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len);
-static char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc);
+static char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc, const uint32 *inc_cumul_offs);
 static inline bool smol_key_eq_len(const char *a, const char *b, uint16 len);
 static inline void smol_run_reset(SmolScanOpaque so);
 static inline bool smol_leaf_is_rle(Page page);
@@ -1036,7 +1040,7 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     } /* GCOV_EXCL_STOP */
 
     /* Get first key on page for bounds checking */
-    char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude);
+    char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
 
     /* For zero-copy pages, skip IndexTuple header to get actual key data */
     if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated smol_build_tree_from_sorted */
@@ -2089,6 +2093,9 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
         memcpy(so->runtime_keys, keys, sizeof(ScanKeyData) * nkeys);
         so->n_runtime_keys = nkeys;
 
+        /* Opt #4: Cache whether runtime key testing is needed (checked once per scan, not per tuple) */
+        so->need_runtime_key_test = false;
+
         for (int i = 0; i < nkeys; i++)
         {
             ScanKey sk = &keys[i];
@@ -2111,15 +2118,28 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
                     so->upper_bound_datum = sk->sk_argument;
                 }
             }
-            else if (sk->sk_attno == 2 && sk->sk_strategy == BTEqualStrategyNumber)
+            else if (sk->sk_attno == 2)
             {
-                so->have_k2_eq = true;
-                Oid t2 = so->atttypid2;
-                if (t2 == INT2OID) so->k2_eq = (int64) DatumGetInt16(sk->sk_argument);
-                else if (t2 == INT4OID) so->k2_eq = (int64) DatumGetInt32(sk->sk_argument);
-                else so->k2_eq = DatumGetInt64(sk->sk_argument);
+                if (sk->sk_strategy == BTEqualStrategyNumber)
+                {
+                    so->have_k2_eq = true;
+                    Oid t2 = so->atttypid2;
+                    if (t2 == INT2OID) so->k2_eq = (int64) DatumGetInt16(sk->sk_argument);
+                    else if (t2 == INT4OID) so->k2_eq = (int64) DatumGetInt32(sk->sk_argument);
+                    else so->k2_eq = DatumGetInt64(sk->sk_argument);
+                }
+                else
+                {
+                    /* Attribute 2 with non-equality: requires runtime testing */
+                    so->need_runtime_key_test = true;
+                }
             }
         }
+    }
+    else
+    {
+        /* No keys: no runtime testing needed */
+        so->need_runtime_key_test = false;
     }
 
 #ifdef SMOL_TEST_COVERAGE
@@ -2154,20 +2174,8 @@ smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so)
     if (so->n_runtime_keys == 0)
         return true;
 
-    /* Only test keys that SMOL doesn't handle natively */
-    bool need_test = false;
-    for (int i = 0; i < so->n_runtime_keys; i++)
-    {
-        ScanKey key = &so->runtime_keys[i];
-        /* Need to test if it's attribute 2 with non-equality strategy */
-        if (key->sk_attno == 2 && key->sk_strategy != BTEqualStrategyNumber)
-        {
-            need_test = true;
-            break;
-        }
-    }
-
-    if (!need_test)
+    /* Opt #4: Use cached flag instead of iterating all keys (eliminates 10M loop iterations) */
+    if (!so->need_runtime_key_test)
         return true; /* All keys are handled natively by SMOL */
 
     /* Extract values from the prebuilt tuple */
@@ -2277,7 +2285,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 so->cur_off = n;
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
                     if (so->upper_bound_strict ? (c < 0) : (c <= 0))
                         break;
@@ -2382,7 +2390,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             while (lo2 <= hi2)
                             {
                                 uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                                char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_len, so->ninclude);
+                                char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                                 /* For zero-copy pages, skip IndexTuple header to get key data */
                                 if (page_is_zerocopy_par) kp2 += sizeof(IndexTupleData);
                                 int cc = smol_cmp_keyptr_to_bound(so, kp2);
@@ -2438,7 +2446,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude);
+                            char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                             /* For zero-copy pages, skip IndexTuple header to get key data */
                             if (so->page_is_zerocopy) 
                                 keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
@@ -2615,6 +2623,27 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         so->page_is_zerocopy = (tag == SMOL_TAG_ZEROCOPY);
 
+        /* Opt #5: Cache page metadata once per page (nitems and format) */
+        if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE)
+        {
+            /* Tagged formats: [u16 tag][u16 nitems][...] */
+            uint16 nitems;
+            memcpy(&nitems, base + sizeof(uint16), sizeof(uint16));
+            so->cur_page_nitems = nitems;
+            if (tag == SMOL_TAG_ZEROCOPY)
+                so->cur_page_format = 1;
+            else if (tag == SMOL_TAG_KEY_RLE)
+                so->cur_page_format = 2;
+            else /* SMOL_TAG_INC_RLE */
+                so->cur_page_format = 3;
+        }
+        else
+        {
+            /* Plain format: first u16 is nitems (no tag) */
+            so->cur_page_nitems = tag;
+            so->cur_page_format = 0;
+        }
+
         /* Run-detection optimization: check page type ONCE per page (not per row)
          * Plain pages with no INCLUDE columns have no duplicate-key runs, so we can
          * skip expensive run-boundary scanning. This eliminates 60% of CPU overhead
@@ -2720,12 +2749,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
         else
         {
-            uint16 n = smol_leaf_nitems(page);
+            uint16 n = so->cur_page_nitems; /* Opt #5: use cached nitems */
             if (dir == BackwardScanDirection)
             {
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     /* For zero-copy pages, skip IndexTuple header to get key data */
                     if (so->page_is_zerocopy) 
                         keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
@@ -2793,7 +2822,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     /* RLE page but not encoded: scan backward to find run start */
                                     while (start > FirstOffsetNumber)
                                     {
-                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         start--; /* RLE page: scan backward to find start of duplicate run */ 
@@ -2826,7 +2855,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             /* Copy INCLUDE columns */
                             if (so->ninclude > 0)
                             {
-                                uint16 n2 = smol_leaf_nitems(page);
+                                uint16 n2 = so->cur_page_nitems; /* Opt #5: use cached nitems */
                                 for (uint16 ii=0; ii<so->ninclude; ii++)
                                 {
                                     char *ip;
@@ -2890,7 +2919,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 while (so->cur_off <= n)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
+                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     /* For zero-copy pages, keyp points to IndexTuple header; adjust to key data */
                     IndexTuple itup_ptr = NULL;
                     if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
@@ -2969,7 +2998,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     /* RLE page but not encoded: scan forward to find run end */
                                     while (end < n)
                                     {
-                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (end + 1), so->key_len, so->inc_len, so->ninclude);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (end + 1), so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         end++;
@@ -3430,7 +3459,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                         if (page2_is_zerocopy) kp2 += sizeof(IndexTupleData);  /* Skip IndexTuple header to get key data */
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
@@ -3451,7 +3480,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (cc > 0) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -4814,7 +4843,7 @@ smol_leaf_nitems(Page page)
 
 /* Extended version with include support for multi-run Include-RLE */
 static inline char *
-smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc)
+smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc, const uint32 *inc_cumul_offs)
 {
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
@@ -4862,10 +4891,9 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
             if (tag == 0x8003u)
             {
                 /* Include-RLE: skip all include columns to reach next run */
-                if (inc_lens && ninc > 0)
+                if (inc_cumul_offs && ninc > 0)
                 {
-                    for (uint16 i = 0; i < ninc; i++)
-                        rp += inc_lens[i];
+                    rp += inc_cumul_offs[ninc];  /* O(1) skip all INCLUDE columns using cumulative offsets */
                 }
                 else /* GCOV_EXCL_START - defensive: Include-RLE (0x8003) pages should always be accessed with metadata */
                 {
@@ -4882,7 +4910,7 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
 static inline char *
 smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
 {
-    return smol_leaf_keyptr_ex(page, idx, key_len, NULL, 0);
+    return smol_leaf_keyptr_ex(page, idx, key_len, NULL, 0, NULL);
 }
 
 static inline bool
@@ -6208,7 +6236,7 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
     /* includes */
     if (so->ninclude > 0)
     {
-        uint16 n2 = smol_leaf_nitems(page);
+        uint16 n2 = so->cur_page_nitems; /* Opt #5: use cached nitems */
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
             cur = att_align_nominal(cur, so->inc_align[ii]);

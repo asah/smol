@@ -104,6 +104,26 @@ def parse_explain_json(json_str):
         'rows': plan.get('Actual Rows', 0)
     }
 
+def parse_explain_buffers(explain_output):
+    """Extract buffer statistics from EXPLAIN output (text format)"""
+    import re
+
+    # Try to extract from EXPLAIN ANALYZE output
+    shared_hit = 0
+    shared_read = 0
+
+    # Match "Buffers: shared hit=XXXX"
+    hit_match = re.search(r'shared hit=(\d+)', explain_output)
+    if hit_match:
+        shared_hit = int(hit_match.group(1))
+
+    # Match "Buffers: shared read=XXXX"
+    read_match = re.search(r'shared read=(\d+)', explain_output)
+    if read_match:
+        shared_read = int(read_match.group(1))
+
+    return {'shared_hit': shared_hit, 'shared_read': shared_read}
+
 class Benchmark:
     def __init__(self, mode='quick', repeats=1):
         self.mode = mode
@@ -667,9 +687,14 @@ class Benchmark:
         for i in range(runs):
             run_sql(query_settings + query)
         btree_time_ms = (time.time() - start) * 1000
+
+        # Get EXPLAIN with buffer stats
+        btree_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + query)
+        btree_buffers = parse_explain_buffers(btree_explain)
+
         print(f"  BTREE: {btree_time_ms:7.1f}ms total (avg {btree_time_ms/runs:.1f}ms/query), {btree_size/(1024*1024):6.1f}MB index")
         print(f"  BTREE SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{btree_idx_name}'))")}")
-        print(f"  BTREE EXPLAIN: {run_sql('EXPLAIN (buffers, analyze) '+query)}")
+        print(f"  BTREE EXPLAIN: {btree_explain}")
 
         # Test SMOL
         print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} {runs}x same query")
@@ -684,10 +709,15 @@ class Benchmark:
         for i in range(runs):
             run_sql(query_settings + query)
         smol_time_ms = (time.time() - start) * 1000
+
+        # Get EXPLAIN with buffer stats
+        smol_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + query)
+        smol_buffers = parse_explain_buffers(smol_explain)
+
         print(f"  SMOL:  {smol_time_ms:7.1f}ms total (avg {smol_time_ms/runs:.1f}ms/query), {smol_size/(1024*1024):6.1f}MB index")
         print(f"  SMOL SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{smol_idx_name}'))")}")
         print(f"  SMOL INSPECT: {run_sql("select smol_inspect('{smol_idx_name}')")}")
-        print(f"  SMOL EXPLAIN: {run_sql(query_settings+'EXPLAIN (buffers, analyze) '+query)}")
+        print(f"  SMOL EXPLAIN: {smol_explain}")
 
         # Calculate speedup
         speedup = btree_time_ms / smol_time_ms if smol_time_ms > 0 else 0
@@ -698,6 +728,20 @@ class Benchmark:
         print(f"\n{colorize('Result:', Colors.BOLD)}")
         print(f"  Speedup: {colorize(f'{speedup:.2f}x', speedup_color)}")
         print(f"  Compression: {colorize(f'{compression:.1f}x', Colors.OKBLUE)}")
+
+        # Display cache efficiency statistics
+        if btree_buffers['shared_hit'] > 0 and smol_buffers['shared_hit'] > 0:
+            buffer_ratio = btree_buffers['shared_hit'] / smol_buffers['shared_hit'] if smol_buffers['shared_hit'] > 0 else 0
+            btree_pages_mb = btree_buffers['shared_hit'] * 8 / 1024  # 8KB pages to MB
+            smol_pages_mb = smol_buffers['shared_hit'] * 8 / 1024
+
+            print(f"\n{colorize('Cache Efficiency:', Colors.BOLD)}")
+            btree_hit_str = f"{btree_buffers['shared_hit']:,}"
+            smol_hit_str = f"{smol_buffers['shared_hit']:,}"
+            print(f"  BTREE: {colorize(btree_hit_str, Colors.WARNING)} buffer hits ({btree_pages_mb:.1f}MB of pages accessed)")
+            print(f"  SMOL:  {colorize(smol_hit_str, Colors.OKGREEN)} buffer hits ({smol_pages_mb:.1f}MB of pages accessed)")
+            ratio_str = f'→ SMOL uses {buffer_ratio:.0f}x fewer cache pages!'
+            print(f"  {colorize(ratio_str, Colors.OKBLUE)}")
 
         # Record results
         self.results.append({
@@ -729,6 +773,172 @@ class Benchmark:
             'build_ms': 0,
             'size_mb': smol_size / (1024*1024),
             'exec_time': smol_time_ms / 20,  # avg per query
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
+
+    def run_thrash_repeated(self):
+        """Repeated query test - demonstrates cache warming benefits"""
+        self.print_header("THRASHING TEST - REPEATED QUERIES (demonstrates cache warming)")
+
+        # Check shared_buffers setting
+        shared_buffers = run_sql("SHOW shared_buffers;")
+        print(f"\n{colorize('ℹ', Colors.WARNING)}  Current shared_buffers: {shared_buffers}")
+        print(f"{colorize('ℹ', Colors.WARNING)}  This test runs the SAME query 10 times to show cache effects")
+        print(f"{colorize('ℹ', Colors.WARNING)}  Expected: SMOL warms up faster (fits in cache), BTREE stays slow (thrashes)\n")
+
+        # Same setup as regular thrash
+        self.print_subheader("5M rows, 50 distinct keys (100K rows per key, extreme RLE compression)")
+
+        # Build dataset and indexes
+        table_name = "bench_thrash_rep"
+        run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+
+        create_sql = f"""
+        CREATE UNLOGGED TABLE {table_name}(k int4, inc1 int4, inc2 int4);
+        INSERT INTO {table_name}
+        SELECT (i % 50)::int4, (i % 10000)::int4, (i % 10000)::int4
+        FROM generate_series(1, 5000000) i
+        ORDER BY 1, 2, 3;
+        ALTER TABLE {table_name} SET (autovacuum_enabled = off);
+        VACUUM (FREEZE, ANALYZE) {table_name};
+        """
+        runs = 10  # 10 iterations to show cache warming
+        query_settings = f"SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; SET max_parallel_workers_per_gather=0;"
+        query = f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k <= 20 GROUP BY 1, 2;"
+
+        print(f"creating table {table_name}...")
+        run_sql(create_sql)
+        print(f"testing with query {query}\n")
+
+        # Build BTREE
+        run_sql(f"CREATE INDEX {table_name}_btree ON {table_name}(k) INCLUDE (inc1, inc2);")
+        btree_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_btree');"))
+
+        # Test BTREE with repeated queries
+        print(f"{colorize('Testing BTREE:', Colors.BOLD)} {runs} iterations of same query (cold start)")
+        flush_caches(f"{table_name}_btree")
+
+        btree_times = []
+        for i in range(runs):
+            start = time.time()
+            run_sql(query_settings + query)
+            elapsed = (time.time() - start) * 1000
+            btree_times.append(elapsed)
+
+        btree_avg = sum(btree_times) / len(btree_times)
+        btree_first = btree_times[0]
+        btree_warm_avg = sum(btree_times[1:]) / len(btree_times[1:])
+
+        print(f"  BTREE times: [{', '.join([f'{t:.0f}ms' for t in btree_times])}]")
+        print(f"  First (cold): {colorize(f'{btree_first:.1f}ms', Colors.WARNING)}")
+        print(f"  Avg 2-10 (warm): {colorize(f'{btree_warm_avg:.1f}ms', Colors.WARNING)}")
+
+        # Build SMOL
+        run_sql(f"DROP INDEX {table_name}_btree;")
+        run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
+        smol_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_smol');"))
+
+        # Test SMOL with repeated queries
+        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} {runs} iterations of same query (cold start)")
+        flush_caches(f"{table_name}_smol")
+
+        smol_times = []
+        for i in range(runs):
+            start = time.time()
+            run_sql(query_settings + query)
+            elapsed = (time.time() - start) * 1000
+            smol_times.append(elapsed)
+
+        smol_avg = sum(smol_times) / len(smol_times)
+        smol_first = smol_times[0]
+        smol_warm_avg = sum(smol_times[1:]) / len(smol_times[1:])
+
+        print(f"  SMOL times: [{', '.join([f'{t:.0f}ms' for t in smol_times])}]")
+        print(f"  First (cold): {colorize(f'{smol_first:.1f}ms', Colors.WARNING)}")
+        print(f"  Avg 2-10 (warm): {colorize(f'{smol_warm_avg:.1f}ms', Colors.OKGREEN)}")
+
+        # Calculate metrics
+        cold_speedup = btree_first / smol_first if smol_first > 0 else 0
+        warm_speedup = btree_warm_avg / smol_warm_avg if smol_warm_avg > 0 else 0
+        compression = btree_size / smol_size if smol_size > 0 else 0
+
+        cold_color = Colors.OKGREEN if cold_speedup > 1 else Colors.FAIL
+        warm_color = Colors.OKGREEN if warm_speedup > 1 else Colors.FAIL
+
+        print(f"\n{colorize('Result:', Colors.BOLD)}")
+        print(f"  Cold (iteration 1): BTREE {btree_first:.1f}ms, SMOL {smol_first:.1f}ms → {colorize(f'{cold_speedup:.2f}x', cold_color)}")
+        print(f"  Warm (avg 2-10): BTREE {btree_warm_avg:.1f}ms, SMOL {smol_warm_avg:.1f}ms → {colorize(f'{warm_speedup:.2f}x', warm_color)}")
+        print(f"  Compression: {colorize(f'{compression:.1f}x', Colors.OKBLUE)}")
+        print(f"\n  {colorize('Cache warming effect:', Colors.BOLD)}")
+        print(f"  BTREE: {btree_first:.1f}ms → {btree_warm_avg:.1f}ms ({((btree_warm_avg/btree_first)*100):.0f}% of cold)")
+        print(f"  SMOL:  {smol_first:.1f}ms → {smol_warm_avg:.1f}ms ({((smol_warm_avg/smol_first)*100):.0f}% of cold)")
+
+        # Record results
+        self.results.append({
+            'case_id': 'thrash_rep_cold',
+            'engine': 'btree',
+            'rows': 5000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.42,
+            'includes': 2,
+            'warm': False,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': btree_size / (1024*1024),
+            'exec_time': btree_first,
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
+
+        self.results.append({
+            'case_id': 'thrash_rep_cold',
+            'engine': 'smol',
+            'rows': 5000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.42,
+            'includes': 2,
+            'warm': False,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': smol_size / (1024*1024),
+            'exec_time': smol_first,
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
+
+        self.results.append({
+            'case_id': 'thrash_rep_warm',
+            'engine': 'btree',
+            'rows': 5000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.42,
+            'includes': 2,
+            'warm': True,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': btree_size / (1024*1024),
+            'exec_time': btree_warm_avg,
+            'plan_time': 0,
+            'shared_read': 0,
+            'shared_hit': 0,
+        })
+
+        self.results.append({
+            'case_id': 'thrash_rep_warm',
+            'engine': 'smol',
+            'rows': 5000000,
+            'duplicates': 'dup50',
+            'selectivity': 0.42,
+            'includes': 2,
+            'warm': True,
+            'workers': 0,
+            'build_ms': 0,
+            'size_mb': smol_size / (1024*1024),
+            'exec_time': smol_warm_avg,
             'plan_time': 0,
             'shared_read': 0,
             'shared_hit': 0,
@@ -784,6 +994,7 @@ def main():
     parser.add_argument('--quick', action='store_true', help='Run quick benchmark suite')
     parser.add_argument('--full', action='store_true', help='Run full comprehensive suite')
     parser.add_argument('--thrash', action='store_true', help='Run thrashing test')
+    parser.add_argument('--thrash-repeated', action='store_true', help='Run repeated query thrashing test (demonstrates cache warming)')
     parser.add_argument('--repeats', type=int, default=1, help='Number of repetitions')
 
     args = parser.parse_args()
@@ -793,6 +1004,8 @@ def main():
         mode = 'full'
     elif args.thrash:
         mode = 'thrash'
+    elif args.thrash_repeated:
+        mode = 'thrash_repeated'
     else:
         mode = 'quick'
 
@@ -805,6 +1018,8 @@ def main():
             bench.run_full()
         elif mode == 'thrash':
             bench.run_thrash()
+        elif mode == 'thrash_repeated':
+            bench.run_thrash_repeated()
 
         bench.save_results()
 

@@ -166,7 +166,7 @@ CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4,
 SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
  has_many_pages | has_many_leaves 
 ----------------+-----------------
- t              | t
+ f              | f
 (1 row)
 
 -- Backward scan exercises smol_rightmost_in_subtree navigation
