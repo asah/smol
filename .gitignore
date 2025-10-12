@@ -17,6 +17,17 @@ regression.*
 *.gcda
 *.gcno
 
+.bash_history
+.ssh/
+.lesshst
+.config/
+.claude*
+.sudo_as_admin_successful
+.psql_history
+.npm/
+.bashrc
+smol-sshdir.tgz
+
 # Object files
 *.o
 *.ko
