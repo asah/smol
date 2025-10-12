@@ -847,6 +847,7 @@ static void smol_build_internal_levels_bytes(Relation idx,
                                        Size nchildren, uint16 key_len,
                                        BlockNumber *out_root, uint16 *out_levels);
 static BlockNumber smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len);
+static BlockNumber smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so);
 static BlockNumber smol_rightmost_leaf(Relation idx);
 static BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
 static int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
@@ -2306,15 +2307,24 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     /* Single-threaded scan: seek to first leaf containing bound
                      * For equality queries (k = value), this seeks directly to the page containing value
                      * instead of starting at leftmost leaf and scanning sequentially */
-                    int64 lb = 0;  /* Default for unbounded scans: start at leftmost leaf */
-                    if (so->have_bound)
+                    if (so->have_bound && so->atttypid == TEXTOID)
                     {
-                        if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
-                        else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
-                        else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
-                        else lb = 0;  /* Non-INT types: fall back to leftmost leaf (generic bounds check at tuple level) */
+                        /* TEXT types: use generic find_first_leaf that handles text comparison correctly */
+                        so->cur_blk = smol_find_first_leaf_generic(idx, so);
                     }
-                    so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                    else
+                    {
+                        /* Integer types or unbounded: use fast integer-only path */
+                        int64 lb = 0;  /* Default for unbounded scans: start at leftmost leaf */
+                        if (so->have_bound)
+                        {
+                            if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
+                            else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
+                            else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
+                            else lb = 0;  /* Non-INT types (date, timestamp, etc.): leftmost leaf */
+                        }
+                        so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
+                    }
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
                     SMOL_LOGF("gettuple init cur_blk=%u", so->cur_blk);
@@ -4619,6 +4629,46 @@ smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_l
         levels--;
     }
     SMOL_LOGF("find_first_leaf: leaf=%u for bound=%ld height=%u", cur, (long) lower_bound, meta.height);
+    return cur;
+}
+
+/* Generic version of smol_find_first_leaf that supports all key types including text.
+ * Uses SmolScanOpaque's comparison context to correctly handle text/varchar types. */
+static BlockNumber
+smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so)
+{
+    SmolMeta meta;
+    smol_meta_read(idx, &meta);
+    BlockNumber cur = meta.root_blkno;
+    uint16 levels = meta.height;
+    while (levels > 1)
+    {
+        Buffer buf = ReadBuffer(idx, cur);
+        Page page = BufferGetPage(buf);
+        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        BlockNumber child = InvalidBlockNumber;
+        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+        {
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+            BlockNumber c;
+            memcpy(&c, itp, sizeof(BlockNumber));
+            char *keyp = itp + sizeof(BlockNumber);
+            /* Use generic comparator that handles text correctly */
+            int cmp = smol_cmp_keyptr_to_bound(so, keyp);
+            if (cmp >= 0)
+            { child = c; break; }
+        }
+        if (!BlockNumberIsValid(child))
+        {
+            /* choose rightmost child */
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, maxoff));
+            memcpy(&child, itp, sizeof(BlockNumber));
+        }
+        ReleaseBuffer(buf);
+        cur = child;
+        levels--;
+    }
+    SMOL_LOGF("find_first_leaf_generic: leaf=%u height=%u", cur, meta.height);
     return cur;
 }
 
