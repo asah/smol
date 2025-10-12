@@ -635,92 +635,104 @@ class Benchmark:
             self.run_case(f'd{dup}', 'smol', 1000000, dup, 0.5, 2, True)
 
     def run_thrash(self):
-        """Thrashing test - demonstrates cache efficiency"""
-        self.print_header("THRASHING TEST (demonstrates cache efficiency)")
+        """Thrashing test - demonstrates cache efficiency with cold queries"""
+        self.print_header("THRASHING TEST (demonstrates cache efficiency with COLD queries)")
 
         # Check shared_buffers setting
         shared_buffers = run_sql("SHOW shared_buffers;")
         print(f"\n{colorize('ℹ', Colors.WARNING)}  Current shared_buffers: {shared_buffers}")
-        print(f"{colorize('ℹ', Colors.WARNING)}  This test uses indexes larger than shared_buffers")
-        print(f"{colorize('ℹ', Colors.WARNING)}  BTREE: ~300MB (thrashes), SMOL: ~3MB (fits in cache)")
-        print(f"{colorize('ℹ', Colors.WARNING)}  Expected: Large speedup due to cache hits\n")
+        print(f"{colorize('ℹ', Colors.WARNING)}  This test uses large indexes and COLD (different) queries")
+        print(f"{colorize('ℹ', Colors.WARNING)}  BTREE: ~600MB (9.4x larger than cache)")
+        print(f"{colorize('ℹ', Colors.WARNING)}  SMOL: ~5MB (easily fits in cache)")
+        print(f"{colorize('ℹ', Colors.WARNING)}  Expected: SMOL faster because whole index fits in cache\n")
 
-        # 10M rows with 50 distinct keys = 200K rows per key (extreme RLE compression for SMOL)
-        # BTREE: ~300MB index (4.7x larger than 64MB cache → heavy thrashing)
-        # SMOL with RLE: ~3MB (easily fits in 64MB shared_buffers)
-        self.print_subheader("10M rows, 50 distinct keys (200K rows per key, extreme RLE compression)")
+        # 20M rows with 50 distinct keys = 400K rows per key (extreme RLE compression for SMOL)
+        # BTREE: ~600MB index (9.4x larger than 64MB cache → cannot fit)
+        # SMOL with RLE: ~5MB (easily fits in 64MB shared_buffers)
+        # Use 5 different queries accessing different ranges - BTREE must constantly evict/refetch
+        self.print_subheader("20M rows, 50 distinct keys - 5 different cold queries")
 
         # Build dataset and indexes
         table_name = "bench_thrash"
         run_sql(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
 
+        print(f"Creating table with 20M rows...")
         create_sql = f"""
         CREATE UNLOGGED TABLE {table_name}(k int4, inc1 int4, inc2 int4);
         INSERT INTO {table_name}
         SELECT (i % 50)::int4, (i % 10000)::int4, (i % 10000)::int4
-        FROM generate_series(1, 5000000) i
+        FROM generate_series(1, 20000000) i
         ORDER BY 1, 2, 3;
         ALTER TABLE {table_name} SET (autovacuum_enabled = off);
         VACUUM (FREEZE, ANALYZE) {table_name};
         """
-        runs = 3
-        # Query that scans significant portion of index
-        query_settings = f"SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; SET max_parallel_workers_per_gather=8;"
-        query = f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k <= 20 GROUP BY 1, 2;"
-
-        print(f"creating table {table_name}: {create_sql}")
         run_sql(create_sql)
-        print(f"testing with query {query}")
 
-        # Build both indexes
-        run_sql(f"DROP INDEX {table_name}_smol;")  # Only BTREE active
+        # 5 different queries accessing different key ranges (cold queries)
+        # This forces BTREE to evict/refetch pages since working set >> cache
+        queries = [
+            f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k BETWEEN 0 AND 9 GROUP BY 1, 2;",
+            f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k BETWEEN 10 AND 19 GROUP BY 1, 2;",
+            f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k BETWEEN 20 AND 29 GROUP BY 1, 2;",
+            f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k BETWEEN 30 AND 39 GROUP BY 1, 2;",
+            f"SELECT inc1, inc2, count(*) FROM {table_name} WHERE k BETWEEN 40 AND 49 GROUP BY 1, 2;",
+        ]
+        query_settings = "SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; SET max_parallel_workers_per_gather=0;"
+
+        # Build BTREE
+        print(f"Building BTREE index...")
         run_sql(f"CREATE INDEX {table_name}_btree ON {table_name}(k) INCLUDE (inc1, inc2);")
         btree_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_btree');"))
-
-        # Test BTREE
-        print(f"\n{colorize('Testing BTREE:', Colors.BOLD)} {runs}x same query")
         btree_idx_name = f"{table_name}_btree"
 
-        # Test BTREE
+        # Test BTREE with 5 cold queries
+        print(f"\n{colorize('Testing BTREE:', Colors.BOLD)} 5 cold queries accessing different ranges")
         flush_caches(btree_idx_name)
-        start = time.time()
-        for i in range(runs):
-            run_sql(query_settings + query)
-        btree_time_ms = (time.time() - start) * 1000
 
-        # Get EXPLAIN with buffer stats
-        btree_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + query)
+        btree_total_ms = 0
+        for i, query in enumerate(queries):
+            start = time.time()
+            run_sql(query_settings + query)
+            elapsed = (time.time() - start) * 1000
+            btree_total_ms += elapsed
+            print(f"  Query {i+1}: {elapsed:.1f}ms")
+
+        # Get buffer stats from last query
+        btree_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + queries[0])
         btree_buffers = parse_explain_buffers(btree_explain)
 
-        print(f"  BTREE: {btree_time_ms:7.1f}ms total (avg {btree_time_ms/runs:.1f}ms/query), {btree_size/(1024*1024):6.1f}MB index")
-        print(f"  BTREE SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{btree_idx_name}'))")}")
-        print(f"  BTREE EXPLAIN: {btree_explain}")
+        print(f"  BTREE total: {colorize(f'{btree_total_ms:.1f}ms', Colors.WARNING)} (avg {btree_total_ms/len(queries):.1f}ms/query)")
+        print(f"  BTREE size: {btree_size/(1024*1024):.1f}MB")
 
-        # Test SMOL
-        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} {runs}x same query")
-
-        run_sql(f"DROP INDEX {table_name}_btree;")  # Only SMOL active
+        # Build SMOL
+        run_sql(f"DROP INDEX {table_name}_btree;")
+        print(f"\n{colorize('Building SMOL index...', Colors.BOLD)}")
         run_sql(f"CREATE INDEX {table_name}_smol ON {table_name} USING smol(k) INCLUDE (inc1, inc2);")
         smol_size = int(run_sql(f"SELECT pg_relation_size('{table_name}_smol');"))
         smol_idx_name = f"{table_name}_smol"
 
+        # Test SMOL with 5 cold queries
+        print(f"\n{colorize('Testing SMOL:', Colors.BOLD)} 5 cold queries accessing different ranges")
         flush_caches(smol_idx_name)
-        start = time.time()
-        for i in range(runs):
-            run_sql(query_settings + query)
-        smol_time_ms = (time.time() - start) * 1000
 
-        # Get EXPLAIN with buffer stats
-        smol_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + query)
+        smol_total_ms = 0
+        for i, query in enumerate(queries):
+            start = time.time()
+            run_sql(query_settings + query)
+            elapsed = (time.time() - start) * 1000
+            smol_total_ms += elapsed
+            print(f"  Query {i+1}: {elapsed:.1f}ms")
+
+        # Get buffer stats from last query
+        smol_explain = run_sql(query_settings + 'EXPLAIN (buffers, analyze) ' + queries[0])
         smol_buffers = parse_explain_buffers(smol_explain)
 
-        print(f"  SMOL:  {smol_time_ms:7.1f}ms total (avg {smol_time_ms/runs:.1f}ms/query), {smol_size/(1024*1024):6.1f}MB index")
-        print(f"  SMOL SIZE: {run_sql("select pg_size_pretty(pg_relation_size('{smol_idx_name}'))")}")
-        print(f"  SMOL INSPECT: {run_sql("select smol_inspect('{smol_idx_name}')")}")
-        print(f"  SMOL EXPLAIN: {smol_explain}")
+        print(f"  SMOL total: {colorize(f'{smol_total_ms:.1f}ms', Colors.OKGREEN)} (avg {smol_total_ms/len(queries):.1f}ms/query)")
+        print(f"  SMOL size: {smol_size/(1024*1024):.1f}MB")
+        print(f"  SMOL inspect: {run_sql(f'SELECT smol_inspect(\'{smol_idx_name}\')')}")
 
         # Calculate speedup
-        speedup = btree_time_ms / smol_time_ms if smol_time_ms > 0 else 0
+        speedup = btree_total_ms / smol_total_ms if smol_total_ms > 0 else 0
         compression = btree_size / smol_size if smol_size > 0 else 0
 
         speedup_color = Colors.OKGREEN if speedup > 1 else Colors.FAIL
@@ -728,6 +740,7 @@ class Benchmark:
         print(f"\n{colorize('Result:', Colors.BOLD)}")
         print(f"  Speedup: {colorize(f'{speedup:.2f}x', speedup_color)}")
         print(f"  Compression: {colorize(f'{compression:.1f}x', Colors.OKBLUE)}")
+        print(f"  Performance gain: {colorize(f'{btree_total_ms - smol_total_ms:.0f}ms saved', Colors.OKGREEN if speedup > 1 else Colors.FAIL)} ({((speedup - 1) * 100):.0f}% faster)")
 
         # Display cache efficiency statistics
         if btree_buffers['shared_hit'] > 0 and smol_buffers['shared_hit'] > 0:
@@ -735,27 +748,27 @@ class Benchmark:
             btree_pages_mb = btree_buffers['shared_hit'] * 8 / 1024  # 8KB pages to MB
             smol_pages_mb = smol_buffers['shared_hit'] * 8 / 1024
 
-            print(f"\n{colorize('Cache Efficiency:', Colors.BOLD)}")
+            print(f"\n{colorize('Cache Efficiency (per query):', Colors.BOLD)}")
             btree_hit_str = f"{btree_buffers['shared_hit']:,}"
             smol_hit_str = f"{smol_buffers['shared_hit']:,}"
             print(f"  BTREE: {colorize(btree_hit_str, Colors.WARNING)} buffer hits ({btree_pages_mb:.1f}MB of pages accessed)")
             print(f"  SMOL:  {colorize(smol_hit_str, Colors.OKGREEN)} buffer hits ({smol_pages_mb:.1f}MB of pages accessed)")
-            ratio_str = f'→ SMOL uses {buffer_ratio:.0f}x fewer cache pages!'
+            ratio_str = f'→ SMOL uses {buffer_ratio:.0f}x fewer cache pages per query!'
             print(f"  {colorize(ratio_str, Colors.OKBLUE)}")
 
         # Record results
         self.results.append({
             'case_id': 'thrash',
             'engine': 'btree',
-            'rows': 10000000,
+            'rows': 20000000,
             'duplicates': 'dup50',
-            'selectivity': 0.1,
+            'selectivity': 0.2,
             'includes': 2,
             'warm': False,
             'workers': 0,
             'build_ms': 0,
             'size_mb': btree_size / (1024*1024),
-            'exec_time': btree_time_ms / 20,  # avg per query
+            'exec_time': btree_total_ms / len(queries),  # avg per query
             'plan_time': 0,
             'shared_read': 0,
             'shared_hit': 0,
@@ -764,15 +777,15 @@ class Benchmark:
         self.results.append({
             'case_id': 'thrash',
             'engine': 'smol',
-            'rows': 10000000,
+            'rows': 20000000,
             'duplicates': 'dup50',
-            'selectivity': 0.1,
+            'selectivity': 0.2,
             'includes': 2,
             'warm': False,
             'workers': 0,
             'build_ms': 0,
             'size_mb': smol_size / (1024*1024),
-            'exec_time': smol_time_ms / 20,  # avg per query
+            'exec_time': smol_total_ms / len(queries),  # avg per query
             'plan_time': 0,
             'shared_read': 0,
             'shared_hit': 0,
