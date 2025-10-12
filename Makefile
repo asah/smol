@@ -115,28 +115,6 @@ bench-help:
 	@echo "See bench/README.md for detailed documentation"
 	@echo ""
 
-# Legacy SQL-based benchmarks (kept for compatibility)
-bench-pressure: start
-	@echo "[bench] Running buffer pressure test (20M rows, demonstrates cache efficiency)..."
-	@mkdir -p results
-	@echo "[bench] This test uses EXPLAIN (ANALYZE, BUFFERS) to show I/O differences"
-	@echo "[bench] Expected runtime: 3-5 minutes"
-	@/usr/local/pgsql/bin/psql -f bench/buffer_pressure.sql | tee results/bench-pressure-$(shell date +%Y%m%d-%H%M%S).log
-	@echo "[bench] Buffer pressure test complete. Check results/ for detailed I/O statistics."
-
-bench-extreme: start
-	@echo "[bench] Running EXTREME buffer pressure test (HIGHLY repetitive data)..."
-	@mkdir -p results
-	@echo "[bench] This test demonstrates maximum RLE compression advantage"
-	@echo "[bench] 20M rows with only 1000 distinct keys → massive compression!"
-	@echo "[bench] Expected: SMOL 8-10x smaller than BTREE"
-	@echo "[bench] Expected runtime: 4-6 minutes"
-	@/usr/local/pgsql/bin/psql -v shared_buffers=64MB -f bench/extreme_pressure.sql | tee results/bench-extreme-$(shell date +%Y%m%d-%H%M%S).log
-	@echo "[bench] Extreme pressure test complete. Check results/ for compression and thrashing data."
-
-bench-legacy: bench-pressure bench-extreme
-	@echo "[bench] Legacy benchmark suite complete."
-
 # ---------------------------------------------------------------------------
 # Inside-container targets
 # Use these when you are already inside the smol Docker container.
