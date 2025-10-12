@@ -83,7 +83,7 @@ WORK_MEM_FRACTION_OF_RAM="${WORK_MEM_FRACTION_OF_RAM:-0.15}" # 15% RAM budgeted 
 WORK_MEM_CAP_MB="${WORK_MEM_CAP_MB:-128}"                   # hard cap per session for safety
 MAINT_WORK_MEM_CAP_MB="${MAINT_WORK_MEM_CAP_MB:-1024}"      # 1GB cap
 OLAP_STATS_TARGET="${OLAP_STATS_TARGET:-200}"
-PARALLEL_GATHER_CAP="${PARALLEL_GATHER_CAP:-4}"
+PARALLEL_GATHER_CAP="${PARALLEL_GATHER_CAP:-16}"
 
 if in_docker; then
   # Be more conservative inside containers to avoid host memory pressure

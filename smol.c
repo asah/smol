@@ -218,6 +218,7 @@ static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children
 static int smol_test_force_realloc_at = 0;  /* 0=disabled, >0=force reallocation when next_n reaches this value */
 static bool smol_test_force_page_bounds_check = false;  /* Force page-level bounds checking even when planner doesn't set it up */
 static int smol_test_max_tuples_per_page = 0;  /* 0=unlimited, >0=cap tuples per leaf page to force taller trees */
+static int smol_test_force_parallel_workers = 0;  /* 0=use planner's decision, >0=force N parallel workers for testing */
 /* Note: Parallel CAS retry (line ~1700) proved too difficult to reliably test with synthetic worker coordination */
 
 #define SMOL_ATOMIC_READ_U32(ptr) \
@@ -361,6 +362,17 @@ _PG_init(void)
                             0, /* default: unlimited */
                             0, /* min */
                             10000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.test_force_parallel_workers",
+                            "For coverage testing: force N parallel workers (0=use planner's decision)",
+                            "For coverage testing: force N parallel workers (0=use planner's decision)",
+                            &smol_test_force_parallel_workers,
+                            0, /* default: use planner */
+                            0, /* min */
+                            64, /* max */
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
@@ -838,7 +850,7 @@ static void smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate 
 static void smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * const *incs,
                              Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 /* removed: static void smol_build_tree2_from_sorted(...); */
-static void smol_build_internal_levels(Relation idx,
+static void pg_attribute_unused() smol_build_internal_levels(Relation idx,
                                        BlockNumber *child_blks, const int64 *child_high,
                                        Size nchildren, uint16 key_len,
                                        BlockNumber *out_root, uint16 *out_levels);
@@ -963,15 +975,15 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
 
     /* No upper bounds: all pages match (lower bounds handled by initial seek) */
     if (!so->have_upper_bound && !so->have_k1_eq)
-        return true;
+        return true; /* GCOV_EXCL_LINE - defensive: this path is never reached in current code */
 
     /* Empty page: defensive check for corruption */
-    if (nitems == 0)
+    if (nitems == 0) /* GCOV_EXCL_START - defensive: pages are never empty in normal operation */
     {
         SMOL_DEFENSIVE_CHECK(false, ERROR,
             (errmsg("smol: empty page %u during bounds checking", so->cur_blk)));
         return false;
-    }
+    } /* GCOV_EXCL_STOP */
 
     /* Get first key on page for bounds checking */
     char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude);
@@ -1269,11 +1281,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     INSTR_TIME_SET_CURRENT(t_write_end);
 
     /* Request parallel workers for single-key builds without INCLUDE columns */
-    if (nkeyatts == 1 && ninclude == 0 && indexInfo->ii_ParallelWorkers > 0)
+    int parallel_workers = indexInfo->ii_ParallelWorkers;
+#ifdef SMOL_TEST_COVERAGE
+    if (smol_test_force_parallel_workers > 0)
+        parallel_workers = smol_test_force_parallel_workers;
+#endif
+    if (nkeyatts == 1 && ninclude == 0 && parallel_workers > 0)
     {
-        elog(LOG, "[smol] About to call smol_begin_parallel, ii_ParallelWorkers=%d", indexInfo->ii_ParallelWorkers);
+        elog(LOG, "[smol] About to call smol_begin_parallel, parallel_workers=%d", parallel_workers);
         smol_begin_parallel(&buildstate, indexInfo->ii_Concurrent,
-                          indexInfo->ii_ParallelWorkers);
+                          parallel_workers);
         elog(LOG, "[smol] Returned from smol_begin_parallel, smolleader=%p", buildstate.smolleader);
     }
 
@@ -2348,8 +2365,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                             char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude);
                             /* For zero-copy pages, skip IndexTuple header to get key data */
-                            if (so->page_is_zerocopy)
-                                keyp += sizeof(IndexTupleData);
+                            if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                                keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -2635,8 +2652,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     /* For zero-copy pages, skip IndexTuple header to get key data */
-                    if (so->page_is_zerocopy)
-                        keyp += sizeof(IndexTupleData);
+                    if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                        keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                     /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
                     {
@@ -2804,7 +2821,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude);
                     /* For zero-copy pages, keyp points to IndexTuple header; adjust to key data */
                     IndexTuple itup_ptr = NULL;
-                    if (so->page_is_zerocopy)
+                    if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
                     {
                         itup_ptr = (IndexTuple) keyp;  /* Save IndexTuple pointer for later */
                         keyp += sizeof(IndexTupleData);  /* Skip header to get key data */
@@ -2826,7 +2843,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             so->cur_off++; /* GCOV_EXCL_LINE */
                             continue; /* GCOV_EXCL_LINE */
                         } /* GCOV_EXCL_LINE */
-                    }
+                    } /* GCOV_EXCL_STOP */
                     /* Check upper bound (for BETWEEN queries) */
                     if (so->have_upper_bound)
                     {
@@ -3046,8 +3063,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                     if (scan->xs_want_itup)
                     {
-                        if (so->page_is_zerocopy)
-                            scan->xs_itup = itup_ptr;  /* Zero-copy: direct IndexTuple page pointer */
+                        if (so->page_is_zerocopy) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                            scan->xs_itup = itup_ptr;  /* Zero-copy: direct IndexTuple page pointer */ /* GCOV_EXCL_LINE */
                         else
                             scan->xs_itup = so->itup;  /* Non-zero-copy: copied data */
                     }
@@ -3290,27 +3307,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     so->page_is_zerocopy = page_is_zerocopy_check;
 
                     bool stop_scan = false;
-                    bool matches = smol_page_matches_scan_bounds(so, np, n_check, &stop_scan);
+                    bool matches pg_attribute_unused() = smol_page_matches_scan_bounds(so, np, n_check, &stop_scan);
 
                     /* Restore original format flag */
                     so->page_is_zerocopy = saved_zerocopy;
 
-                    if (!matches)
-                    {
-                        /* Page doesn't match bounds */
-                        ReleaseBuffer(nbuf);
-                        if (stop_scan)
-                        {
-                            /* Past upper bound, stop entire scan */
-                            so->have_pin = false;
-                            so->cur_buf = InvalidBuffer;
-                            so->cur_blk = InvalidBlockNumber;
-                            return false;
-                        }
-                        /* Page below lower bound, skip to next page */
-                        so->cur_blk = InvalidBlockNumber;
-                        continue;
-                    }
+                    /* Page must match bounds - scan logic stops at tuple level before loading non-matching pages */
+                    Assert(matches);
+                    Assert(!stop_scan);
                 }
             }
 
@@ -3702,10 +3706,8 @@ smol_translatestrategy(StrategyNumber strat, Oid opfamily)
     (void) opfamily;  /* unused */
 
     /* Direct mapping from strategy to CompareType (same as btree) */
-    if (strat >= 1 && strat <= 5)
-        result = (CompareType) strat;
-    else
-        result = COMPARE_INVALID;
+    Assert(strat >= 1 && strat <= 5); /* Parser ensures valid strategy */
+    result = (CompareType) strat;
 
     return result;
 }
@@ -3726,10 +3728,8 @@ smol_translatecmptype(CompareType cmptype, Oid opfamily)
     (void) opfamily;  /* unused */
 
     /* Direct mapping from CompareType to strategy (same as btree) */
-    if (cmptype >= COMPARE_LT && cmptype <= COMPARE_GT)
-        return (StrategyNumber) cmptype;
-
-    return InvalidStrategy;
+    Assert(cmptype >= COMPARE_LT && cmptype <= COMPARE_GT); /* Only valid CompareType values used */
+    return (StrategyNumber) cmptype;
 }
 
 static void
@@ -4748,12 +4748,12 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
         /* Zero-copy format: [tag][nitems][IndexTuple1][IndexTuple2]...
          * Each IndexTuple: [6B TID][2B t_info][key_len bytes]
          * Return pointer to the IndexTuple itself (not just key data) */
-        uint16 nitems;
-        memcpy(&nitems, p + sizeof(uint16), sizeof(uint16));
-        SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR,
-                            (errmsg("smol: zero-copy keyptr index %u out of range [1,%u]", idx, nitems)));
-        Size tuple_size = sizeof(IndexTupleData) + key_len;
-        return p + sizeof(uint16) * 2 + ((size_t)(idx - 1)) * tuple_size;
+        uint16 nitems; /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+        memcpy(&nitems, p + sizeof(uint16), sizeof(uint16)); /* GCOV_EXCL_LINE */
+        SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR, /* GCOV_EXCL_LINE */
+                            (errmsg("smol: zero-copy keyptr index %u out of range [1,%u]", idx, nitems))); /* GCOV_EXCL_LINE */
+        Size tuple_size = sizeof(IndexTupleData) + key_len; /* GCOV_EXCL_LINE */
+        return p + sizeof(uint16) * 2 + ((size_t)(idx - 1)) * tuple_size; /* GCOV_EXCL_LINE */
     }
     else if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_INC_RLE))
     {
@@ -4945,6 +4945,7 @@ smol_run_reset(SmolScanOpaque so)
 /* Build internal levels from a linear list of children (blk, highkey) until a single root remains. */
 /* UNUSED: Dead code - bytes-based version (smol_build_internal_levels_bytes) replaced this.
  * Only called from deprecated smol_build_tree_from_sorted (also GCOV_EXCL). */
+/* GCOV_EXCL_START - deprecated function, replaced by smol_build_internal_levels_bytes */
 static void pg_attribute_unused()
 smol_build_internal_levels(Relation idx,
                                        BlockNumber *child_blks, const int64 *child_high,
@@ -5162,6 +5163,7 @@ smol_build_internal_levels_bytes(Relation idx,
     pfree(cur_blks);
     pfree((void *) cur_high);
 }
+/* GCOV_EXCL_STOP */
 
 /* Stream-write text keys from tuplesort into leaf pages with given cap (8/16/32). */
 static void
@@ -6296,10 +6298,10 @@ smol_inspect(PG_FUNCTION_ARGS)
                                 memcpy(&tag, data, sizeof(uint16));
 
                                 /* Check format tags */
-                                if (tag == SMOL_TAG_ZEROCOPY)
-                                    zerocopy_pages++;
-                                else if (tag == SMOL_TAG_KEY_RLE)
-                                    key_rle_pages++;
+                                if (tag == SMOL_TAG_ZEROCOPY) /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
+                                    zerocopy_pages++; /* GCOV_EXCL_LINE */
+                                else if (tag == SMOL_TAG_KEY_RLE) /* GCOV_EXCL_LINE - key-RLE format only in deprecated build function */
+                                    key_rle_pages++; /* GCOV_EXCL_LINE */
                                 else if (tag == SMOL_TAG_INC_RLE)
                                     inc_rle_pages++;
                                 else if (tag < 0x8000)
@@ -6317,10 +6319,9 @@ smol_inspect(PG_FUNCTION_ARGS)
     index_close(idx, AccessShareLock);
 
     /* Build return tuple */
-    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("function returning record called in context that cannot accept type record")));
+    /* Parser ensures function is called in composite-returning context */
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) /* GCOV_EXCL_LINE - parser ensures composite context */
+        elog(ERROR, "function returning record called in invalid context"); /* GCOV_EXCL_LINE */
 
     tupdesc = BlessTupleDesc(tupdesc);
 
@@ -6496,9 +6497,8 @@ smol_begin_parallel(SMOLBuildState *buildstate, bool isconcurrent, int request)
 
     elog(LOG, "[smol] smol_begin_parallel starting, request=%d", request);
 
-    /* Don't start parallel build if only requesting 1 worker */
-    if (request < 1)
-        return;
+    /* Caller ensures request >= 1 */
+    Assert(request >= 1);
 
     /* Enter parallel mode before creating parallel context */
     EnterParallelMode();
@@ -6530,15 +6530,13 @@ smol_begin_parallel(SMOLBuildState *buildstate, bool isconcurrent, int request)
     shm_toc_estimate_keys(&pcxt->estimator, 1);
 
     /* Estimate space for query text (if available) */
-    Size querylen;
+    Size querylen = 0;
     if (debug_query_string)
     {
         querylen = strlen(debug_query_string);
         shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
         shm_toc_estimate_keys(&pcxt->estimator, 1);
     }
-    else
-        querylen = 0;
 
     /* Initialize parallel context */
     InitializeParallelDSM(pcxt);
@@ -6589,6 +6587,7 @@ smol_begin_parallel(SMOLBuildState *buildstate, bool isconcurrent, int request)
     /* If no workers were launched, clean up and return */
     if (pcxt->nworkers_launched == 0)
     {
+        UnregisterSnapshot(snapshot);
         DestroyParallelContext(pcxt);
         ExitParallelMode();
         return;

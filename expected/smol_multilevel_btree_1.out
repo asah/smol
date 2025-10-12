@@ -44,7 +44,7 @@ SELECT
 FROM smol_inspect('t_multilevel_smol_idx');
  total_pages | leaf_pages | internal_pages | has_multiple_internal_levels 
 -------------+------------+----------------+------------------------------
-         102 |         99 |              3 | f
+         112 |         99 |             13 | t
 (1 row)
 
 -- Test queries that navigate the multi-level tree
