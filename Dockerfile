@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libicu-dev liburing-dev \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
-    locales sudo less jq emacs gcovr vmtouch gdb \
+    locales sudo less jq emacs gcovr vmtouch gdb strace \
   && pip3 install slack_sdk matplotlib --break-system-packages \
   && rm -rf /var/lib/apt/lists/*
 
