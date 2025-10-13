@@ -2,8 +2,7 @@
 -- Tests all error paths in smol_validate() (lines 2555-2636)
 -- WARNING: This test directly modifies system catalogs and must restore them
 SET client_min_messages = warning;
-DROP EXTENSION IF EXISTS smol CASCADE;
-CREATE EXTENSION smol;
+CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Helper function to safely test validation by temporarily corrupting catalog
 CREATE OR REPLACE FUNCTION test_smol_validation() RETURNS void AS $$

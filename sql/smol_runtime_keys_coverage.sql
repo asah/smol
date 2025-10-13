@@ -1,10 +1,12 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test runtime keys (non-native predicates) for coverage
 -- Targets lines 2741-2742 (backward), 2770-2780 (forward ultra-fast), 2991-2994 (forward)
 -- Runtime keys are needed for multi-column indexes with range predicates on the 2nd column
 -- SMOL handles attribute 1 (leading key) natively, but attribute 2 range predicates need rechecking
 
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;

@@ -1,7 +1,7 @@
 -- Comprehensive test for remaining easy coverage targets
 SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 DROP EXTENSION IF EXISTS smol CASCADE;
-CREATE EXTENSION smol;
 
 -- TEST 1: Cost estimation without leading key (line 2697)
 DROP TABLE IF EXISTS t_nokey CASCADE;

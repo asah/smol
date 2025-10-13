@@ -46,7 +46,7 @@ CREATE INDEX t_large_idx ON t_large USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_large_idx');
  total_pages | leaf_pages 
 -------------+------------
-          53 |         50
+          77 |         74
 (1 row)
 
 -- Query to use the multi-level index

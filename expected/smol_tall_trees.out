@@ -122,6 +122,7 @@ FROM generate_series(1, 15000) i;
 SET client_min_messages = notice;
 CREATE INDEX t_large_inc_rle_smol ON t_large_inc_rle USING smol(k) INCLUDE (v1, v2);
 SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 SELECT count(*) FROM t_large_inc_rle WHERE k = 1;
  count 
 -------

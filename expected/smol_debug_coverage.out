@@ -1,7 +1,5 @@
 -- Test debug logging and additional coverage paths
 -- Covers: debug logging, text upper bounds, backward scans with upper-bound-only
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- ============================================================================
 -- PART 1: Debug Logging Coverage (lines 1809-1820 and others)
 -- ============================================================================

@@ -1,10 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test RLE with 65534 items per page (maximum allowed)
 -- This tests the uint16 boundary handling in scan code
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- Test 1: Create RLE page with exactly 65534 items
 DROP TABLE IF EXISTS t_rle_65k CASCADE;
-NOTICE:  table "t_rle_65k" does not exist, skipping
 CREATE UNLOGGED TABLE t_rle_65k(k int8);
 -- Insert data that will create runs totaling 65534 items
 -- 65534 items = 655 runs of 100 items + 1 run of 34 items
@@ -68,7 +67,6 @@ SELECT k FROM t_rle_65k ORDER BY k DESC LIMIT 5;
 DROP TABLE t_rle_65k CASCADE;
 -- Test 2: Create data that would exceed 65534 if not limited
 DROP TABLE IF EXISTS t_rle_overflow CASCADE;
-NOTICE:  table "t_rle_overflow" does not exist, skipping
 CREATE UNLOGGED TABLE t_rle_overflow(k int4);
 -- Insert 100K items that compress into very few runs
 -- This should create multiple pages, each with max 65534 items
@@ -112,7 +110,6 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_index_scan_size = 0;
 DROP TABLE IF EXISTS t_unbounded_parallel CASCADE;
-NOTICE:  table "t_unbounded_parallel" does not exist, skipping
 CREATE UNLOGGED TABLE t_unbounded_parallel(k int4, v int4);
 INSERT INTO t_unbounded_parallel
 SELECT i, i*2

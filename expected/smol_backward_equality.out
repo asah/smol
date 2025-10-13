@@ -1,10 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test backward scan with equality bound to hit have_k1_eq termination path
 -- Targets lines 1931-1932: have_k1_eq with c < 0 termination
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- Create table with duplicates
 DROP TABLE IF EXISTS t_eq_backward CASCADE;
-NOTICE:  table "t_eq_backward" does not exist, skipping
 CREATE UNLOGGED TABLE t_eq_backward (k int4, v int4);
 -- Insert data: many rows with k=500, and other values
 INSERT INTO t_eq_backward
@@ -24,7 +23,6 @@ SELECT k, v FROM t_eq_backward WHERE k = 500 ORDER BY k DESC LIMIT 20;
 ERROR:  smol supports index-only scans only
 -- Test with text key and varwidth to hit line 1982 (has_varwidth path)
 DROP TABLE IF EXISTS t_eq_text_backward CASCADE;
-NOTICE:  table "t_eq_text_backward" does not exist, skipping
 CREATE UNLOGGED TABLE t_eq_text_backward (k text COLLATE "C", v int4);
 INSERT INTO t_eq_text_backward
 SELECT
@@ -38,7 +36,6 @@ SELECT k, v FROM t_eq_text_backward WHERE k = 'key_500' ORDER BY k DESC LIMIT 20
 ERROR:  smol supports index-only scans only
 -- Test with int8 key to hit line 1988 (key_len == 8)
 DROP TABLE IF EXISTS t_eq_int8_backward CASCADE;
-NOTICE:  table "t_eq_int8_backward" does not exist, skipping
 CREATE UNLOGGED TABLE t_eq_int8_backward (k int8);
 INSERT INTO t_eq_int8_backward
 SELECT

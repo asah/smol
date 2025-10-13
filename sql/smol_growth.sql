@@ -1,6 +1,8 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test growth beyond threshold (line 4397 - linear growth path)
 -- Uses smol.growth_threshold_test to reduce the threshold for testing
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Set threshold to 16384 (16K) instead of 8M for testing
 -- Growth: 1024 -> 2048 -> 4096 -> 8192 -> 16384 -> 18432 (+2M but we'll use 20000)

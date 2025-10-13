@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test parallel scans with two-column indexes using UUID and DATE (non-INT types)
 -- This targets lines 1710, 1712, 2265, 2267 for non-INT type parallel bounds
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_indexscan = off;

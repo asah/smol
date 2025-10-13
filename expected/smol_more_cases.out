@@ -4,7 +4,6 @@ SET client_min_messages = warning;
 \pset tuples_only on
 \pset footer off
 \pset pager off
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Case 1: single-key backward equality run
 DROP TABLE IF EXISTS bkeq CASCADE;
 CREATE UNLOGGED TABLE bkeq(a int2);

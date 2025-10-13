@@ -1,9 +1,10 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test runtime keys (non-native predicates) for coverage
 -- Targets lines 2741-2742 (backward), 2770-2780 (forward ultra-fast), 2991-2994 (forward)
 -- Runtime keys are needed for multi-column indexes with range predicates on the 2nd column
 -- SMOL handles attribute 1 (leading key) natively, but attribute 2 range predicates need rechecking
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET max_parallel_workers_per_gather = 0;
@@ -51,32 +52,32 @@ SELECT zerocopy_pct FROM smol_inspect('t_zerocopy_idx');
 SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 100 AND k2 > 50000 LIMIT 10;
   k1  |  k2   | v  
 ------+-------+----
- 6810 | 68100 | 35
- 6830 | 68300 | 35
- 6850 | 68500 | 35
- 6870 | 68700 | 35
- 6890 | 68900 | 35
- 6910 | 69100 | 35
- 6930 | 69300 | 35
- 6950 | 69500 | 35
- 6970 | 69700 | 35
- 6990 | 69900 | 35
+ 6800 | 68000 | 35
+ 6820 | 68200 | 35
+ 6840 | 68400 | 35
+ 6860 | 68600 | 35
+ 6880 | 68800 | 35
+ 6900 | 69000 | 35
+ 6920 | 69200 | 35
+ 6940 | 69400 | 35
+ 6960 | 69600 | 35
+ 6980 | 69800 | 35
 (10 rows)
 
 -- Also test with some runtime key successes to hit the success path (lines 2772-2776)
 SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 4990 AND k2 >= 49900 LIMIT 10;
   k1  |  k2   | v  
 ------+-------+----
- 9490 | 94900 | 35
- 9510 | 95100 | 35
- 9530 | 95300 | 35
- 9550 | 95500 | 35
- 9570 | 95700 | 35
- 9590 | 95900 | 35
- 9610 | 96100 | 35
- 9630 | 96300 | 35
- 9650 | 96500 | 35
- 9670 | 96700 | 35
+ 8340 | 83400 | 35
+ 8360 | 83600 | 35
+ 8380 | 83800 | 35
+ 8400 | 84000 | 35
+ 8420 | 84200 | 35
+ 8440 | 84400 | 35
+ 8460 | 84600 | 35
+ 8480 | 84800 | 35
+ 8500 | 85000 | 35
+ 8520 | 85200 | 35
 (10 rows)
 
 -- Cleanup

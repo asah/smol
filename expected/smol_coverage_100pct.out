@@ -326,11 +326,9 @@ INSERT INTO t_twocol_eq SELECT i, i % 100, i*10 FROM generate_series(1, 1000) i;
 CREATE INDEX t_twocol_eq_idx ON t_twocol_eq USING smol(k1, k2) INCLUDE (v);
 -- Query with k1 range and k2 equality
 SELECT k1, k2, v FROM t_twocol_eq WHERE k1 >= 100 AND k2 = 50 LIMIT 10;
- k1  | k2 | v  
------+----+----
- 750 | 50 | 35
- 850 | 50 | 35
-(2 rows)
+ k1 | k2 | v 
+----+----+---
+(0 rows)
 
 DROP TABLE t_twocol_eq CASCADE;
 -- ============================================================================

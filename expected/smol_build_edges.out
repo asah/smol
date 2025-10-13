@@ -1,13 +1,12 @@
--- Test build path edge cases
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
+-- Test build path edge cases
 -- ============================================================================
 -- Test 1: Empty index (line 3099: nkeys == 0 early return)
 -- Create empty index with INCLUDE columns to trigger smol_build_tree1_inc_from_sorted
 -- Also test text variant for line 3310
 -- ============================================================================
 DROP TABLE IF EXISTS t_empty_build CASCADE;
-NOTICE:  table "t_empty_build" does not exist, skipping
 CREATE UNLOGGED TABLE t_empty_build (k int4, v int4, t text);
 -- Don't insert any data - this will trigger the nkeys == 0 path during build
 CREATE INDEX idx_empty_build_int ON t_empty_build USING smol(k) INCLUDE (v);
@@ -31,7 +30,6 @@ SELECT count(*) FROM t_empty_build WHERE t = 'x';
 -- This creates many internal pages that exceed the conservative cap_next allocation
 -- ============================================================================
 DROP TABLE IF EXISTS t_wide_tree CASCADE;
-NOTICE:  table "t_wide_tree" does not exist, skipping
 CREATE UNLOGGED TABLE t_wide_tree (k int4);
 -- Strategy: Use fanout=1 to create one internal page per child
 -- With 10 leaves: cap_next = (10/2)+2 = 7, but we create 10 internal pages

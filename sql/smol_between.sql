@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test BETWEEN queries (upper bound coverage)
 -- This exercises the have_upper_bound code paths that aren't covered by existing tests
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Test 1: Single-column BETWEEN on int4
 DROP TABLE IF EXISTS t_between CASCADE;

@@ -1,8 +1,10 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test RLE compression for all supported datatypes
 -- This test verifies that RLE compression works correctly across
 -- different data types and that it provides actual space savings
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- ============================================================================
 -- Test 1: int2 RLE

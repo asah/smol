@@ -1,13 +1,12 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test TEXT32 indexes spanning multiple leaf pages
 -- Targets uncovered lines 4099-4103 in smol_build_text_stream_from_tuplesort
 -- (rightlink update for multi-page TEXT indexes)
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- Create table with enough TEXT data to span multiple leaf pages
 -- With key_len=16 and ~8KB pages, we fit ~500 keys per page
 -- Use 10000 rows to ensure many pages and trigger rightlink updates
 DROP TABLE IF EXISTS t_text_multipage CASCADE;
-NOTICE:  table "t_text_multipage" does not exist, skipping
 CREATE UNLOGGED TABLE t_text_multipage (k text COLLATE "C");
 -- Insert 10000 text keys with moderate length (10 bytes)
 -- This will use cap=16, fitting ~500 keys per page = ~20 leaf pages

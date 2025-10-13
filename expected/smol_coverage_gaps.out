@@ -1,7 +1,7 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test to cover remaining coverage gaps
 -- Covers: Text RLE, UUID RLE, RLE INCLUDE caching
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- Test 1: Text RLE with heavy duplicates (covers lines 5307-5342)
 CREATE UNLOGGED TABLE test_text_rle(k text COLLATE "C", v int);
 -- Insert text with heavy duplicates to trigger RLE
@@ -132,9 +132,14 @@ ANALYZE test_text32_back;
 -- Index-only backward scan to trigger debug logging
 -- Must use WHERE condition that benefits from index
 SELECT k, inc FROM test_text32_back WHERE k >= 'key010' AND k < 'key050' ORDER BY k DESC LIMIT 5;
- k | inc 
----+-----
-(0 rows)
+   k    |  inc   
+--------+--------
+ key049 | val949
+ key049 | val849
+ key049 | val749
+ key049 | val649
+ key049 | val549
+(5 rows)
 
 SET enable_seqscan = true;
 SET smol.debug_log = false;

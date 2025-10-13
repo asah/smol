@@ -1400,9 +1400,14 @@ SELECT COUNT(*) FROM t_debug_log WHERE k > 'key500';
 BEGIN;
 DECLARE c_back CURSOR FOR SELECT k FROM t_debug_log WHERE k < 'key200' ORDER BY k DESC;
 FETCH 5 FROM c_back;
- k 
----
-(0 rows)
+   k    
+--------
+ key20
+ key2
+ key199
+ key198
+ key197
+(5 rows)
 
 CLOSE c_back;
 COMMIT;

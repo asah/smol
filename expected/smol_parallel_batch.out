@@ -1,10 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test parallel batch claiming (smol.parallel_claim_batch > 1)
 -- This exercises the batch claiming loops that reduce atomic contention
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 -- Test 1: Single-column parallel scan with batch claiming
 DROP TABLE IF EXISTS t_batch1 CASCADE;
-NOTICE:  table "t_batch1" does not exist, skipping
 CREATE UNLOGGED TABLE t_batch1 (a int4);
 -- Insert enough data to create multiple leaf pages
 INSERT INTO t_batch1 SELECT i FROM generate_series(1, 50000) i;
@@ -39,7 +38,6 @@ SELECT count(*) FROM t_batch1 WHERE a > 10000;
 
 -- Test 2: Two-column parallel scan with batch claiming
 DROP TABLE IF EXISTS t_batch2 CASCADE;
-NOTICE:  table "t_batch2" does not exist, skipping
 CREATE UNLOGGED TABLE t_batch2 (a int4, b int4);
 INSERT INTO t_batch2 SELECT i % 1000, i FROM generate_series(1, 50000) i;
 CREATE INDEX idx_batch2 ON t_batch2 USING smol(a, b);
@@ -59,7 +57,6 @@ SELECT sum(b) FROM t_batch2 WHERE a > 100;
 
 -- Test 3: Batch claiming with selective query (lower bound)
 DROP TABLE IF EXISTS t_batch3 CASCADE;
-NOTICE:  table "t_batch3" does not exist, skipping
 CREATE UNLOGGED TABLE t_batch3 (a int4);
 INSERT INTO t_batch3 SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX idx_batch3 ON t_batch3 USING smol(a);
@@ -79,7 +76,6 @@ SELECT sum(a) FROM t_batch3 WHERE a >= 75000;
 
 -- Test 4: Batch claiming with INT2
 DROP TABLE IF EXISTS t_batch_int2 CASCADE;
-NOTICE:  table "t_batch_int2" does not exist, skipping
 CREATE UNLOGGED TABLE t_batch_int2 (a int2);
 INSERT INTO t_batch_int2 SELECT (i % 30000)::int2 FROM generate_series(1, 100000) i;
 CREATE INDEX idx_batch_int2 ON t_batch_int2 USING smol(a);
@@ -92,7 +88,6 @@ SELECT count(*) FROM t_batch_int2 WHERE a > 1000;
 
 -- Test 5: Batch claiming with INT8
 DROP TABLE IF EXISTS t_batch_int8 CASCADE;
-NOTICE:  table "t_batch_int8" does not exist, skipping
 CREATE UNLOGGED TABLE t_batch_int8 (a int8);
 INSERT INTO t_batch_int8 SELECT i::int8 FROM generate_series(1, 80000) i;
 CREATE INDEX idx_batch_int8 ON t_batch_int8 USING smol(a);
@@ -106,7 +101,6 @@ SELECT count(*) FROM t_batch_int8 WHERE a >= 40000;
 -- Test 6: High contention scenario (batch_size=1 vs batch_size>1)
 -- First with batch_size=1 (baseline)
 DROP TABLE IF EXISTS t_contend CASCADE;
-NOTICE:  table "t_contend" does not exist, skipping
 CREATE UNLOGGED TABLE t_contend (a int4, b int4);
 INSERT INTO t_contend SELECT i, i*2 FROM generate_series(1, 100000) i;
 CREATE INDEX idx_contend ON t_contend USING smol(a);
@@ -137,7 +131,6 @@ SELECT c, s FROM batch1;
 
 -- Test 7: Edge case - batch size larger than number of leaves
 DROP TABLE IF EXISTS t_small CASCADE;
-NOTICE:  table "t_small" does not exist, skipping
 CREATE UNLOGGED TABLE t_small (a int4);
 INSERT INTO t_small SELECT i FROM generate_series(1, 100) i;
 CREATE INDEX idx_small ON t_small USING smol(a);
@@ -154,7 +147,6 @@ SET smol.parallel_claim_batch = 1;
 -- Test 8: CAS failure retry path (line 2132)
 -- Force atomic CAS to fail every 2nd call to test retry logic
 DROP TABLE IF EXISTS t_cas_fail CASCADE;
-NOTICE:  table "t_cas_fail" does not exist, skipping
 CREATE UNLOGGED TABLE t_cas_fail (a int4);
 INSERT INTO t_cas_fail SELECT i FROM generate_series(1, 50000) i;
 CREATE INDEX idx_cas_fail ON t_cas_fail USING smol(a);
@@ -184,7 +176,6 @@ SET smol.cas_fail_every = 0;
 -- Test 9: Prefetch depth > 1 (line 2087-2094)
 -- Test prefetching multiple blocks ahead in parallel scans
 DROP TABLE IF EXISTS t_prefetch CASCADE;
-NOTICE:  table "t_prefetch" does not exist, skipping
 CREATE UNLOGGED TABLE t_prefetch (a int4);
 INSERT INTO t_prefetch SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX idx_prefetch ON t_prefetch USING smol(a);
@@ -216,12 +207,30 @@ WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
  count  
 --------
  100000
 (1 row)
 
 SELECT sum(a) FROM t_prefetch WHERE a > 50000;
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
+WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested
 WARNING:  smol: prefetch_depth > 1 not fully tested

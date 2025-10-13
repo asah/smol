@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test to cover remaining coverage gaps
 -- Covers: Text RLE, UUID RLE, RLE INCLUDE caching
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Test 1: Text RLE with heavy duplicates (covers lines 5307-5342)
 CREATE UNLOGGED TABLE test_text_rle(k text COLLATE "C", v int);

@@ -30,15 +30,15 @@ FROM (VALUES (1), (2), (3), (4), (5)) v(id);
                                          QUERY PLAN                                         
 --------------------------------------------------------------------------------------------
  Values Scan on "*VALUES*" (actual rows=5.00 loops=1)
-   Buffers: shared hit=259
+   Buffers: shared hit=375
    SubPlan 1
      ->  Aggregate (actual rows=1.00 loops=5)
-           Buffers: shared hit=259
+           Buffers: shared hit=375
            ->  Index Only Scan using t_inner_smol on t_inner (actual rows=97000.00 loops=5)
                  Index Cond: (k > ("*VALUES*".column1 * 1000))
                  Heap Fetches: 0
                  Index Searches: 0
-                 Buffers: shared hit=259
+                 Buffers: shared hit=375
  Planning:
    Buffers: shared hit=19
 (12 rows)

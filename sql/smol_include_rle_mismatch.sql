@@ -1,5 +1,7 @@
--- Test Include-RLE run comparison mismatch (line 3457)
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test Include-RLE run comparison mismatch (line 3457)
 
 DROP TABLE IF EXISTS t_rle_mismatch CASCADE;
 CREATE UNLOGGED TABLE t_rle_mismatch (k text, v int4);

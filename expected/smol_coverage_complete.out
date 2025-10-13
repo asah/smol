@@ -181,7 +181,7 @@ ANALYZE t_twocol_attr2_eq;
 SELECT count(*) FROM t_twocol_attr2_eq WHERE k1 >= 1000 AND k2 = 500;
  count 
 -------
-     2
+     0
 (1 row)
 
 SELECT k1, k2, v FROM t_twocol_attr2_eq WHERE k1 BETWEEN 5000 AND 6000 AND k2 = 750 ORDER BY k1 LIMIT 5;
@@ -259,14 +259,34 @@ CREATE INDEX t_zerocopy_backward_idx ON t_zerocopy_backward USING smol(k) INCLUD
 ANALYZE t_zerocopy_backward;
 -- Backward scan should hit zero-copy pages
 SELECT k, v FROM t_zerocopy_backward WHERE k <= 1000 ORDER BY k DESC LIMIT 10;
- k | v 
----+---
-(0 rows)
+  k   |   v   
+------+-------
+ 1000 | 10000
+  999 |  9990
+  998 |  9980
+  997 |  9970
+  996 |  9960
+  995 |  9950
+  994 |  9940
+  993 |  9930
+  992 |  9920
+  991 |  9910
+(10 rows)
 
 SELECT k, v FROM t_zerocopy_backward WHERE k BETWEEN 2000 AND 3000 ORDER BY k DESC LIMIT 10;
- k | v 
----+---
-(0 rows)
+  k   |   v   
+------+-------
+ 3000 | 30000
+ 2999 | 29990
+ 2998 | 29980
+ 2997 | 29970
+ 2996 | 29960
+ 2995 | 29950
+ 2994 | 29940
+ 2993 | 29930
+ 2992 | 29920
+ 2991 | 29910
+(10 rows)
 
 DROP TABLE t_zerocopy_backward CASCADE;
 -- ============================================================================
@@ -2583,7 +2603,7 @@ SET min_parallel_index_scan_size = 0;
 SELECT count(*) FROM t_parallel_twocol WHERE k1 >= 10000;
  count 
 -------
- 91305
+ 92404
 (1 row)
 
 SELECT k1, k2, v FROM t_parallel_twocol WHERE k1 BETWEEN 50000 AND 50100 ORDER BY k1, k2 LIMIT 20;

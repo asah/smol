@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test backward scans with varwidth keys and various key sizes
 -- Targets uncovered lines in backward scan paths
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- ============================================================================
 -- Test 1: Backward scan with TEXT32 (varwidth) key

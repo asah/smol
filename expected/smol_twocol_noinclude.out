@@ -1,7 +1,6 @@
 -- Test two-column indexes WITHOUT INCLUDE columns
 -- Covers smol_build_tree_from_sorted and two-column scan paths
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Test 1: Two int4 columns (most common case)
 DROP TABLE IF EXISTS t_twocol_int4 CASCADE;
 CREATE UNLOGGED TABLE t_twocol_int4 (a int4, b int4, c text);

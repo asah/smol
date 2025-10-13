@@ -1,8 +1,7 @@
--- Test Include-RLE run comparison mismatch (line 3457)
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
+-- Test Include-RLE run comparison mismatch (line 3457)
 DROP TABLE IF EXISTS t_rle_mismatch CASCADE;
-NOTICE:  table "t_rle_mismatch" does not exist, skipping
 CREATE UNLOGGED TABLE t_rle_mismatch (k text, v int4);
 -- Insert rows with same key but different include values
 -- This should trigger the include mismatch check in RLE encoding
@@ -27,7 +26,6 @@ DROP TABLE t_rle_mismatch CASCADE;
 -- This specifically targets the inner loop that checks include value mismatches
 -- Need MANY duplicate keys to trigger Include-RLE format (not RLE format)
 DROP TABLE IF EXISTS t_multi_inc CASCADE;
-NOTICE:  table "t_multi_inc" does not exist, skipping
 CREATE UNLOGGED TABLE t_multi_inc (k text, v1 int4, v2 int4);
 -- Insert rows where:
 -- - Key is same (triggers RLE)

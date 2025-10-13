@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test rescan with buffer pin cleanup
 -- Targets lines 1263-1268: ReleaseBuffer during rescan
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_indexscan = off;

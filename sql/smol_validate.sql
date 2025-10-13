@@ -1,8 +1,10 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test smol_validate() function (line 2433)
 -- This function is called by PostgreSQL during CREATE OPERATOR CLASS
 -- It gets executed when the extension is created/loaded
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Query all smol operator classes (validates they were created successfully)
 SELECT opcname, opfmethod.amname

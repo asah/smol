@@ -1,11 +1,11 @@
 -- Comprehensive duplicate-run coverage for single-key SMOL with INCLUDE
 -- Tests both small groups and large multi-leaf duplicate runs
 SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 \pset format unaligned
 \pset tuples_only on
 \pset footer off
 \pset pager off
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Test 1: Small duplicate groups (10 groups of 5 duplicates each)
 DROP TABLE IF EXISTS d CASCADE;
 CREATE UNLOGGED TABLE d(a int2, x int4);

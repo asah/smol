@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test rare edge cases for additional coverage
 -- Targets: rescan paths, buffer management, parallel edge cases
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_indexscan = off;

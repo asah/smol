@@ -1,8 +1,10 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test TEXT32 indexes spanning multiple leaf pages
 -- Targets uncovered lines 4099-4103 in smol_build_text_stream_from_tuplesort
 -- (rightlink update for multi-page TEXT indexes)
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Create table with enough TEXT data to span multiple leaf pages
 -- With key_len=16 and ~8KB pages, we fit ~500 keys per page

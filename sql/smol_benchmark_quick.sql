@@ -1,10 +1,12 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Quick benchmark suite comparing SMOL vs BTREE for common real-world scenarios
 -- This test provides performance assertions while maintaining deterministic output
 --
 -- Performance benchmarks are optional and disabled by default (can be flaky in CI).
 -- To enable: SMOL_ENABLE_PERF_TESTS=1 make installcheck REGRESS=smol_benchmark_quick
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;

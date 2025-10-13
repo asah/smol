@@ -1,7 +1,7 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test rare edge cases for additional coverage
 -- Targets: rescan paths, buffer management, parallel edge cases
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 SET enable_seqscan = off;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
@@ -9,7 +9,6 @@ SET enable_bitmapscan = off;
 -- PART 1: Rescan with Pinned Buffer (lines 1257-1259)
 -- ============================================================================
 DROP TABLE IF EXISTS t_rescan CASCADE;
-NOTICE:  table "t_rescan" does not exist, skipping
 CREATE UNLOGGED TABLE t_rescan (a int4);
 INSERT INTO t_rescan SELECT i FROM generate_series(1, 1000) i;
 CREATE INDEX idx_rescan ON t_rescan USING smol(a);
@@ -59,7 +58,6 @@ SET parallel_tuple_cost = 0;
 SET min_parallel_index_scan_size = 0;
 -- INT8 without lower bound (triggers else lb = PG_INT64_MIN)
 DROP TABLE IF EXISTS t_para_int8_nobound CASCADE;
-NOTICE:  table "t_para_int8_nobound" does not exist, skipping
 CREATE UNLOGGED TABLE t_para_int8_nobound (a int8);
 INSERT INTO t_para_int8_nobound SELECT i::int8 FROM generate_series(1, 50000) i;
 CREATE INDEX idx_para_int8_nobound ON t_para_int8_nobound USING smol(a);
@@ -72,7 +70,6 @@ SELECT count(*) FROM t_para_int8_nobound;
 
 -- INT2 without lower bound
 DROP TABLE IF EXISTS t_para_int2_nobound CASCADE;
-NOTICE:  table "t_para_int2_nobound" does not exist, skipping
 CREATE UNLOGGED TABLE t_para_int2_nobound (a int2);
 INSERT INTO t_para_int2_nobound SELECT (i % 30000)::int2 FROM generate_series(1, 50000) i;
 CREATE INDEX idx_para_int2_nobound ON t_para_int2_nobound USING smol(a);
@@ -88,7 +85,6 @@ SELECT count(*) FROM t_para_int2_nobound;
 -- This happens when scanning continues after releasing a buffer
 -- Typically in the main scan loop when moving between pages
 DROP TABLE IF EXISTS t_multipage CASCADE;
-NOTICE:  table "t_multipage" does not exist, skipping
 CREATE UNLOGGED TABLE t_multipage (a int4);
 INSERT INTO t_multipage SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX idx_multipage ON t_multipage USING smol(a);
@@ -105,7 +101,6 @@ SELECT CASE WHEN count(*) BETWEEN 48000 AND 50100 THEN 49000 ELSE count(*) END a
 -- This is the inner loop of run detection that scans backward
 -- Need duplicate keys where the run spans boundaries
 DROP TABLE IF EXISTS t_run_boundary CASCADE;
-NOTICE:  table "t_run_boundary" does not exist, skipping
 CREATE UNLOGGED TABLE t_run_boundary (a int4);
 -- Insert duplicates to create runs
 INSERT INTO t_run_boundary SELECT (i % 100) FROM generate_series(1, 10000) i ORDER BY 1;
@@ -156,7 +151,6 @@ SELECT a FROM t_run_boundary WHERE a BETWEEN 40 AND 45 ORDER BY a DESC LIMIT 20;
 -- ============================================================================
 -- INT8 backward scan (need to force backward direction)
 DROP TABLE IF EXISTS t_int8_back_real CASCADE;
-NOTICE:  table "t_int8_back_real" does not exist, skipping
 CREATE UNLOGGED TABLE t_int8_back_real (a int8);
 INSERT INTO t_int8_back_real SELECT i::int8 FROM generate_series(1, 1000) i;
 CREATE INDEX idx_int8_back_real ON t_int8_back_real USING smol(a);
@@ -173,7 +167,6 @@ SELECT a FROM t_int8_back_real WHERE a BETWEEN 100 AND 500 ORDER BY a DESC LIMIT
 
 -- UUID backward scan
 DROP TABLE IF EXISTS t_uuid_back_real CASCADE;
-NOTICE:  table "t_uuid_back_real" does not exist, skipping
 CREATE UNLOGGED TABLE t_uuid_back_real (u uuid);
 INSERT INTO t_uuid_back_real
 SELECT md5(i::text)::uuid FROM generate_series(1, 1000) i;
@@ -208,7 +201,6 @@ SELECT u FROM t_uuid_back_real WHERE u > '50000000-0000-0000-0000-000000000000':
 -- PART 7: Text Backward Scan (line 1802 - varlena emission)
 -- ============================================================================
 DROP TABLE IF EXISTS t_text_back_real CASCADE;
-NOTICE:  table "t_text_back_real" does not exist, skipping
 CREATE UNLOGGED TABLE t_text_back_real (s text COLLATE "C");
 INSERT INTO t_text_back_real SELECT 'text_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
 CREATE INDEX idx_text_back_real ON t_text_back_real USING smol(s);
@@ -234,7 +226,6 @@ SELECT s FROM t_text_back_real WHERE s BETWEEN 'text_000100' AND 'text_000500' O
 -- Set prefetch depth to enable prefetching
 SET smol.prefetch_depth = 3;
 DROP TABLE IF EXISTS t_prefetch CASCADE;
-NOTICE:  table "t_prefetch" does not exist, skipping
 CREATE UNLOGGED TABLE t_prefetch (a int4);
 INSERT INTO t_prefetch SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX idx_prefetch ON t_prefetch USING smol(a);
@@ -252,7 +243,6 @@ SET smol.prefetch_depth = 1;
 -- ============================================================================
 -- Backward scan with upper bound checking in the loop
 DROP TABLE IF EXISTS t_upper_back CASCADE;
-NOTICE:  table "t_upper_back" does not exist, skipping
 CREATE UNLOGGED TABLE t_upper_back (a int4);
 INSERT INTO t_upper_back SELECT i FROM generate_series(1, 10000) i;
 CREATE INDEX idx_upper_back ON t_upper_back USING smol(a);
@@ -276,7 +266,6 @@ SELECT a FROM t_upper_back WHERE a BETWEEN 5000 AND 7000 ORDER BY a DESC LIMIT 1
 -- PART 10: INCLUDE Column Edge Cases (line 1959)
 -- ============================================================================
 DROP TABLE IF EXISTS t_inc_edge CASCADE;
-NOTICE:  table "t_inc_edge" does not exist, skipping
 CREATE UNLOGGED TABLE t_inc_edge (a int4, b int8, c uuid);
 INSERT INTO t_inc_edge SELECT i, i::int8, md5(i::text)::uuid FROM generate_series(1, 1000) i;
 CREATE INDEX idx_inc_edge ON t_inc_edge USING smol(a) INCLUDE (b, c);
@@ -292,7 +281,6 @@ SELECT count(*), min(a), max(a), min(b), max(b) FROM t_inc_edge WHERE a BETWEEN 
 -- ============================================================================
 -- This is used for non-INT types with upper bounds
 DROP TABLE IF EXISTS t_generic_upper CASCADE;
-NOTICE:  table "t_generic_upper" does not exist, skipping
 CREATE UNLOGGED TABLE t_generic_upper (s text COLLATE "C");
 INSERT INTO t_generic_upper SELECT 'key_' || lpad(i::text, 5, '0') FROM generate_series(1, 5000) i;
 CREATE INDEX idx_generic_upper ON t_generic_upper USING smol(s);

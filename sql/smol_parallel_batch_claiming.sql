@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test to cover parallel batch claiming loops (lines 2638-2643)
 -- Requires two-column index, parallel scan, claim_batch > 1, and bounds
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_indexscan = off;

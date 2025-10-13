@@ -4,7 +4,6 @@ SET client_min_messages = warning;
 \pset tuples_only on
 \pset footer off
 \pset pager off
-CREATE EXTENSION IF NOT EXISTS smol;
 DROP TABLE IF EXISTS d CASCADE;
 CREATE UNLOGGED TABLE d(a int2, x int4);
 -- Create 10 groups of 5 duplicates each: a in [1..10], each repeated 5 times

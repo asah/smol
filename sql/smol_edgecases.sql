@@ -1,10 +1,12 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- SMOL edge-case correctness checks (kept separate from REGRESS)
 -- Run manually: psql -f sql/smol_edgecases.sql
 -- All tests are small and fast; they exercise boundaries, duplicates,
 -- page chains, backward scans, rescans, and two-column equality filters.
 
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- 1) Empty and single-leaf trees (compare vs BTREE)
 DROP TABLE IF EXISTS e1 CASCADE; CREATE UNLOGGED TABLE e1(a int);

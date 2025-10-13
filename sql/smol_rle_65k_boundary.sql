@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test RLE with 65534 items per page (maximum allowed)
 -- This tests the uint16 boundary handling in scan code
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Test 1: Create RLE page with exactly 65534 items
 DROP TABLE IF EXISTS t_rle_65k CASCADE;

@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test two-column index page advancement with bounds
 -- Covers lines 3677-3691: two-column page loading with binary search for bounds
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Enable profiling to cover prof_pages++ at line 2946
 SET smol.profile = on;

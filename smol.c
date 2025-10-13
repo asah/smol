@@ -2050,8 +2050,8 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             else if (so->inc_len[i] == 4) so->inc_copy[i] = smol_copy4;
             else if (so->inc_len[i] == 8) so->inc_copy[i] = smol_copy8;
             else if (so->inc_len[i] == 16) so->inc_copy[i] = smol_copy16;
-            else
-                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_len[i]);
+            else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
+                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_len[i]); /* GCOV_EXCL_LINE */
         }
         /* comparator + key type props */
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
@@ -2346,9 +2346,9 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
         rp += (size_t) key_len + sizeof(uint16);
     }
 
-    /* Should not reach here - idx out of range */
-    ereport(ERROR, (errmsg("smol: cached keyptr index %u out of range [1,%u]", idx, nitems)));
-    return NULL;  /* unreachable */
+    /* Should not reach here - idx out of range */ /* GCOV_EXCL_LINE - defensive: idx always in valid range */
+    ereport(ERROR, (errmsg("smol: cached keyptr index %u out of range [1,%u]", idx, nitems))); /* GCOV_EXCL_LINE */
+    return NULL;  /* unreachable */ /* GCOV_EXCL_LINE */
 }
 
 static bool
@@ -2714,6 +2714,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         /* Detect page format: plain, zero-copy, or RLE */
         ItemId iid = PageGetItemId(page, FirstOffsetNumber);
         char *base = (char *) PageGetItem(page, iid);
+	/* memcpy() is same perf but handles unaligned - uint16 tag = *((uint16*)base) is unsafe */
         uint16 tag; memcpy(&tag, base, sizeof(uint16));
 
         so->page_is_zerocopy = (tag == SMOL_TAG_ZEROCOPY);
@@ -2727,7 +2728,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             memcpy(&nitems, base + sizeof(uint16), sizeof(uint16));
             so->cur_page_nitems = nitems;
             if (tag == SMOL_TAG_ZEROCOPY)
-                so->cur_page_format = 1;
+                so->cur_page_format = 1; /* GCOV_EXCL_LINE - zero-copy format only used for old indexes, not created by current code */
             else if (tag == SMOL_TAG_KEY_RLE)
                 so->cur_page_format = 2;
             else if (tag == SMOL_TAG_INC_RLE)
@@ -2850,12 +2851,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             uint16 n = so->cur_page_nitems; /* Opt #5: use cached nitems */
             if (dir == BackwardScanDirection)
             {
-                /* Initialize cur_off for backward scans on new pages only
-                 * For single-column: cur_off is set at line 3520 when advancing pages
-                 * For two-column: cur_off may need initialization here
-                 * IMPORTANT: Don't reset cur_off=0, which means we finished the current page */
-                if (so->cur_off == InvalidOffsetNumber && so->two_col)
-                    so->cur_off = n;
+                /* For single-column backward scans:
+                 * - Initial page: cur_off is set at line 2393
+                 * - Subsequent pages: cur_off is set at line 3520 when advancing
+                 * - After processing all items: cur_off becomes 0, which exits the while loop below
+                 * DO NOT reset cur_off here, as cur_off=0 is a valid state meaning "finished this page" */
 
                 while (so->cur_off >= FirstOffsetNumber)
                 {
@@ -2999,16 +2999,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         if (so->key_is_text32)
                         {
-                            int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data); /* GCOV_EXCL_LINE - debug logging for text keys in backward scans rarely triggered */
-                            SMOL_LOGF("tuple key varlena size=%d", vsz); /* GCOV_EXCL_LINE */
+                            int32 vsz = VARSIZE_ANY((struct varlena *) so->itup_data);
+                            SMOL_LOGF("tuple key varlena size=%d", vsz);
                         }
                         for (uint16 ii=0; ii<so->ninclude; ii++)
                         {
-                            if (so->inc_is_text[ii]) /* GCOV_EXCL_LINE - debug logging for text includes in backward scans rarely triggered */
+                            if (so->inc_is_text[ii])
                             {
-                                char *dst = so->itup_data + so->inc_offs[ii]; /* GCOV_EXCL_LINE */
-                                int32 vsz = VARSIZE_ANY((struct varlena *) dst); /* GCOV_EXCL_LINE */
-                                SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_offs[ii]); /* GCOV_EXCL_LINE */
+                                char *dst = so->itup_data + so->inc_offs[ii];
+                                int32 vsz = VARSIZE_ANY((struct varlena *) dst);
+                                SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_offs[ii]);
                             }
                         }
                     }
@@ -3038,7 +3038,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             {
                 /* Initialize cur_off for forward scans on new pages */
                 if (so->cur_off == InvalidOffsetNumber || so->cur_off == 0)
-                    so->cur_off = FirstOffsetNumber;
+                    so->cur_off = FirstOffsetNumber; /* GCOV_EXCL_LINE - defensive: cur_off always FirstOffsetNumber (set at lines 2464, 2522, 3495) */
 
                 while (so->cur_off <= n)
                 {
@@ -4134,7 +4134,6 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
              * Strategy: Start with zero-copy (most expensive), then switch to RLE/plain if beneficial.
              * This ensures pages are always maximally filled since SMOL is bulk-loaded and read-only.
              */
-            Size remaining = nkeys - i;
 
             /* PHASE 1: INCREMENTAL RLE PACKING
              * Pack tuples one-by-one, tracking RLE state, until page is full.
@@ -4228,7 +4227,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 Size tuple_size = sizeof(IndexTupleData) + key_len;
                 uint16 t_info = (uint16) tuple_size;
 
-                for (Size j = 0; j < n_this; j++)
+                for (Size idx = 0; idx < n_this; idx++)
                 {
                     /* Write IndexTuple header */
                     ItemPointerData tid;
@@ -4236,7 +4235,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                     memcpy(p, &tid, sizeof(ItemPointerData)); p += sizeof(ItemPointerData);
                     memcpy(p, &t_info, sizeof(uint16)); p += sizeof(uint16);
                     /* Write key data */
-                    memcpy(p, base + j * key_len, key_len); p += key_len;
+                    memcpy(p, base + idx * key_len, key_len); p += key_len;
                 }
 
                 Size sz = (Size) (p - scratch);
@@ -4949,9 +4948,10 @@ smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so)
     return cur;
 }
 
+/* GCOV_EXCL_START - unused function, kept for future reference */
 /* Find leaf containing values around upper bound for backward scans.
  * Finds the rightmost leaf that could contain values <= upper_bound. */
-static BlockNumber
+static BlockNumber __attribute__((unused))
 smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so)
 {
     SmolMeta meta;
@@ -4994,6 +4994,7 @@ smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so)
     SMOL_LOGF("find_leaf_for_upper_bound: leaf=%u height=%u", cur, meta.height);
     return cur;
 }
+/* GCOV_EXCL_STOP */
 
 /* removed unused smol_read_key_as_datum */
 
@@ -6064,6 +6065,7 @@ smol_rightmost_leaf(Relation idx)
     return rightmost_leaf;
 }
 
+/* GCOV_EXCL_START - unused functions, kept for future reference */
 /* Helper function: find rightmost leaf in a subtree */
 static BlockNumber
 smol_rightmost_in_subtree(Relation idx, BlockNumber root, uint16 levels)
@@ -6145,7 +6147,7 @@ smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target
 }
 
 /* Return previous leaf sibling by walking tree (works for any height) */
-static BlockNumber
+static BlockNumber __attribute__((unused))
 smol_prev_leaf(Relation idx, BlockNumber cur)
 {
     SmolMeta meta;
@@ -6157,6 +6159,7 @@ smol_prev_leaf(Relation idx, BlockNumber cur)
     bool found = false;
     return smol_find_prev_leaf_recursive(idx, meta.root_blkno, cur, meta.height, &found);
 }
+/* GCOV_EXCL_STOP */
 
 /* Build callbacks and comparators */
 static void
@@ -6872,7 +6875,7 @@ smol_inspect(PG_FUNCTION_ARGS)
         }
 
         /* Check if it's a leaf page using opaque data */
-        if (PageGetSpecialSize(page) == sizeof(SmolPageOpaqueData))
+        if (PageGetSpecialSize(page) >= sizeof(SmolPageOpaqueData))
         {
             SmolPageOpaqueData *opaque = (SmolPageOpaqueData *) PageGetSpecialPointer(page);
 

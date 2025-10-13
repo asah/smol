@@ -1,5 +1,7 @@
--- Test build path edge cases
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test build path edge cases
 
 -- ============================================================================
 -- Test 1: Empty index (line 3099: nkeys == 0 early return)

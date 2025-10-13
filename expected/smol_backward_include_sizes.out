@@ -25,9 +25,14 @@ CREATE INDEX t_backward_inc_sizes_idx ON t_backward_inc_sizes
 -- Backward scan to trigger INCLUDE column copying with different sizes
 SELECT k, v1, v2, v3, v4 FROM t_backward_inc_sizes 
 WHERE k <= 100 ORDER BY k DESC LIMIT 5;
- k | v1 | v2 | v3 | v4 
----+----+----+----+----
-(0 rows)
+  k  | v1  | v2  | v3  |                  v4                  
+-----+-----+-----+-----+--------------------------------------
+ 100 | 100 | 200 | 300 | 12345678-1234-5678-1234-567812345678
+  99 | 100 | 200 | 300 | 12345678-1234-5678-1234-567812345678
+  98 | 100 | 200 | 300 | 12345678-1234-5678-1234-567812345678
+  97 | 100 | 200 | 300 | 12345678-1234-5678-1234-567812345678
+  96 | 100 | 200 | 300 | 12345678-1234-5678-1234-567812345678
+(5 rows)
 
 -- Verify correctness
 SELECT count(*) = 5 AS correct_count FROM (
@@ -36,7 +41,7 @@ SELECT count(*) = 5 AS correct_count FROM (
 ) sub WHERE v1 = 100 AND v2 = 200 AND v3 = 300;
  correct_count 
 ---------------
- f
+ t
 (1 row)
 
 -- Cleanup

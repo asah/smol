@@ -1,7 +1,6 @@
 -- Test zero-copy format with bounds checking
 -- Covers lines 981, 993-994, 1006-1007 in smol_page_matches_scan_bounds
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Force zero-copy format for this test
 SET smol.enable_zero_copy = on;
 -- Create table with single-column index (zero-copy format)

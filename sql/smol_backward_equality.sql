@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test backward scan with equality bound to hit have_k1_eq termination path
 -- Targets lines 1931-1932: have_k1_eq with c < 0 termination
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Create table with duplicates
 DROP TABLE IF EXISTS t_eq_backward CASCADE;

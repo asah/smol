@@ -1,7 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test parallel batch claiming (smol.parallel_claim_batch > 1)
 -- This exercises the batch claiming loops that reduce atomic contention
 
-CREATE EXTENSION IF NOT EXISTS smol;
 
 -- Test 1: Single-column parallel scan with batch claiming
 DROP TABLE IF EXISTS t_batch1 CASCADE;

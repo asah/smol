@@ -4,7 +4,6 @@ SET client_min_messages = warning;
 \pset tuples_only on
 \pset footer off
 \pset pager off
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Build a multi-leaf duplicate run for single-key + INCLUDE
 DROP TABLE IF EXISTS m CASCADE;
 CREATE UNLOGGED TABLE m(a int2, x int8);

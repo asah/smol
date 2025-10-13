@@ -1,7 +1,6 @@
 -- Test backward navigation in tall trees (height >= 3)
 -- Covers smol_rightmost_in_subtree function (lines 5404-5420)
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Use GUC to force very tall tree with height >= 3
 -- Also force low internal fanout to ensure multiple internal levels
 SET smol.test_max_tuples_per_page = 50;

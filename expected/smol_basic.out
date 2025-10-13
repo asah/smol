@@ -1,5 +1,6 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- basic regression for smol: ordered, read-only, index-only scans, drop/recreate, multi-index
-CREATE EXTENSION smol;
 -- base table without NULLs
 CREATE TABLE t(a int, b int);
 INSERT INTO t(a,b)

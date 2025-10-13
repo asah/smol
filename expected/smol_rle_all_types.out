@@ -1,4 +1,3 @@
-NOTICE:  extension "smol" already exists, skipping
 CREATE EXTENSION
 Test 1: int2 with heavy duplicates (RLE compression)
 DROP TABLE

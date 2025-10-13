@@ -1,9 +1,9 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test BETWEEN queries (upper bound coverage)
 -- This exercises the have_upper_bound code paths that aren't covered by existing tests
-CREATE EXTENSION IF NOT EXISTS smol;
 -- Test 1: Single-column BETWEEN on int4
 DROP TABLE IF EXISTS t_between CASCADE;
-NOTICE:  table "t_between" does not exist, skipping
 CREATE UNLOGGED TABLE t_between (a int4);
 INSERT INTO t_between SELECT i FROM generate_series(1, 1000) i;
 CREATE INDEX idx_between_smol ON t_between USING smol(a);
@@ -44,7 +44,6 @@ SELECT count(*) FROM (SELECT a FROM t_between WHERE a BETWEEN 100 AND 200 ORDER 
 
 -- Test 2: Two-column index with upper bound
 DROP TABLE IF EXISTS t_between2 CASCADE;
-NOTICE:  table "t_between2" does not exist, skipping
 CREATE UNLOGGED TABLE t_between2 (a int4, b int4);
 INSERT INTO t_between2 SELECT i % 100, i FROM generate_series(1, 5000) i;
 CREATE INDEX idx_between2_smol ON t_between2 USING smol(a, b);
@@ -76,7 +75,6 @@ SELECT count(*) FROM t_between WHERE a <= 500;
 
 -- Test 4: Text columns with BETWEEN
 DROP TABLE IF EXISTS t_text_between CASCADE;
-NOTICE:  table "t_text_between" does not exist, skipping
 CREATE UNLOGGED TABLE t_text_between (s text COLLATE "C");
 INSERT INTO t_text_between SELECT 'key_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
 CREATE INDEX idx_text_between ON t_text_between USING smol(s);
@@ -94,7 +92,6 @@ SELECT count(*) FROM t_text_between WHERE s >= 'key_000100' AND s < 'key_000200'
 
 -- Test 5: Backward scan with upper bound only
 DROP TABLE IF EXISTS t_back_upper CASCADE;
-NOTICE:  table "t_back_upper" does not exist, skipping
 CREATE UNLOGGED TABLE t_back_upper (a int4);
 INSERT INTO t_back_upper SELECT i FROM generate_series(1, 500) i;
 CREATE INDEX idx_back_upper ON t_back_upper USING smol(a);
@@ -113,7 +110,6 @@ SELECT count(*) FROM (SELECT a FROM t_back_upper WHERE a < 400 ORDER BY a DESC) 
 
 -- Test 6: INCLUDE columns with BETWEEN
 DROP TABLE IF EXISTS t_inc_between CASCADE;
-NOTICE:  table "t_inc_between" does not exist, skipping
 CREATE UNLOGGED TABLE t_inc_between (a int4, b int4, c int4);
 INSERT INTO t_inc_between SELECT i, i*2, i*3 FROM generate_series(1, 1000) i;
 CREATE INDEX idx_inc_between ON t_inc_between USING smol(a) INCLUDE (b, c);

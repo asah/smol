@@ -1,3 +1,6 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
 -- Test RLE format with INCLUDE columns of various sizes
 -- This test covers lines 2698-2713: size-specific INCLUDE column copying in RLE pages
 --
@@ -7,7 +10,6 @@
 -- 2709-2713: Size-specific fast-path copies (4B, 8B, 16B, 2B, 1B)
 
 SET client_min_messages = warning;
-CREATE EXTENSION IF NOT EXISTS smol;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;

@@ -1,14 +1,13 @@
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
 -- Test rescan with buffer pin cleanup
 -- Targets lines 1263-1268: ReleaseBuffer during rescan
-CREATE EXTENSION IF NOT EXISTS smol;
-NOTICE:  extension "smol" already exists, skipping
 SET enable_seqscan = off;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
 SET max_parallel_workers_per_gather = 0;
 -- Create table with index
 DROP TABLE IF EXISTS t_rescan CASCADE;
-NOTICE:  table "t_rescan" does not exist, skipping
 CREATE UNLOGGED TABLE t_rescan (k int4, v int4);
 INSERT INTO t_rescan SELECT i, i*10 FROM generate_series(1, 10000) i;
 CREATE INDEX idx_rescan ON t_rescan USING smol(k);
@@ -30,7 +29,6 @@ ERROR:  current transaction is aborted, commands ignored until end of transactio
 COMMIT;
 -- Try with nested loop join that might trigger rescan
 DROP TABLE IF EXISTS t_outer CASCADE;
-NOTICE:  table "t_outer" does not exist, skipping
 CREATE UNLOGGED TABLE t_outer (id int4);
 INSERT INTO t_outer VALUES (100), (200), (300);
 -- Nested loop where inner side gets rescanned
