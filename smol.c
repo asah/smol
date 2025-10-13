@@ -1045,8 +1045,8 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         return true; /* GCOV_EXCL_LINE - defensive: this path is never reached in current code */
 
     /* Empty page: defensive check for corruption */
-    if (nitems == 0) /* GCOV_EXCL_START - defensive: pages are never empty in normal operation */
-    {
+    if (nitems == 0)
+    { /* GCOV_EXCL_START - defensive: pages are never empty in normal operation */
         SMOL_DEFENSIVE_CHECK(false, ERROR,
             (errmsg("smol: empty page %u during bounds checking", so->cur_blk)));
         return false;
@@ -1056,9 +1056,9 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
 
     /* For zero-copy pages, skip IndexTuple header to get actual key data */
-    if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated smol_build_tree_from_sorted */
-    {
-        first_key += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
+    if (so->page_is_zerocopy)
+    { /* GCOV_EXCL_START - zero-copy format only in deprecated smol_build_tree_from_sorted */
+        first_key += sizeof(IndexTupleData);
     } /* GCOV_EXCL_STOP */
 
     /* Upper bound check: if first key exceeds upper bound, stop entire scan
@@ -1067,11 +1067,11 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     if (so->have_upper_bound)
     {
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
-        if (so->upper_bound_strict ? (c >= 0) : (c > 0)) /* GCOV_EXCL_START - defensive: prefetch logic avoids loading pages beyond bounds */
-        {
+        if (so->upper_bound_strict ? (c >= 0) : (c > 0))
+        { /* GCOV_EXCL_START - defensive: prefetch logic avoids loading pages beyond bounds */
             /* first_key > upper_bound → past end of range, stop scan */
-            *stop_scan_out = true; /* GCOV_EXCL_LINE */
-            return false; /* GCOV_EXCL_LINE */
+            *stop_scan_out = true;
+            return false;
         } /* GCOV_EXCL_STOP */
     }
 
@@ -1080,11 +1080,11 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     if (so->have_k1_eq)
     {
         int c = smol_cmp_keyptr_to_bound(so, first_key);
-        if (c > 0) /* GCOV_EXCL_START - defensive: scan stops at tuple level before loading next page */
-        {
+        if (c > 0)
+        { /* GCOV_EXCL_START - defensive: scan stops at tuple level before loading next page */
             /* first_key > equality_bound → past the equal value, stop scan */
-            *stop_scan_out = true; /* GCOV_EXCL_LINE */
-            return false; /* GCOV_EXCL_LINE */
+            *stop_scan_out = true;
+            return false;
         } /* GCOV_EXCL_STOP */
     }
 
@@ -3167,8 +3167,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     /* For zero-copy pages, keyp points to IndexTuple header; adjust to key data */
                     IndexTuple itup_ptr = NULL;
-                    if (so->page_is_zerocopy) /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
-                    {
+                    if (so->page_is_zerocopy)
+                    { /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
                         itup_ptr = (IndexTuple) keyp;  /* Save IndexTuple pointer for later */
                         keyp += sizeof(IndexTupleData);  /* Skip header to get key data */
 
@@ -3464,8 +3464,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 for (;;)
                 {
                     uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
-                    if (curv == 0u) /* GCOV_EXCL_START - only reachable via parallel rescan, which is extremely rare */
-                    {
+                    if (curv == 0u)
+                    { /* GCOV_EXCL_START - only reachable via parallel rescan, which is extremely rare */
                         /* Defensive: PostgreSQL planner only uses parallel index scans with WHERE clauses, so have_bound must be true */
                         SMOL_DEFENSIVE_CHECK(so->have_bound, ERROR,
                                             (errmsg("smol: parallel scan without bound")));
@@ -4621,8 +4621,8 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
                 if (run_ok) run++;
             }
             nr++;
-            if (nr >= 32000) /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
-            {
+            if (nr >= 32000)
+            { /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
                 /* Too many runs for uint16 nruns field (conservative limit) */
                 break;
             } /* GCOV_EXCL_STOP */
@@ -4838,8 +4838,8 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
                 if (run_ok) run++;
             }
             nr++;
-            if (nr >= 32000) /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
-            {
+            if (nr >= 32000)
+            { /* GCOV_EXCL_START - unreachable: 32000 runs can't fit in 8KB page */
                 /* Too many runs for uint16 nruns field (conservative limit) */
                 break;
             } /* GCOV_EXCL_STOP */
@@ -5621,8 +5621,8 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
             if (blen > 0) memcpy(dest, src, blen);
             if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
 
-            if (smol_debug_log && i < (Size) smol_log_sample_n) /* GCOV_EXCL_START */
-            {
+            if (smol_debug_log && i < (Size) smol_log_sample_n)
+            { /* GCOV_EXCL_START */
                 int h = (blen < smol_log_hex_limit) ? blen : smol_log_hex_limit;
                 char *hx = smol_hex(dest, h, h);
                 SMOL_LOGF("build text key[%zu] blen=%d hex=%s", (size_t) i, blen, hx);
