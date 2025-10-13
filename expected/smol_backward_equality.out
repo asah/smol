@@ -1,3 +1,4 @@
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 -- Test backward scan with equality bound to hit have_k1_eq termination path

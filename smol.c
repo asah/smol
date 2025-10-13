@@ -161,9 +161,17 @@ typedef enum
     ZERO_COPY_AUTO = 2
 } ZeroCopyMode;
 
+typedef enum
+{
+    KEY_RLE_V1 = 1,      /* Use V1 format (0x8001u) without continues_byte */
+    KEY_RLE_V2 = 2,      /* Use V2 format (0x8002u) with continues_byte */
+    KEY_RLE_AUTO = 3     /* Auto-select based on build path (default: V1 for text, V2 for sorted) */
+} KeyRLEVersion;
+
 static int smol_enable_zero_copy = ZERO_COPY_AUTO;  /* Zero-copy mode: off, on, or auto */
 static int  smol_zero_copy_threshold_mb = 1;     /* Max index size (MB) for zero-copy format - very conservative for safety */
 static double smol_rle_uniqueness_threshold = 0.98; /* If nruns/nitems >= this, consider unique (very high threshold) */
+static int smol_key_rle_version = KEY_RLE_AUTO;  /* KEY_RLE format version: v1, v2, or auto */
 
 /* Logging macros - always available at runtime controlled by smol_debug_log GUC */
 #define SMOL_LOG(msg) \
@@ -495,6 +503,22 @@ _PG_init(void)
                             &smol_enable_zero_copy,
                             ZERO_COPY_AUTO,
                             zero_copy_options,
+                            PGC_USERSET, 0,
+                            NULL, NULL, NULL);
+
+    static const struct config_enum_entry key_rle_version_options[] = {
+        {"v1", KEY_RLE_V1, false},
+        {"v2", KEY_RLE_V2, false},
+        {"auto", KEY_RLE_AUTO, false},
+        {NULL, 0, false}
+    };
+
+    DefineCustomEnumVariable("smol.key_rle_version",
+                            "Force KEY_RLE format version for index builds",
+                            "v1: use V1 format (0x8001u) without continues_byte; v2: use V2 format (0x8002u) with continues_byte; auto: use default for build path",
+                            &smol_key_rle_version,
+                            KEY_RLE_AUTO,
+                            key_rle_version_options,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
 
@@ -4265,26 +4289,36 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             }
             else if (use_rle)
             {
-                /* PHASE 2: RLE V2 with continuation detection */
-                uint16 tag = SMOL_TAG_KEY_RLE_V2;
+                /* PHASE 2: RLE with format controlled by GUC */
+                /* Determine which format to use based on GUC setting */
+                bool use_v2 = (smol_key_rle_version == KEY_RLE_V2 ||
+                              (smol_key_rle_version == KEY_RLE_AUTO));  /* Default to V2 for sorted build */
+                uint16 tag = use_v2 ? SMOL_TAG_KEY_RLE_V2 : SMOL_TAG_KEY_RLE;
+
+                /* Static state for continuation detection (used by V2 format) */
+                static char prev_page_last_key[32];
+                static bool prev_page_has_key = false;
+
                 char *p = scratch;
                 uint16 nitems16 = (uint16) n_this;
                 memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
                 memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
                 memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
 
-                /* Continuation detection: check if first key matches previous page's last key */
-                uint8 continues_byte = 0;
-                const char *first_key = (const char *) keys + ((size_t) i * key_len);
-                static char prev_page_last_key[32];
-                static bool prev_page_has_key = false;
-
-                if (prev_page_has_key && key_len <= 32 &&
-                    memcmp(first_key, prev_page_last_key, key_len) == 0)
+                /* V2 format: write continues_byte for cross-page run continuation */
+                if (use_v2)
                 {
-                    continues_byte = 1;  /* First run continues from previous page */
+                    /* Continuation detection: check if first key matches previous page's last key */
+                    uint8 continues_byte = 0;
+                    const char *first_key = (const char *) keys + ((size_t) i * key_len);
+
+                    if (prev_page_has_key && key_len <= 32 &&
+                        memcmp(first_key, prev_page_last_key, key_len) == 0)
+                    {
+                        continues_byte = 1;  /* First run continues from previous page */
+                    }
+                    *p++ = continues_byte;
                 }
-                *p++ = continues_byte;
 
                 /* Write RLE runs */
                 const char *base = (const char *) keys + ((size_t) i * key_len);
@@ -5637,13 +5671,24 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Size sz;
         if (use_rle)
         {
-            /* RLE format: [tag][nitems][nruns][runs...] where run = [key][count] */
-            uint16 tag = SMOL_TAG_KEY_RLE;
+            /* RLE format with version controlled by GUC */
+            /* Determine which format to use based on GUC setting */
+            bool use_v2 = (smol_key_rle_version == KEY_RLE_V2 ||
+                          (smol_key_rle_version == KEY_RLE_AUTO && false));  /* Default to V1 for text build (AUTO && false) */
+            uint16 tag = use_v2 ? SMOL_TAG_KEY_RLE_V2 : SMOL_TAG_KEY_RLE;
+
             char *p = scratch;
             uint16 nitems16 = (uint16) n_this;
             memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
             memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
             memcpy(p, &rle_nruns, sizeof(uint16)); p += sizeof(uint16);
+
+            /* V2 format: write continues_byte (always 0 for this build path - no cross-page tracking) */
+            if (use_v2)
+            {
+                uint8 continues_byte = 0;
+                *p++ = continues_byte;
+            }
 
             Size pos = 0;
             while (pos < n_this)

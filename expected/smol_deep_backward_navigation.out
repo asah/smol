@@ -1,5 +1,6 @@
 -- Test to trigger smol_rightmost_in_subtree loop (lines 5409-5417)
 -- Requires backward scan in very deep tree where target is first leaf in subtree
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 -- Force extremely deep tree structure
@@ -20,7 +21,7 @@ CREATE INDEX t_deep_backward_idx ON t_deep_backward USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_deep_backward_idx'::regclass);
  total_pages | leaf_pages 
 -------------+------------
-           7 |          4
+         381 |        250
 (1 row)
 
 -- Force backward scan with specific target

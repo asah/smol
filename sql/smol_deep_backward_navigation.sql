@@ -1,6 +1,8 @@
 -- Test to trigger smol_rightmost_in_subtree loop (lines 5409-5417)
 -- Requires backward scan in very deep tree where target is first leaf in subtree
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

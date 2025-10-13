@@ -1,6 +1,8 @@
 -- Test to achieve 100% code coverage
 -- Covers: cost GUCs, error paths, multi-level B-tree
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

@@ -1,5 +1,7 @@
 -- Edge cases and error validation for SMOL
 -- Tests uncovered error paths and boundary conditions
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

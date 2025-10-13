@@ -1,5 +1,6 @@
 -- Test copy function edge cases and build callback paths
 -- Targets lines 4137, 4149, 4153, 4159, 4163, 4168
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 -- ============================================================================

@@ -1,6 +1,8 @@
 -- Test backward scans with INCLUDE columns of various sizes
 -- Targets lines 2699-2702: different INCLUDE column size handling in backward scans
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

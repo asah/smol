@@ -1,6 +1,8 @@
 -- Attempt to corrupt catalog to test smol_validate() error paths (lines 2525-2627)
 -- We'll try to create malformed operator classes that fail validation
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

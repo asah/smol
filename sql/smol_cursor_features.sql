@@ -2,6 +2,8 @@
 -- Documents what cursor operations work and which ones don't
 -- SMOL only supports forward-only cursors; SCROLL cursors are broken
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

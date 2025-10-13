@@ -1,5 +1,7 @@
 -- Timing-independent compression ratio regression test
 -- Verifies SMOL achieves expected compression ratios for various workloads
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 

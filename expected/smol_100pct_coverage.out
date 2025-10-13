@@ -1,5 +1,6 @@
 -- Test to achieve 100% code coverage
 -- Covers: cost GUCs, error paths, multi-level B-tree
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET enable_seqscan = off;
@@ -166,7 +167,7 @@ CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4,
 SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
  has_many_pages | has_many_leaves 
 ----------------+-----------------
- f              | f
+ t              | t
 (1 row)
 
 -- Backward scan exercises smol_rightmost_in_subtree navigation

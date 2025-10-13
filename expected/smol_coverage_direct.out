@@ -1,5 +1,6 @@
 -- Direct coverage tests - bypass planner to exercise unreachable code
 -- These tests call index AM functions directly via C wrappers
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET smol.enable_zero_copy = off;  -- Disable zero-copy to test specific code paths

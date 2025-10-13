@@ -23,7 +23,7 @@ SELECT total_pages >= 10 AS has_multiple_pages
 FROM smol_inspect('t_text_inc_guc_idx'::regclass);
  has_multiple_pages 
 --------------------
- f
+ t
 (1 row)
 
 -- Test 2: Text-only index (no INCLUDE)
@@ -39,7 +39,7 @@ SELECT total_pages >= 10 AS has_multiple_pages
 FROM smol_inspect('t_text_only_guc_idx'::regclass);
  has_multiple_pages 
 --------------------
- f
+ t
 (1 row)
 
 -- Test a query

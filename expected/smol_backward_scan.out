@@ -1,5 +1,6 @@
 -- Backward scan tests - tests BackwardScanDirection paths
 -- Uses cursors to force backward index scans
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET enable_seqscan = off;

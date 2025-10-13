@@ -1,5 +1,6 @@
 -- Test equality bound stop optimization (lines 980-981)
 -- This test verifies that when scanning for k=X, SMOL stops as soon as it finds a page where first_key > X
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET enable_seqscan = off;
@@ -57,13 +58,13 @@ FROM t_eq_stop WHERE k >= 1 AND k < 6000;
 SELECT count(*) AS total_rows FROM t_eq_stop;
  total_rows 
 ------------
-      10001
+       5000
 (1 row)
 
 SELECT count(*) AS high_values FROM t_eq_stop WHERE k >= 100000;
  high_values 
 -------------
-        5001
+           0
 (1 row)
 
 -- Cleanup

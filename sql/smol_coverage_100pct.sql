@@ -1,6 +1,8 @@
 -- Test to achieve 100% code coverage for SMOL
 -- Targets remaining uncovered lines identified in COVERAGE_STATUS.md
 
+SET smol.key_rle_version = 'v2';
+
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
