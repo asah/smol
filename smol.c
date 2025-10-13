@@ -2406,7 +2406,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 so->cur_off = n;
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    /* Fast path for plain pages: compute keyptr inline (O(1) pointer arithmetic) */
+                    char *keyp;
+                    if (so->page_is_plain)
+                    {
+                        /* Plain page: [u16 n][key1][key2]... - simple array layout */
+                        keyp = base + sizeof(uint16) + ((size_t)(so->cur_off - 1)) * so->key_len;
+                    }
+                    else
+                    {
+                        /* RLE or other format: use cached lookup */
+                        keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    }
                     int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
                     if (so->upper_bound_strict ? (c < 0) : (c <= 0))
                         break;
@@ -2886,9 +2897,20 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    /* Fast path for plain pages: compute keyptr inline (O(1) pointer arithmetic) */
+                    char *keyp;
+                    if (so->page_is_plain)
+                    {
+                        /* Plain page: [u16 n][key1][key2]... - simple array layout */
+                        keyp = base + sizeof(uint16) + ((size_t)(so->cur_off - 1)) * so->key_len;
+                    }
+                    else
+                    {
+                        /* RLE or other format: use cached lookup */
+                        keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    }
                     /* For zero-copy pages, skip IndexTuple header to get key data */
-                    if (so->page_is_zerocopy) 
+                    if (so->page_is_zerocopy)
                         keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                     /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
@@ -2931,7 +2953,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         /* dynamic tuple emission handles copies */
                         if (!so->two_col)
                         {
-                            if (so->run_active && so->cur_off >= so->run_start_off)
+                            /* Fast path for plain pages in backward scans: skip all run detection */
+                            if (so->page_is_plain)
+                            {
+                                /* Plain pages have no duplicates - skip run detection entirely */
+                                /* Just mark as active with trivial run bounds */
+                                so->run_active = true;
+                                so->run_start_off = so->cur_off;
+                                so->run_end_off = so->cur_off;
+                            }
+                            else if (so->run_active && so->cur_off >= so->run_start_off)
                             {
                                 /* within run: key already present in xs_itup */
                             }
@@ -2943,13 +2974,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 memcpy(so->run_key, k0, so->run_key_len);
                                 uint16 start = so->cur_off;
                                 uint16 dummy_end;
-                                /* Run-detection optimization active: plain pages have no duplicates */
-                                if (so->page_is_plain)
-                                {
-                                    /* Plain page: each row is its own run (length 1), skip scanning */
-                                    start = so->cur_off;
-                                }
-                                else if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
+                                if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
                                 {
                                     /* RLE page but not encoded: scan backward to find run start */
                                     while (start > FirstOffsetNumber)
@@ -2957,7 +2982,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
-                                        start--; /* RLE page: scan backward to find start of duplicate run */ 
+                                        start--; /* RLE page: scan backward to find start of duplicate run */
                                     }
                                     so->rle_run_inc_cached = false; /* Non-RLE page, no caching */
                                 }
