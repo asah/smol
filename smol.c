@@ -719,6 +719,7 @@ typedef struct SmolPageOpaqueData
 {
     uint16      flags;     /* 1=leaf, 2=internal */
     BlockNumber rightlink; /* next leaf (for leaf pages), or InvalidBlockNumber */
+    BlockNumber leftlink;  /* previous leaf (for leaf pages), or InvalidBlockNumber */
 } SmolPageOpaqueData;
 
 #define SMOL_F_LEAF     0x0001
@@ -909,6 +910,7 @@ static void smol_meta_read(Relation idx, SmolMeta *out);
 static void smol_mark_heap0_allvisible(Relation heapRel);
 static Buffer smol_extend(Relation idx);
 static void smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink);
+static void smol_link_siblings(Relation idx, BlockNumber prev, BlockNumber cur);
 static void smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 key_len);
 static void smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * const *incs,
                              Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
@@ -927,6 +929,7 @@ static void smol_build_internal_levels_bytes(Relation idx,
                                        BlockNumber *out_root, uint16 *out_levels);
 static BlockNumber smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len);
 static BlockNumber smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so);
+static BlockNumber smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so);
 static BlockNumber smol_rightmost_leaf(Relation idx);
 static BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
 static int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
@@ -1535,7 +1538,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                     OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
                     Assert(off != InvalidOffsetNumber); (void) off;
                     MarkBufferDirty(buf); BlockNumber cur = BufferGetBlockNumber(buf); UnlockReleaseBuffer(buf);
-                    if (BlockNumberIsValid(prev)) { Buffer pb = ReadBuffer(index, prev); LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE); Page pp=BufferGetPage(pb); smol_page_opaque(pp)->rightlink=cur; MarkBufferDirty(pb); UnlockReleaseBuffer(pb);} prev = cur; i += n_this;
+                    smol_link_siblings(index, prev, cur); prev = cur; i += n_this;
                 }
                 Buffer mb = ReadBuffer(index, 0); LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); SmolMeta *m = smol_meta_ptr(pg); m->root_blkno = 1; m->height = 1; MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
                 pfree(idx);
@@ -2378,60 +2381,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         /* no local variables needed here */
         if (dir == BackwardScanDirection)
         {
-            if (so->have_bound)
-                so->cur_blk = smol_rightmost_leaf(idx); /* start at rightmost, then step back within leaf by bound */
-            else
-            {
-                so->cur_blk = smol_rightmost_leaf(idx);
-            }
+            /* For now, always start at rightmost leaf for backward scans
+             * TODO: Optimize by seeking to leaf containing upper bound */
+            so->cur_blk = smol_rightmost_leaf(idx);
             /* position within leaf: set to end; we'll walk backward */
             buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
             page = BufferGetPage(buf);
             {
             uint16 n = smol_leaf_nitems(page);
-            if (so->have_bound)
-            {
-                /* For backward scan with lower bound (>=, >, or =):
-                 * Just start at the end and let the scan loop handle bound checking.
-                 * Don't try to position based on the bound here, as we need ALL entries
-                 * from the end down to (but not including) entries < bound. */
-                so->cur_off = n;
-            }
-#ifdef SMOL_PLANNER_BACKWARD_UPPER_ONLY
-            else if (so->have_upper_bound)
-            {
-                /* For backward scan with upper bound only, position to last value <= upper_bound */
-                /* NOTE: PostgreSQL planner currently doesn't generate backward scans with upper-bound-only.
-                 * It uses forward scan + sort instead. Enable this when planner supports it. */
-                so->cur_off = n;
-                while (so->cur_off >= FirstOffsetNumber)
-                {
-                    /* Fast path for plain pages: compute keyptr inline (O(1) pointer arithmetic) */
-                    char *keyp;
-                    if (so->page_is_plain)
-                    {
-                        /* Plain page: [u16 n][key1][key2]... - simple array layout */
-                        keyp = base + sizeof(uint16) + ((size_t)(so->cur_off - 1)) * so->key_len;
-                    }
-                    else
-                    {
-                        /* RLE or other format: use cached lookup */
-                        keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                    }
-                    int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
-                    if (so->upper_bound_strict ? (c < 0) : (c <= 0))
-                        break;
-                    so->cur_off--;
-                }
-                /* If all values exceed upper bound, cur_off is now invalid */
-                if (so->cur_off < FirstOffsetNumber)
-                    so->cur_off = n + 1; /* Set to end-of-page marker */
-            }
-#endif
-            else
-            {
-                so->cur_off = n;
-            }
+            /* For backward scans, start at the end and scan backward */
+            so->cur_off = n;
             so->cur_buf = buf; so->have_pin = true;
             so->initialized = true;
             SMOL_LOGF("init backward cur_blk=%u off=%u", so->cur_blk, so->cur_off);
@@ -3453,9 +3412,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (dir != BackwardScanDirection && so->pages_scanned < 65535)
                 so->pages_scanned++;
 
-            /* Read rightlink BEFORE releasing buffer */
+            /* Read rightlink/leftlink BEFORE releasing buffer */
             op = smol_page_opaque(page);
-            next = (dir == BackwardScanDirection) ? smol_prev_leaf(idx, so->cur_blk) : op->rightlink;
+            next = (dir == BackwardScanDirection) ? op->leftlink : op->rightlink;
 
             /* Adaptive prefetching with slow-start for bounded scans
              * Avoids over-prefetching for equality lookups and narrow ranges
@@ -4071,8 +4030,33 @@ smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink)
     op = smol_page_opaque(page);
     op->flags = leaf ? SMOL_F_LEAF : SMOL_F_INTERNAL;
     op->rightlink = rightlink;
+    op->leftlink = InvalidBlockNumber;  /* Will be set when linking siblings */
     SMOL_LOGF("init page blk=%u leaf=%d rl=%u",
               BufferGetBlockNumber(buf), leaf ? 1 : 0, rightlink);
+}
+
+/* Link two sibling leaf pages: sets prev->rightlink = cur and cur->leftlink = prev */
+static void
+smol_link_siblings(Relation idx, BlockNumber prev, BlockNumber cur)
+{
+    if (!BlockNumberIsValid(prev))
+        return;
+
+    /* Set prev->rightlink = cur */
+    Buffer pbuf = ReadBuffer(idx, prev);
+    LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+    smol_page_opaque(BufferGetPage(pbuf))->rightlink = cur;
+    MarkBufferDirty(pbuf);
+    UnlockReleaseBuffer(pbuf);
+
+    /* Set cur->leftlink = prev */
+    Buffer cbuf = ReadBuffer(idx, cur);
+    LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+    smol_page_opaque(BufferGetPage(cbuf))->leftlink = prev;
+    MarkBufferDirty(cbuf);
+    UnlockReleaseBuffer(cbuf);
+
+    SMOL_LOGF("linked siblings: %u <- -> %u", prev, cur);
 }
 
 /* GCOV_EXCL_START - Deprecated function: replaced by RLE two-pass build */
@@ -4399,6 +4383,13 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 MarkBufferDirty(pbuf2);
             }
             UnlockReleaseBuffer(pbuf2);
+
+            /* Also set cur's leftlink */
+            Buffer cbuf = ReadBuffer(idx, cur);
+            LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+            smol_page_opaque(BufferGetPage(cbuf))->leftlink = prev;
+            MarkBufferDirty(cbuf);
+            UnlockReleaseBuffer(cbuf);
         }
         else
         {
@@ -4660,15 +4651,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
-        if (BlockNumberIsValid(prev))
-        {
-            Buffer pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            Page pp = BufferGetPage(pbuf);
-            smol_page_opaque(pp)->rightlink = cur;
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
+        smol_link_siblings(idx, prev, cur);
         prev = cur;
         i += n_this;
     }
@@ -4871,15 +4854,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
-        if (BlockNumberIsValid(prev))
-        {
-            Buffer pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            Page pp = BufferGetPage(pbuf);
-            smol_page_opaque(pp)->rightlink = cur;
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
+        smol_link_siblings(idx, prev, cur);
         prev = cur;
         i += n_this;
     }
@@ -4968,6 +4943,52 @@ smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so)
         levels--;
     }
     SMOL_LOGF("find_first_leaf_generic: leaf=%u height=%u", cur, meta.height);
+    return cur;
+}
+
+/* Find leaf containing values around upper bound for backward scans.
+ * Finds the rightmost leaf that could contain values <= upper_bound. */
+static BlockNumber
+smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so)
+{
+    SmolMeta meta;
+    smol_meta_read(idx, &meta);
+    BlockNumber cur = meta.root_blkno;
+    uint16 levels = meta.height;
+    while (levels > 1)
+    {
+        Buffer buf = ReadBuffer(idx, cur);
+        Page page = BufferGetPage(buf);
+        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        BlockNumber child = InvalidBlockNumber;
+        /* Find rightmost child where separator key <= upper_bound */
+        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+        {
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+            BlockNumber c;
+            memcpy(&c, itp, sizeof(BlockNumber));
+            char *keyp = itp + sizeof(BlockNumber);
+            /* Check if this separator key exceeds upper bound */
+            int cmp = smol_cmp_keyptr_to_upper_bound(so, keyp);
+            if (so->upper_bound_strict ? (cmp >= 0) : (cmp > 0))
+            {
+                /* This child's separator > upper_bound, so values <= upper_bound must be in previous child */
+                break;
+            }
+            /* Separator <= upper_bound, remember this child and keep looking */
+            child = c;
+        }
+        if (!BlockNumberIsValid(child))
+        {
+            /* All separators > upper_bound, use leftmost child */
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+            memcpy(&child, itp, sizeof(BlockNumber));
+        }
+        ReleaseBuffer(buf);
+        cur = child;
+        levels--;
+    }
+    SMOL_LOGF("find_leaf_for_upper_bound: leaf=%u height=%u", cur, meta.height);
     return cur;
 }
 
@@ -5637,14 +5658,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
-        if (BlockNumberIsValid(prev))
-        {
-            Buffer pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            smol_page_opaque(BufferGetPage(pbuf))->rightlink = cur;
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
+        smol_link_siblings(idx, prev, cur);
         prev = cur;
         /* record leaf and highkey */
         if (nleaves == aleaves)
@@ -5955,14 +5969,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         MarkBufferDirty(buf);
         BlockNumber cur = BufferGetBlockNumber(buf);
         UnlockReleaseBuffer(buf);
-        if (BlockNumberIsValid(prev))
-        {
-            Buffer pbuf = ReadBuffer(idx, prev);
-            LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-            smol_page_opaque(BufferGetPage(pbuf))->rightlink = cur;
-            MarkBufferDirty(pbuf);
-            UnlockReleaseBuffer(pbuf);
-        }
+        smol_link_siblings(idx, prev, cur);
         prev = cur;
         /* record leaf and highkey */
         if (nleaves == aleaves)
