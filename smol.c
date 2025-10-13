@@ -2728,15 +2728,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
     }
 
-    uint32 page_visit_count = 0;
     while (BlockNumberIsValid(so->cur_blk))
     {
         SmolPageOpaqueData *op;
         BlockNumber next;
-
-        /* Safety check: detect infinite page loops */
-        if (++page_visit_count > 10000)
-            ereport(ERROR, (errmsg("smol: infinite page loop detected, visited >10000 pages, cur_blk=%u", so->cur_blk)));
 
         /* Ensure current leaf is pinned; page pointer valid */
         if (!so->have_pin || !BufferIsValid(so->cur_buf)) 
