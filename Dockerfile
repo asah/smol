@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libicu-dev liburing-dev \
     llvm-dev clang \
     tcl python3 python3-dev python3-pip \
-    locales sudo less jq emacs gcovr vmtouch \
+    locales sudo less jq emacs gcovr vmtouch gdb \
   && pip3 install slack_sdk matplotlib --break-system-packages \
   && rm -rf /var/lib/apt/lists/*
 
@@ -70,9 +70,12 @@ ENV PATH="/usr/local/pgsql/bin:${PATH}"
 
 EXPOSE 5432
 
+# convenience
 COPY bashrc .bashrc
 
-# make stop && make install && make start && su - postgres bash -c '/usr/local/pgsql/bin/psql -f bench/thrash.sql' | tee results/thrash.out
+# make clean stop install installcheck
+# make coverage
 # git config user.email "140002+asah@users.noreply.github.com" && git config user.name "Adam Sah"
+
 
 
