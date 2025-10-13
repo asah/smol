@@ -862,6 +862,7 @@ typedef struct SmolScanOpaqueData
     uint32      rle_cached_run_acc;      /* accumulated offset before current run */
     uint32      rle_cached_run_end;      /* last offset in current run (1-based) */
     char       *rle_cached_run_keyptr;   /* pointer to current run's key */
+    char       *rle_cached_run_ptr;      /* pointer to start of current run data (for fast forward scan) */
     BlockNumber rle_cached_page_blk;     /* which page the cache is valid for */
     uint64      rle_cache_hits;          /* cache hit counter for debugging */
     uint64      rle_cache_misses;        /* cache miss counter for debugging */
@@ -2256,6 +2257,23 @@ smol_test_runtime_keys(IndexScanDesc scan, SmolScanOpaque so)
  * This function caches the current RLE run position to provide O(1) lookups
  * for sequential scans within the same run, and O(1) amortized across a page.
  */
+/* Get cached RLE run bounds if available, avoiding linear scan through runs */
+static inline bool
+smol_get_cached_run_bounds(SmolScanOpaque so, uint16 idx, uint16 *run_start_out, uint16 *run_end_out)
+{
+    /* Check if idx is within cached run */
+    if (so->rle_cached_run_keyptr != NULL &&
+        idx >= (so->rle_cached_run_acc + 1) &&
+        idx <= so->rle_cached_run_end)
+    {
+        /* Cache hit - return cached run bounds */
+        if (run_start_out) *run_start_out = (uint16) (so->rle_cached_run_acc + 1);
+        if (run_end_out)   *run_end_out = so->rle_cached_run_end;
+        return true;
+    }
+    return false;
+}
+
 static inline char *
 smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len,
                         uint16 inc_len[], uint16 ninc, uint32 inc_cumul_offs[])
@@ -2269,6 +2287,7 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
         so->rle_cached_run_acc = 0;
         so->rle_cached_run_end = 0;
         so->rle_cached_run_keyptr = NULL;
+        so->rle_cached_run_ptr = NULL;
     }
 
     /* Check if idx is within cached run */
@@ -2310,19 +2329,13 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
     uint16 start_run = 0;
     uint32 acc = 0;
 
-    if (so->rle_cached_run_keyptr != NULL && idx > so->rle_cached_run_end)
+    if (so->rle_cached_run_ptr != NULL && idx > so->rle_cached_run_end)
     {
-        /* Forward scan - start from next run after cached */
+        /* Forward scan - resume from cached position (O(1) instead of O(N)) */
         start_run = so->rle_cached_run_idx + 1;
         acc = so->rle_cached_run_end;
-
-        /* Advance rp to the start of start_run */
-        for (uint16 r = 0; r < start_run; r++)
-        {
-            uint16 cnt;
-            memcpy(&cnt, rp + key_len, sizeof(uint16));
-            rp += (size_t) key_len + sizeof(uint16);
-        }
+        /* Calculate position of next run: cached run ptr + key + count */
+        rp = so->rle_cached_run_ptr + (size_t) key_len + sizeof(uint16);
     }
 
     /* Scan runs to find idx */
@@ -2339,6 +2352,7 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
             so->rle_cached_run_acc = acc;
             so->rle_cached_run_end = acc + cnt;
             so->rle_cached_run_keyptr = k;
+            so->rle_cached_run_ptr = rp;  /* Cache run pointer for O(1) forward scan */
             return k;
         }
 
@@ -2936,7 +2950,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 memcpy(so->run_key, k0, so->run_key_len);
                                 uint16 start = so->cur_off;
                                 uint16 dummy_end;
-                                if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
+                                /* Try cached run bounds first (O(1)) before linear scan (O(N)) */
+                                bool cached = smol_get_cached_run_bounds(so, so->cur_off, &start, &dummy_end);
+                                if (!cached && !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
                                 {
                                     /* RLE page but not encoded: scan backward to find run start */
                                     while (start > FirstOffsetNumber)
@@ -3116,7 +3132,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     /* Plain page: each row is its own run (length 1), skip scanning */
                                     start = end = so->cur_off;
                                 }
-                                else if (!smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &end, so->inc_len, so->ninclude))
+                                /* Try cached run bounds first (O(1)) before linear scan (O(N)) */
+                                else if (!smol_get_cached_run_bounds(so, so->cur_off, &start, &end) &&
+                                         !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &end, so->inc_len, so->ninclude))
                                 {
                                     /* RLE page but not encoded: scan forward to find run end */
                                     while (end < n)
