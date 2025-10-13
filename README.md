@@ -7,23 +7,14 @@ To discourage inappropriate use, the authors intentionally are not packaging SMO
 
 ## Performance
 
-SMOL indexes are **60-81% smaller** than BTREE while delivering competitive or superior query performance.
-
-### Benchmark Results (PostgreSQL 18, 1M rows)
-
-| Workload | BTREE | SMOL | Advantage |
-|----------|-------|------|-----------|
-| **Unique int4 range scan** | 13.5ms, 21MB | 15ms, 3.9MB | 81% smaller, competitive speed |
-| **Duplicate keys + INCLUDEs** | 3.2ms, 30MB | 3.9ms, 12MB | 60% smaller, competitive |
-| **Two-column selective** | 13.6ms, 21MB | 2.9ms, 7.9MB | **4.7x faster**, 62% smaller |
+SMOL indexes can be 0-99.95% smaller than B-Trees with corresponding less use of cache, memory and I/O, while providing +/- 20% performance, with edge cases providing multiplicative speedups. SMOL works best on single key columns with highly repeated values and optionally, INCLUDE column(s) that are highly repeated. For unique values, SMOL falls back to an uncompressed, "zero copy" format that's a small optimization over B-Trees in space and speed.
 
 ### When to Use SMOL
 
 ✅ **Use SMOL when:**
 - Memory-constrained environments (cloud, containers)
-- Read-heavy workloads (data warehouses, reporting)
-- Two-column indexes with selective queries
-- Fixed-width columns (int, date, uuid)
+- Read-only reporting workloads
+- Fixed-width columns (integers, date, uuid)
 - Smaller backups/faster restores matter
 
 ⚠️ **Use BTREE when:**
@@ -89,7 +80,7 @@ Overview
 - Read‑only index AM optimized for index‑only scans on append‑only data.
 - Stores only fixed‑width key values (no heap TIDs), improving density and
   cache locality.
- - Supports ordered and backward scans; no bitmap scans. Parallel planned
+- Supports ordered and backward scans; no bitmap scans. Parallel planned
    (flag exposed; shared-state chunking not implemented yet).
 
 Architecture
@@ -131,12 +122,6 @@ Build & Test (PostgreSQL 18 from source)
   - Quick regression (build, start PG, run installcheck, stop PG): `make check`
   - Start PostgreSQL (initdb if needed): `make start`
   - Stop PostgreSQL: `make stop`
-
-Usage
-- `CREATE EXTENSION smol;`
-- `CREATE INDEX idx_smol ON some_table USING smol (col1, col2);`
-- Planner: favor IOS as usual; SMOL errors on non‑IOS paths. Parallel scans
-  are supported, but see notes below on deterministic correctness testing.
 
 Tests
 - Run regression tests: `make install && make start && make installcheck && make stop`

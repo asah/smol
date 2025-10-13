@@ -3,7 +3,7 @@ EXTENSION = smol
 DATA = smol--1.0.sql
 MODULES = smol
 
-PG_CFLAGS=-Wno-declaration-after-statement
+PG_CFLAGS=-Wno-declaration-after-statement -Werror
 
 # Coverage build flags (gcov-compatible)
 ifeq ($(COVERAGE),1)

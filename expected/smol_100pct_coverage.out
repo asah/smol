@@ -46,7 +46,7 @@ CREATE INDEX t_large_idx ON t_large USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_large_idx');
  total_pages | leaf_pages 
 -------------+------------
-          53 |         50
+          77 |         74
 (1 row)
 
 -- Query to use the multi-level index
@@ -166,7 +166,7 @@ CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4,
 SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
  has_many_pages | has_many_leaves 
 ----------------+-----------------
- f              | f
+ t              | t
 (1 row)
 
 -- Backward scan exercises smol_rightmost_in_subtree navigation

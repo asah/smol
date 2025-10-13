@@ -1338,7 +1338,6 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     buildstate.index = index;
     buildstate.indexInfo = indexInfo;
     buildstate.smolleader = NULL;
-
     SMOL_LOGF("build start rel=%u idx=%u", RelationGetRelid(heap), RelationGetRelid(index));
     /* Phase timers */
     instr_time t_start, t_collect_end, t_sort_end, t_write_end;
@@ -2397,28 +2396,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                  * from the end down to (but not including) entries < bound. */
                 so->cur_off = n;
             }
-#ifdef SMOL_PLANNER_BACKWARD_UPPER_ONLY
-            else if (so->have_upper_bound)
-            {
-                /* For backward scan with upper bound only, position to last value <= upper_bound */
-                /* NOTE: PostgreSQL planner currently doesn't generate backward scans with upper-bound-only.
-                 * It uses forward scan + sort instead. Enable this when planner supports it. */
-                so->cur_off = n;
-                while (so->cur_off >= FirstOffsetNumber)
-                {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                    int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
-                    if (so->upper_bound_strict ? (c < 0) : (c <= 0))
-                        break;
-                    so->cur_off--;
-                }
-                /* If all values exceed upper bound, cur_off is now invalid */
-                if (so->cur_off < FirstOffsetNumber)
-                    so->cur_off = n + 1; /* Set to end-of-page marker */
-            }
-#endif
             else
             {
+                /* For all other backward scans, start from end */
                 so->cur_off = n;
             }
             so->cur_buf = buf; so->have_pin = true;
@@ -2729,14 +2709,19 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
     }
 
     uint32 page_visit_count = 0;
+    BlockNumber last_blk = InvalidBlockNumber;
     while (BlockNumberIsValid(so->cur_blk))
     {
         SmolPageOpaqueData *op;
         BlockNumber next;
 
-        /* Safety check: detect infinite page loops */
-        if (++page_visit_count > 10000)
-            ereport(ERROR, (errmsg("smol: infinite page loop detected, visited >10000 pages, cur_blk=%u", so->cur_blk)));
+        /* Safety check: detect infinite page loops (only count actual page changes) */
+        if (so->cur_blk != last_blk)
+        {
+            if (++page_visit_count > 10000)
+                ereport(ERROR, (errmsg("smol: infinite page loop detected, visited >10000 pages, cur_blk=%u", so->cur_blk)));
+            last_blk = so->cur_blk;
+        }
 
         /* Ensure current leaf is pinned; page pointer valid */
         if (!so->have_pin || !BufferIsValid(so->cur_buf)) 
@@ -2813,6 +2798,17 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (so->two_col)
         {
+            /* Backward scans are not supported for two-column indexes */
+            if (dir == BackwardScanDirection)
+            {
+                if (so->have_pin && BufferIsValid(so->cur_buf))
+                {
+                    ReleaseBuffer(so->cur_buf);
+                    so->have_pin = false;
+                }
+                return false;
+            }
+
             if (so->leaf_i < so->leaf_n)
             {
                 uint16 row = (uint16) (so->leaf_i + 1);
@@ -2879,29 +2875,137 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 if (so->prof_enabled) { so->prof_rows++; so->prof_bytes += (uint64)(so->key_len + so->key_len2); }
                 return true;
             }
+            /* Two-column path: page exhausted (leaf_i >= leaf_n), advance to next page */
+            SMOL_LOGF("two-col page exhausted: cur_blk=%u leaf_i=%u leaf_n=%u", so->cur_blk, (unsigned)so->leaf_i, (unsigned)so->leaf_n);
+
+            /* Parallel scan coordination: claim next batch of pages or follow local chunk */
+            if (scan->parallel_scan)
+            {
+                SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+                /* If we have a local chunk remaining, just follow rightlink */
+                if (so->chunk_left > 0)
+                {
+                    op = smol_page_opaque(page);
+                    next = op->rightlink;
+                    so->chunk_left--;
+                }
+                else
+                {
+                    /* Claim next batch of pages atomically */
+                    for (;;)
+                    {
+                        uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
+                        if (curv == (uint32) InvalidBlockNumber)
+                        { next = InvalidBlockNumber; break; }
+                        Buffer tbuf = ReadBufferExtended(idx, MAIN_FORKNUM, (BlockNumber) curv, RBM_NORMAL, so->bstrategy);
+                        Page tpg = BufferGetPage(tbuf);
+                        BlockNumber step = smol_page_opaque(tpg)->rightlink;
+                        uint32 claimed = 0;
+                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
+                        {
+                            Buffer nb = ReadBufferExtended(idx, MAIN_FORKNUM, step, RBM_NORMAL, so->bstrategy);
+                            Page np = BufferGetPage(nb);
+                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
+                            ReleaseBuffer(nb);
+                            step = rl2;
+                            claimed++;
+                        }
+                        ReleaseBuffer(tbuf);
+                        uint32 expected = curv;
+                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                        if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expected, newv))
+                        {
+                            next = (BlockNumber) curv;
+                            so->chunk_left = claimed;
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                /* Non-parallel: just follow rightlink */
+                op = smol_page_opaque(page);
+                next = op->rightlink;
+            }
+
+            SMOL_LOGF("advancing to next page: next=%u", next);
+            SMOL_DEFENSIVE_CHECK(next != so->cur_blk, ERROR,
+                (errmsg("smol: circular rightlink detected, cur_blk=%u points to itself", so->cur_blk)));
+            if (so->have_pin && BufferIsValid(so->cur_buf))
+            {
+                ReleaseBuffer(so->cur_buf);
+                so->have_pin = false;
+                so->cur_buf = InvalidBuffer;
+            }
+            if (so->prof_enabled)
+                so->prof_pages++;
+            so->cur_blk = next;
+            if (!BlockNumberIsValid(so->cur_blk))
+                return false;
+            /* Load next page and initialize row count */
+            so->cur_buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
+            so->have_pin = true;
+            page = BufferGetPage(so->cur_buf);
+            so->leaf_n = smol12_leaf_nrows(page);
+            so->leaf_i = 0;
+            /* Check bounds on new page and position to first matching row */
+            if (so->have_bound)
+            {
+                uint16 lo = FirstOffsetNumber, hi = so->leaf_n, ans = InvalidOffsetNumber;
+                while (lo <= hi)
+                {
+                    uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+                    char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2);
+                    int c = smol_cmp_keyptr_to_bound(so, k1p);
+                    if (so->bound_strict ? (c > 0) : (c >= 0))
+                    {
+                        ans = mid;
+                        hi = (uint16) (mid - 1);
+                    }
+                    else
+                        lo = (uint16) (mid + 1);
+                }
+                so->leaf_i = (ans != InvalidOffsetNumber) ? (uint32) (ans - 1) : (uint32) so->leaf_n;
+            }
+            /* Page loaded - go back to top of loop to process rows */
+            continue;
         }
         else
         {
             uint16 n = so->cur_page_nitems; /* Opt #5: use cached nitems */
             if (dir == BackwardScanDirection)
             {
-                /* Initialize cur_off for backward scans on new pages */
-                if (so->cur_off == InvalidOffsetNumber)
-                    so->cur_off = n;
+                /* For backward scans, cur_off is set during page load (line 3666).
+                 * Don't reinitialize it here - just use the value from page load.
+                 * When cur_off reaches 0 (after scanning all entries), the while loop below
+                 * will exit, and we'll advance to the next page where cur_off is set again. */
 
                 while (so->cur_off >= FirstOffsetNumber)
                 {
-                    char *keyp = smol_leaf_keyptr_ex(page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     /* For zero-copy pages, skip IndexTuple header to get key data */
-                    if (so->page_is_zerocopy) 
+                    if (so->page_is_zerocopy)
                         keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
-                    /* Check upper bound (for backward scans with <= or < bounds) */
-                    if (so->have_upper_bound)
+                    /* Check upper bound only when we have BOTH bounds (forward scan pattern)
+                     * Skip for upper-bound-only since binary search positioned us correctly */
+                    if (so->have_upper_bound && so->have_bound)
                     {
                         int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
                         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
                         {
                             /* Key exceeds upper bound, skip and continue */
+                            so->cur_off--;
+                            continue;
+                        }
+                    }
+                    /* Check upper bound for backward scans (descending order) */
+                    if (so->have_upper_bound)
+                    {
+                        int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
+                        if (so->upper_bound_strict ? (c >= 0) : (c > 0))
+                        {
+                            /* Key exceeds upper bound - skip and continue to smaller keys */
                             so->cur_off--;
                             continue;
                         }
@@ -3885,7 +3989,6 @@ smol_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                   double *indexPages)
 {
     GenericCosts costs;
-
     /* Use genericcostestimate for standard index cost calculation with parallel support */
     MemSet(&costs, 0, sizeof(costs));
     genericcostestimate(root, path, loop_count, &costs);
@@ -4127,8 +4230,6 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
              * Strategy: Start with zero-copy (most expensive), then switch to RLE/plain if beneficial.
              * This ensures pages are always maximally filled since SMOL is bulk-loaded and read-only.
              */
-            Size remaining = nkeys - i;
-
             /* PHASE 1: INCREMENTAL RLE PACKING
              * Pack tuples one-by-one, tracking RLE state, until page is full.
              * This maximizes tuples per page for low-cardinality data.
@@ -4221,7 +4322,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 Size tuple_size = sizeof(IndexTupleData) + key_len;
                 uint16 t_info = (uint16) tuple_size;
 
-                for (Size j = 0; j < n_this; j++)
+                for (Size k = 0; k < n_this; k++)
                 {
                     /* Write IndexTuple header */
                     ItemPointerData tid;
@@ -4229,7 +4330,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                     memcpy(p, &tid, sizeof(ItemPointerData)); p += sizeof(ItemPointerData);
                     memcpy(p, &t_info, sizeof(uint16)); p += sizeof(uint16);
                     /* Write key data */
-                    memcpy(p, base + j * key_len, key_len); p += key_len;
+                    memcpy(p, base + k * key_len, key_len); p += key_len;
                 }
 
                 Size sz = (Size) (p - scratch);
