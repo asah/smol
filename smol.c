@@ -6046,7 +6046,8 @@ smol_rightmost_leaf(Relation idx)
         Buffer buf = ReadBuffer(idx, blk);
         Page page = BufferGetPage(buf);
 
-        if (!PageIsEmpty(page) && PageGetSpecialSize(page) == sizeof(SmolPageOpaqueData))
+        /* Check if page has SmolPageOpaqueData (use >= to account for MAXALIGN padding) */
+        if (!PageIsEmpty(page) && PageGetSpecialSize(page) >= sizeof(SmolPageOpaqueData))
         {
             SmolPageOpaqueData *op = (SmolPageOpaqueData *) PageGetSpecialPointer(page);
             if (op->flags & SMOL_F_LEAF)

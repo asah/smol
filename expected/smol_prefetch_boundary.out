@@ -1,0 +1,41 @@
+-- Test to cover prefetch break at index boundary (line 3607)
+-- This happens when prefetch depth extends beyond the end of the index
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+-- Create a small index so prefetch can reach the boundary
+DROP TABLE IF EXISTS t_prefetch_boundary CASCADE;
+CREATE UNLOGGED TABLE t_prefetch_boundary (k int4);
+-- Insert just enough data to create a few pages
+-- With default settings, we need enough to create 3-4 pages
+INSERT INTO t_prefetch_boundary SELECT i FROM generate_series(1, 5000) i;
+CREATE INDEX idx_prefetch_boundary ON t_prefetch_boundary USING smol(k);
+-- Check index size
+SELECT total_pages, leaf_pages FROM smol_inspect('idx_prefetch_boundary');
+ total_pages | leaf_pages 
+-------------+------------
+           7 |          4
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+-- Set prefetch depth high to ensure we try to prefetch beyond end
+SET smol.prefetch_depth = 8;
+-- Do an unbounded forward scan that will trigger aggressive prefetching
+-- The prefetch logic at line 3601-3608 will try to prefetch beyond the index boundary
+-- This should hit the break at line 3607 when pb >= nblocks
+SELECT count(*) FROM t_prefetch_boundary WHERE k >= 1;
+ count 
+-------
+  5000
+(1 row)
+
+-- Try with a scan starting near the end
+SELECT count(*) FROM t_prefetch_boundary WHERE k >= 4500;
+ count 
+-------
+   501
+(1 row)
+
+-- Cleanup
+DROP TABLE t_prefetch_boundary CASCADE;

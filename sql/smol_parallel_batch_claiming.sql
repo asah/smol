@@ -1,0 +1,39 @@
+-- Test to cover parallel batch claiming loops (lines 2638-2643)
+-- Requires two-column index, parallel scan, claim_batch > 1, and bounds
+
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_index_scan_size = 0;
+
+-- Set claim batch > 1 to trigger batch claiming logic
+SET smol.parallel_claim_batch = 4;
+
+-- Create two-column index with enough pages for multiple batches
+DROP TABLE IF EXISTS t_parallel_batch CASCADE;
+CREATE UNLOGGED TABLE t_parallel_batch (
+    k1 int4,
+    k2 int4
+);
+
+-- Insert enough data to create multiple leaf pages
+INSERT INTO t_parallel_batch
+SELECT i / 10, i % 10
+FROM generate_series(1, 100000) i;
+
+CREATE INDEX idx_parallel_batch ON t_parallel_batch USING smol(k1, k2);
+ANALYZE t_parallel_batch;
+
+-- Query with bounds to trigger parallel batch claiming
+-- The WHERE clause on k1 triggers the bounded parallel scan path
+SELECT count(*) FROM t_parallel_batch WHERE k1 >= 5000;
+SELECT count(*) FROM t_parallel_batch WHERE k1 >= 1000 AND k1 < 8000;
+SELECT count(*) FROM t_parallel_batch WHERE k1 >= 0;
+
+-- Cleanup
+DROP TABLE t_parallel_batch CASCADE;
