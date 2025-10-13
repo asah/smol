@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_basic smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_between smol_parallel_batch smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_zero_copy smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_key_rle_basic smol_catalog_corrupt smol_edgecases smol_force_parallel_rescan smol_multi_type smol_parallel_build smol_parallel_rescan_attempt smol_text_norle smol_cursor_features smol_coverage_100pct smol_coverage_complete smol_equality_stop smol_page_bounds_coverage smol_page_advance_bounds smol_backward_include_sizes smol_rle_include_sizes smol_runtime_keys_coverage smol_multilevel_btree smol_zerocopy_backward smol_deep_backward_navigation smol_text_include_guc smol_parallel_build_test smol_twocol_page_advance smol_zerocopy_scan smol_zerocopy_format smol_prefetch_boundary smol_parallel_batch_claiming
+REGRESS = smol_basic smol_between smol_parallel smol_include smol_types smol_duplicates smol_rle_cache smol_text smol_twocol_uuid_int4 smol_twocol_date_int4 smol_twocol_int8 smol_io_efficiency smol_compression smol_explain_cost smol_edge_cases smol_backward_scan smol_parallel_scan smol_error_paths smol_coverage_direct smol_parallel_batch smol_edge_coverage smol_rescan_buffer smol_validate smol_growth smol_validate_errors smol_include_rle smol_loop_guard smol_rle_edge_cases smol_tree_navigation smol_rle_deep_coverage smol_key_rle_includes smol_copy_coverage smol_tall_trees smol_tall_tree_fanout smol_validate_catalog smol_int2 smol_parallel_full smol_easy_coverage smol_cost_nokey smol_options_coverage smol_text32_toolong smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_twocol_parallel_uuid_date smol_backward_varwidth smol_backward_equality smol_build_edges smol_include_rle_mismatch smol_text_multipage smol_zero_copy smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_key_rle_basic smol_catalog_corrupt smol_edgecases smol_force_parallel_rescan smol_multi_type smol_parallel_build smol_parallel_rescan_attempt smol_text_norle smol_cursor_features smol_coverage_100pct smol_coverage_complete smol_equality_stop smol_page_bounds_coverage smol_page_advance_bounds smol_backward_include_sizes smol_rle_include_sizes smol_runtime_keys_coverage smol_multilevel_btree smol_zerocopy_backward smol_deep_backward_navigation smol_text_include_guc smol_parallel_build_test smol_twocol_page_advance smol_zerocopy_scan smol_zerocopy_format smol_prefetch_boundary smol_parallel_batch_claiming
 
 # smol_debug_coverage smol_debug_log
 
@@ -32,7 +32,7 @@ dbuild:
 dstart:
 	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
 	echo "[docker] Creating docker instance 'smol' from image 'smol'"
-	docker run --init -m 4GB -d --name smol -v "$$PWD":/home/postgres smol sleep infinity
+	docker run --init -m 4GB -d -u root --name smol -v "$$PWD":/home/postgres smol sleep infinity
 	echo "[docker] Container 'smol' is ready. building..."
 	docker exec -u postgres -w /home/postgres smol make build
 	echo "[docker] starting postgresql..."
@@ -40,12 +40,13 @@ dstart:
 	echo "[docker] done/ready."
 
 # jump into the docker instance e.g. to run top
+# -e OPENAI_API_KEY="$(OPENAI_API_KEY)"
 dexec:
-	docker exec -e OPENAI_API_KEY="$(OPENAI_API_KEY)" -it -w /home/postgres smol bash
+	docker exec -it -u postgres -w /home/postgres smol bash
 
 # jump into the docker instance e.g. to run top
 dpsql:
-	docker exec -it -u postgres smol psql
+	docker exec -it -u postgres -w /home/postgres smol psql
 
 # jump into the docker and run codex - note long startup time while it reads
 #dcodex:

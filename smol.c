@@ -2850,8 +2850,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             uint16 n = so->cur_page_nitems; /* Opt #5: use cached nitems */
             if (dir == BackwardScanDirection)
             {
-                /* Initialize cur_off for backward scans on new pages */
-                if (so->cur_off == InvalidOffsetNumber)
+                /* Initialize cur_off for backward scans on new pages only
+                 * For single-column: cur_off is set at line 3520 when advancing pages
+                 * For two-column: cur_off may need initialization here
+                 * IMPORTANT: Don't reset cur_off=0, which means we finished the current page */
+                if (so->cur_off == InvalidOffsetNumber && so->two_col)
                     so->cur_off = n;
 
                 while (so->cur_off >= FirstOffsetNumber)
