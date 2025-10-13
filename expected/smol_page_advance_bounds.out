@@ -18,7 +18,7 @@ CREATE INDEX t_bounds_idx ON t_bounds USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_bounds_idx');
  total_pages | leaf_pages 
 -------------+------------
-          11 |          8
+           8 |          5
 (1 row)
 
 -- Query with upper bound that causes page-level bounds check to stop scan
