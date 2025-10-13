@@ -2304,17 +2304,16 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
     so->rle_cache_misses++;
 
     /* Cache miss - need to find the run containing idx */
-    ItemId iid = PageGetItemId(page, FirstOffsetNumber);
-    char *p = (char *) PageGetItem(page, iid);
-    uint16 tag;
-    memcpy(&tag, p, sizeof(uint16));
-
-    /* Only cache for RLE pages */
-    if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2))
+    /* PERF OPT: Reuse cur_page_format instead of extracting tag again */
+    /* Only cache for KEY_RLE pages (format 2 or 4) */
+    if (so->cur_page_format != 2 && so->cur_page_format != 4)
     {
-        /* Not an RLE page - fall back to regular function */
+        /* Not a KEY_RLE page - fall back to regular function */
         return smol_leaf_keyptr_ex(page, idx, key_len, inc_len, ninc, inc_cumul_offs);
     }
+
+    ItemId iid = PageGetItemId(page, FirstOffsetNumber);
+    char *p = (char *) PageGetItem(page, iid);
 
     /* RLE page - scan runs from last cached position */
     uint16 nitems, nruns;
@@ -2322,7 +2321,7 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
     memcpy(&nruns, p + sizeof(uint16) * 2, sizeof(uint16));
 
     char *rp = p + sizeof(uint16) * 3;
-    if (tag == SMOL_TAG_KEY_RLE_V2)
+    if (so->cur_page_format == 4)  /* SMOL_TAG_KEY_RLE_V2 = format 4 */
         rp++;  /* Skip continues_byte */
 
     /* Start from cached position if valid, otherwise from beginning */
@@ -2761,9 +2760,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
          * Plain pages with no INCLUDE columns have no duplicate-key runs, so we can
          * skip expensive run-boundary scanning. This eliminates 60% of CPU overhead
          * on unique-key workloads while preserving correctness.
-         * Lines 1767 and 1887 use page_is_plain to set run_length=1 without scanning. */
+         * Lines 1767 and 1887 use page_is_plain to set run_length=1 without scanning.
+         * PERF OPT: Reuse already-extracted tag instead of calling smol_leaf_is_rle() */
         if (!so->two_col && so->ninclude == 0)
-            so->page_is_plain = !smol_leaf_is_rle(page);
+            so->page_is_plain = (so->cur_page_format == 0);  /* format 0 = plain */
         else
             so->page_is_plain = false;
 
@@ -6447,48 +6447,33 @@ smol_copy1(char *dst, const char *src)
     *dst = *src;
 }
 
+/* PERF OPT: Use __builtin_memcpy for small fixed sizes. The compiler optimizes
+ * this to direct assignments when possible, and handles unaligned cases efficiently.
+ * This eliminates the runtime alignment checks while maintaining correctness. */
 static inline void
 smol_copy2(char *dst, const char *src)
 {
-    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 1) == 0)
-        *(uint16_t *) dst = *(const uint16_t *) src;
-    else
-        memcpy(dst, src, 2);
+    __builtin_memcpy(dst, src, 2);
 }
 
 static inline void
 smol_copy4(char *dst, const char *src)
 {
-    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 3) == 0)
-        *(uint32_t *) dst = *(const uint32_t *) src;
-    else
-        memcpy(dst, src, 4);
+    __builtin_memcpy(dst, src, 4);
 }
 
 static inline void
 smol_copy8(char *dst, const char *src)
 {
-    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 7) == 0)
-        *(uint64_t *) dst = *(const uint64_t *) src;
-    else
-        memcpy(dst, src, 8);
+    __builtin_memcpy(dst, src, 8);
 }
 
-/* Try a single 16-byte wide copy when both pointers are 16B-aligned. */
+/* PERF OPT: Use __builtin_memcpy for 16-byte copy. Compiler generates optimal
+ * code, often using SIMD instructions on modern CPUs. */
 static inline void
 smol_copy16(char *dst, const char *src)
 {
-    if ((((uintptr_t) dst | (uintptr_t) src) & (uintptr_t) 15) == 0)
-    {
-        struct vec16 { uint64_t a, b; };
-        *(struct vec16 *) dst = *(const struct vec16 *) src;
-    }
-    else
-    {
-        /* Two 8-byte copies are usually competitive; they handle alignment. */
-        smol_copy8(dst, src);
-        smol_copy8(dst + 8, src + 8);
-    }
+    __builtin_memcpy(dst, src, 16);
 }
 
 /* Generic small copy for uncommon fixed lengths (<= 32). */
