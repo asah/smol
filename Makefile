@@ -32,7 +32,7 @@ dbuild:
 dstart:
 	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
 	echo "[docker] Creating docker instance 'smol' from image 'smol'"
-	docker run -m 4GB -d --name smol -v "$$PWD":/home/postgres smol sleep infinity
+	docker run --init -m 4GB -d --name smol -v "$$PWD":/home/postgres smol sleep infinity
 	echo "[docker] Container 'smol' is ready. building..."
 	docker exec -u postgres -w /home/postgres smol make build
 	echo "[docker] starting postgresql..."
