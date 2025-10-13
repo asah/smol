@@ -3118,10 +3118,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         {
                             if (so->run_active && so->cur_off <= so->run_end_off)
                             {
-                                /* run reuse enabled */
+                                /* run reuse enabled - already have run bounds */
                             }
                             else
                             {
+                                /* Starting new run - compute bounds and cache key */
                                 const char *k0 = keyp;
                                 so->run_key_len = (so->key_len <= sizeof(so->run_key) ? so->key_len : (uint16) sizeof(so->run_key));
                                 memcpy(so->run_key, k0, so->run_key_len);

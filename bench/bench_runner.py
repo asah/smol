@@ -282,7 +282,7 @@ class Benchmark:
 
         # Create and populate table with duplicates (sorted for RLE)
         create_sql = f"""
-        CREATE TABLE {table_name}(k {dtype});
+        CREATE UNLOGGED TABLE {table_name}(k {dtype});
         INSERT INTO {table_name}
         SELECT (i % {distinct_values})::{dtype}
         FROM generate_series(1, {rows}) i
@@ -386,7 +386,7 @@ class Benchmark:
 
         # Create and populate table with duplicates (sorted for RLE)
         create_sql = f"""
-        CREATE TABLE {table_name}(k text COLLATE "C");
+        CREATE UNLOGGED TABLE {table_name}(k text COLLATE "C");
         INSERT INTO {table_name}
         SELECT CASE (i % {distinct_values})
         """
@@ -491,7 +491,7 @@ class Benchmark:
 
         # Create and populate table with duplicates (sorted for RLE)
         create_sql = f"""
-        CREATE TABLE {table_name}(k uuid);
+        CREATE UNLOGGED TABLE {table_name}(k uuid);
         INSERT INTO {table_name}
         SELECT ('00000000-0000-0000-0000-' || lpad((i % {distinct_values})::text, 12, '0'))::uuid
         FROM generate_series(1, {rows}) i
