@@ -133,6 +133,7 @@ PG_BIN := $(dir $(PG_CONFIG))
 PGDATA := /home/postgres/pgdata
 
 production: clean stop install start installcheck
+	@if ps aux | grep "/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data" | grep -v grep; then pg_ctl -D /usr/local/pgsql/data stop; fi
 	@echo "rebuilding and testing production build from scratch."
 
 buildclean:
@@ -240,6 +241,7 @@ coverage-html:
 
 # Complete coverage workflow - build, test, report, and check
 coverage: coverage-clean coverage-build coverage-test
+	@if ps aux | grep "/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data" | grep -v grep; then pg_ctl -D /usr/local/pgsql/data stop; fi
 	@echo "[coverage] Generating coverage report..."
 	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov execution completed"
 	@echo "[coverage] Checking coverage percentage..."
