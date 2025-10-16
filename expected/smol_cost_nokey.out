@@ -15,7 +15,7 @@ SET enable_bitmapscan = off;
 EXPLAIN SELECT * FROM t_cost WHERE b > 500;
                                  QUERY PLAN                                  
 -----------------------------------------------------------------------------
- Index Scan using t_cost_idx on t_cost  (cost=0.00..21.93 rows=750 width=12)
+ Index Scan using t_cost_idx on t_cost  (cost=0.00..45.12 rows=750 width=12)
    Index Cond: (b > 500)
 (2 rows)
 

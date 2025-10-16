@@ -113,9 +113,36 @@ RESET min_parallel_table_scan_size;
 RESET min_parallel_index_scan_size;
 RESET smol.prefetch_depth;
 
+-- Test 7: Use v1 RLE format to cover line 2795 (cur_page_format = 2 for SMOL_TAG_KEY_RLE)
+SET smol.key_rle_version = 'v1';
+CREATE UNLOGGED TABLE test_v1_rle(k int4);
+-- Insert duplicates to trigger RLE
+INSERT INTO test_v1_rle SELECT (i % 50)::int4 FROM generate_series(1, 5000) i ORDER BY 1;
+CREATE INDEX test_v1_rle_idx ON test_v1_rle USING smol(k);
+-- Scan to trigger format detection at line 2795
+SELECT count(*) FROM test_v1_rle WHERE k >= 10;
+SET smol.key_rle_version = 'v2';
+
+-- Test 8: Trigger smol_leaf_run_bounds_rle_ex with v2 format to cover line 5258
+-- Need backward scan on RLE v2 page with cache miss
+-- Force cache invalidation by having multiple runs and scanning in a pattern that causes cache misses
+CREATE UNLOGGED TABLE test_v2_run_bounds(k int4);
+-- Create many small runs to stress run boundary detection
+INSERT INTO test_v2_run_bounds SELECT (i % 1000)::int4 FROM generate_series(1, 10000) i ORDER BY 1;
+CREATE INDEX test_v2_run_bounds_idx ON test_v2_run_bounds USING smol(k);
+-- Backward scan with xs_want_itup to trigger run detection path
+BEGIN;
+DECLARE c_run_bounds SCROLL CURSOR FOR SELECT k FROM test_v2_run_bounds WHERE k >= 500 ORDER BY k;
+MOVE FORWARD ALL FROM c_run_bounds;
+FETCH BACKWARD 20 FROM c_run_bounds;
+CLOSE c_run_bounds;
+COMMIT;
+
 -- Cleanup
 DROP TABLE test_text_rle CASCADE;
 DROP TABLE test_uuid_rle CASCADE;
 DROP TABLE test_rle_inc_cache CASCADE;
 DROP TABLE test_text32_back CASCADE;
 DROP TABLE test_prefetch_small CASCADE;
+DROP TABLE test_v1_rle CASCADE;
+DROP TABLE test_v2_run_bounds CASCADE;

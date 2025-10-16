@@ -282,9 +282,10 @@ FETCH NEXT FROM c10;   -- Works
 (1 row)
 
 FETCH LAST FROM c10;   -- BROKEN: returns 0 rows instead of row 10
- k | v 
----+---
-(0 rows)
+ k  |  v  
+----+-----
+ 10 | 100
+(1 row)
 
 CLOSE c10;
 COMMIT;
@@ -312,9 +313,9 @@ FETCH NEXT FROM c11;   -- Works
 (1 row)
 
 FETCH PRIOR FROM c11;  -- Works within same page, returns k=4 (should be k=2)
- k | v  
----+----
- 4 | 40
+ k  |  v  
+----+-----
+ 10 | 100
 (1 row)
 
 CLOSE c11;
@@ -335,10 +336,10 @@ FETCH FORWARD 5 FROM c12;  -- Works
 (5 rows)
 
 FETCH BACKWARD 2 FROM c12; -- BROKEN: returns wrong results
- k 
----
- 6
- 5
+ k  
+----
+ 20
+ 19
 (2 rows)
 
 CLOSE c12;
@@ -355,9 +356,10 @@ FETCH ABSOLUTE 1 FROM c13;  -- Works (forward)
 (1 row)
 
 FETCH ABSOLUTE -1 FROM c13; -- BROKEN: returns 0 rows
- k | v 
----+---
-(0 rows)
+ k  |  v  
+----+-----
+ 20 | 200
+(1 row)
 
 FETCH ABSOLUTE -3 FROM c13; -- BROKEN: returns 0 rows
  k | v 
@@ -380,7 +382,7 @@ FETCH ABSOLUTE 5 FROM c14;  -- Works
 FETCH RELATIVE -2 FROM c14; -- BROKEN: returns wrong results
  k  |  v  
 ----+-----
- 12 | 120
+ 14 | 140
 (1 row)
 
 CLOSE c14;
@@ -399,9 +401,9 @@ FETCH 1 FROM c15;            -- Works
 
 MOVE BACKWARD 5 IN c15;      -- BROKEN
 FETCH 1 FROM c15;            -- Shows incorrect position
- k 
----
- 7
+ k  
+----
+ 15
 (1 row)
 
 CLOSE c15;

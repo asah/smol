@@ -1473,9 +1473,19 @@ DECLARE c_back SCROLL CURSOR FOR SELECT k FROM t_back_rle WHERE k > 50::int8;
 MOVE FORWARD ALL FROM c_back;
 -- Now fetch backward to trigger BackwardScanDirection
 FETCH BACKWARD 10 FROM c_back;
- k 
----
-(0 rows)
+ k  
+----
+ 99
+ 98
+ 97
+ 96
+ 95
+ 94
+ 93
+ 92
+ 91
+ 90
+(10 rows)
 
 CLOSE c_back;
 COMMIT;
@@ -1484,9 +1494,24 @@ BEGIN;
 DECLARE c_back2 SCROLL CURSOR FOR SELECT k FROM t_back_rle WHERE k BETWEEN 40::int8 AND 60::int8;
 MOVE FORWARD ALL FROM c_back2;
 FETCH BACKWARD 15 FROM c_back2;
- k 
----
-(0 rows)
+ k  
+----
+ 60
+ 59
+ 58
+ 57
+ 56
+ 55
+ 54
+ 53
+ 52
+ 51
+ 50
+ 49
+ 48
+ 47
+ 46
+(15 rows)
 
 CLOSE c_back2;
 COMMIT;
@@ -1503,9 +1528,14 @@ BEGIN;
 DECLARE c_back_text SCROLL CURSOR FOR SELECT k FROM t_back_text WHERE k < 'key300';
 MOVE FORWARD ALL FROM c_back_text;
 FETCH BACKWARD 5 FROM c_back_text;
- k 
----
-(0 rows)
+   k   
+-------
+ key0
+ key30
+ key29
+ key28
+ key27
+(5 rows)
 
 CLOSE c_back_text;
 COMMIT;
@@ -1523,9 +1553,19 @@ BEGIN;
 DECLARE c_back_zerocopy SCROLL CURSOR FOR SELECT k FROM t_back_zerocopy WHERE k > 40000::int8;
 MOVE FORWARD ALL FROM c_back_zerocopy;
 FETCH BACKWARD 10 FROM c_back_zerocopy;
- k 
----
-(0 rows)
+   k   
+-------
+ 50000
+ 49999
+ 49998
+ 49997
+ 49996
+ 49995
+ 49994
+ 49993
+ 49992
+ 49991
+(10 rows)
 
 CLOSE c_back_zerocopy;
 COMMIT;

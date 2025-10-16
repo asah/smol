@@ -21,7 +21,30 @@ SET enable_bitmapscan = off;
 -- This sets have_k1_eq=true (BTEqualStrategyNumber)
 -- The backward scan should terminate when c < 0 (past the equality run)
 SELECT k, v FROM t_eq_backward WHERE k = 500 ORDER BY k DESC LIMIT 20;
-ERROR:  smol supports index-only scans only
+  k  |  v  
+-----+-----
+ 500 |  10
+ 500 |  20
+ 500 |  30
+ 500 |  40
+ 500 |  50
+ 500 |  60
+ 500 |  70
+ 500 |  80
+ 500 |  90
+ 500 | 100
+ 500 | 110
+ 500 | 120
+ 500 | 130
+ 500 | 140
+ 500 | 150
+ 500 | 160
+ 500 | 170
+ 500 | 180
+ 500 | 190
+ 500 | 200
+(20 rows)
+
 -- Test with text key and varwidth to hit line 1982 (has_varwidth path)
 DROP TABLE IF EXISTS t_eq_text_backward CASCADE;
 CREATE UNLOGGED TABLE t_eq_text_backward (k text COLLATE "C", v int4);
@@ -34,7 +57,30 @@ CREATE INDEX idx_eq_text_backward ON t_eq_text_backward USING smol(k);
 ANALYZE t_eq_text_backward;
 -- Equality scan backward with text (varwidth)
 SELECT k, v FROM t_eq_text_backward WHERE k = 'key_500' ORDER BY k DESC LIMIT 20;
-ERROR:  smol supports index-only scans only
+    k    |  v  
+---------+-----
+ key_500 |  10
+ key_500 |  20
+ key_500 |  30
+ key_500 |  40
+ key_500 |  50
+ key_500 |  60
+ key_500 |  70
+ key_500 |  80
+ key_500 |  90
+ key_500 | 100
+ key_500 | 110
+ key_500 | 120
+ key_500 | 130
+ key_500 | 140
+ key_500 | 150
+ key_500 | 160
+ key_500 | 170
+ key_500 | 180
+ key_500 | 190
+ key_500 | 200
+(20 rows)
+
 -- Test with int8 key to hit line 1988 (key_len == 8)
 DROP TABLE IF EXISTS t_eq_int8_backward CASCADE;
 CREATE UNLOGGED TABLE t_eq_int8_backward (k int8);

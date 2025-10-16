@@ -30,8 +30,8 @@ FETCH 5 FROM c1;
 FETCH BACKWARD 2 FROM c1;
   a  
 -----
- 106
- 105
+ 104
+ 103
 (2 rows)
 
 FETCH FORWARD 3 FROM c1;

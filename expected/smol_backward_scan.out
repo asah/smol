@@ -41,19 +41,35 @@ CREATE INDEX t_back1b_smol ON t_back1b USING smol(k);
 BEGIN;
 DECLARE c1 CURSOR FOR SELECT k FROM t_back1b ORDER BY k;
 FETCH LAST FROM c1;
- k 
----
-(0 rows)
+  k   
+------
+ 1000
+(1 row)
 
 FETCH BACKWARD 5 FROM c1;
- k 
----
-(0 rows)
+  k  
+-----
+ 999
+ 998
+ 997
+ 996
+ 995
+(5 rows)
 
 FETCH BACKWARD 10 FROM c1;
- k 
----
-(0 rows)
+  k  
+-----
+ 994
+ 993
+ 992
+ 991
+ 990
+ 989
+ 988
+ 987
+ 986
+ 985
+(10 rows)
 
 COMMIT;
 DROP INDEX t_back1b_smol;
@@ -78,33 +94,40 @@ SELECT k, v FROM t_back2 WHERE k >= 1000 ORDER BY k DESC LIMIT 5;
 BEGIN;
 DECLARE c2 CURSOR FOR SELECT k, v FROM t_back2 WHERE k >= 1000 ORDER BY k;
 FETCH LAST FROM c2;
- k | v 
----+---
-(0 rows)
+  k   |   v   
+------+-------
+ 5000 | 50000
+(1 row)
 
 FETCH BACKWARD 3 FROM c2;
- k | v 
----+---
-(0 rows)
+  k   |   v   
+------+-------
+ 4999 | 49990
+ 4998 | 49980
+ 4997 | 49970
+(3 rows)
 
 COMMIT;
 -- Verify correctness by checking results
 BEGIN;
 DECLARE c3 CURSOR FOR SELECT k FROM t_back2 WHERE k >= 4990 ORDER BY k;
 FETCH LAST FROM c3;
- k 
----
-(0 rows)
+  k   
+------
+ 5000
+(1 row)
 
 FETCH BACKWARD 1 FROM c3;
- k 
----
-(0 rows)
+  k   
+------
+ 4999
+(1 row)
 
 FETCH BACKWARD 1 FROM c3;
- k 
----
-(0 rows)
+  k   
+------
+ 4998
+(1 row)
 
 COMMIT;
 DROP INDEX t_back2_smol;
@@ -117,14 +140,20 @@ CREATE INDEX t_back_int2_smol ON t_back_int2 USING smol(k);
 BEGIN;
 DECLARE c4 CURSOR FOR SELECT k FROM t_back_int2 WHERE k >= 100::int2 ORDER BY k;
 FETCH LAST FROM c4;
- k 
----
-(0 rows)
+   k   
+-------
+ 10000
+(1 row)
 
 FETCH BACKWARD 5 FROM c4;
- k 
----
-(0 rows)
+  k   
+------
+ 9999
+ 9998
+ 9997
+ 9996
+ 9995
+(5 rows)
 
 COMMIT;
 DROP INDEX t_back_int2_smol;
@@ -184,14 +213,20 @@ CREATE INDEX t_back_int8_smol ON t_back_int8 USING smol(k);
 BEGIN;
 DECLARE c_int8 CURSOR FOR SELECT k FROM t_back_int8 WHERE k >= 100::int8 ORDER BY k;
 FETCH LAST FROM c_int8;
- k 
----
-(0 rows)
+  k   
+------
+ 1000
+(1 row)
 
 FETCH BACKWARD 5 FROM c_int8;
- k 
----
-(0 rows)
+  k  
+-----
+ 999
+ 998
+ 997
+ 996
+ 995
+(5 rows)
 
 COMMIT;
 DROP INDEX t_back_int8_smol;
@@ -204,14 +239,20 @@ CREATE INDEX t_back_text_smol ON t_back_text USING smol(s);
 BEGIN;
 DECLARE c_text CURSOR FOR SELECT s FROM t_back_text WHERE s >= 'key_000100' ORDER BY s;
 FETCH LAST FROM c_text;
- s 
----
-(0 rows)
+     s      
+------------
+ key_001000
+(1 row)
 
 FETCH BACKWARD 5 FROM c_text;
- s 
----
-(0 rows)
+     s      
+------------
+ key_000999
+ key_000998
+ key_000997
+ key_000996
+ key_000995
+(5 rows)
 
 COMMIT;
 DROP INDEX t_back_text_smol;

@@ -16,16 +16,29 @@ BEGIN;
 DECLARE c1 CURSOR FOR SELECT k, v FROM t_rescan WHERE k >= 100;
 -- Fetch some rows (this will pin a buffer in the scan state)
 FETCH 5 FROM c1;
-ERROR:  smol supports index-only scans only
+  k  |  v   
+-----+------
+ 100 | 1000
+ 101 | 1010
+ 102 | 1020
+ 103 | 1030
+ 104 | 1040
+(5 rows)
+
 -- Close and reopen cursor (this should trigger rescan which releases buffer)
 CLOSE c1;
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
 DECLARE c1 CURSOR FOR SELECT k, v FROM t_rescan WHERE k >= 200;
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
 FETCH 5 FROM c1;
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
+  k  |  v   
+-----+------
+ 200 | 2000
+ 201 | 2010
+ 202 | 2020
+ 203 | 2030
+ 204 | 2040
+(5 rows)
+
 CLOSE c1;
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
 COMMIT;
 -- Try with nested loop join that might trigger rescan
 DROP TABLE IF EXISTS t_outer CASCADE;

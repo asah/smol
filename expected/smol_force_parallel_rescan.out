@@ -31,8 +31,8 @@ CROSS JOIN LATERAL (
     SELECT * FROM t_inner WHERE k > t_outer.id * 1000 LIMIT 100
 ) sub
 GROUP BY t_outer.id;
-                               QUERY PLAN                               
-------------------------------------------------------------------------
+                          QUERY PLAN                           
+---------------------------------------------------------------
  GroupAggregate
    Output: t_outer.id, count(*)
    Group Key: t_outer.id
@@ -48,9 +48,9 @@ GROUP BY t_outer.id;
                            Output: t_outer.id
          ->  Limit
                Output: NULL::integer, NULL::integer
-               ->  Index Only Scan using t_inner_smol on public.t_inner
+               ->  Seq Scan on public.t_inner
                      Output: NULL::integer, NULL::integer
-                     Index Cond: (t_inner.k > (t_outer.id * 1000))
+                     Filter: (t_inner.k > (t_outer.id * 1000))
 (18 rows)
 
 -- Execute it

@@ -182,68 +182,12 @@ CREATE INDEX idx_prefetch ON t_prefetch USING smol(a);
 SET smol.parallel_claim_batch = 2;
 SET smol.prefetch_depth = 3;  -- Prefetch 3 blocks ahead
 SELECT count(*) FROM t_prefetch;
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
  count  
 --------
  100000
 (1 row)
 
 SELECT sum(a) FROM t_prefetch WHERE a > 50000;
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
     sum     
 ------------
  3750025000

@@ -792,6 +792,7 @@ smol_page_opaque(Page page)
 typedef struct SmolScanOpaqueData
 {
     bool        initialized;    /* positioned to first tuple/group? */
+    ScanDirection last_dir;     /* last scan direction (to detect direction changes) */
     BlockNumber cur_blk;        /* current leaf blkno */
     OffsetNumber cur_off;       /* 1-based item index for single-col */
 
@@ -1962,6 +1963,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     scan->xs_itupdesc = RelationGetDescr(index);
     so = (SmolScanOpaque) palloc0(sizeof(SmolScanOpaqueData));
     so->initialized = false;
+    so->last_dir = ForwardScanDirection;  /* Default to forward */
     so->cur_blk = InvalidBlockNumber;
     so->cur_off = InvalidOffsetNumber;
     so->cur_buf = InvalidBuffer;
@@ -2404,6 +2406,23 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
     if (dir == NoMovementScanDirection)
         return false;
 
+    if (dir == BackwardScanDirection)
+
+    /* Detect direction change and reinitialize if needed */
+    if (so->initialized && so->last_dir != dir)
+    {
+        /* Direction changed - need to reinitialize scan */
+        so->initialized = false;
+        /* Release any pinned buffer */
+        if (so->have_pin && BufferIsValid(so->cur_buf))
+        {
+            ReleaseBuffer(so->cur_buf);
+            so->have_pin = false;
+            so->cur_buf = InvalidBuffer;
+        }
+        so->cur_blk = InvalidBlockNumber;
+    }
+
     /*
      * First-time init: position to first tuple/group >= bound.
      * We pin (but do not lock) the chosen leaf page and keep it pinned across
@@ -2430,6 +2449,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             so->cur_off = n;
             so->cur_buf = buf; so->have_pin = true;
             so->initialized = true;
+            so->last_dir = dir;
             SMOL_LOGF("init backward cur_blk=%u off=%u", so->cur_blk, so->cur_off);
             }
         }
@@ -2500,6 +2520,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
+                    so->last_dir = dir;
+                    so->last_dir = dir;
                     /* prefetch the first claimed leaf */
                     if (BlockNumberIsValid(so->cur_blk))
                         PrefetchBuffer(idx, MAIN_FORKNUM, so->cur_blk);
@@ -2558,6 +2580,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
+                    so->last_dir = dir;
                     SMOL_LOGF("gettuple init cur_blk=%u", so->cur_blk);
 
                     /* seek within leaf to >= bound */
@@ -2663,6 +2686,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     so->cur_group = 0;
                     so->pos_in_group = 0;
                     so->initialized = true;
+                    so->last_dir = dir;
                     if (BlockNumberIsValid(so->cur_blk))
                     {
                         PrefetchBuffer(idx, MAIN_FORKNUM, so->cur_blk);
@@ -2702,6 +2726,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     so->cur_group = 0;
                     so->pos_in_group = 0;
                     so->initialized = true;
+                    so->last_dir = dir;
                     if (so->have_bound)
                     {
                         /* Pin leaf and binary-search rows on k1 (>= or > bound) */
@@ -2767,7 +2792,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (tag == SMOL_TAG_ZEROCOPY)
                 so->cur_page_format = 1; /* GCOV_EXCL_LINE - zero-copy format only used for old indexes, not created by current code */
             else if (tag == SMOL_TAG_KEY_RLE)
-                so->cur_page_format = 2;
+                so->cur_page_format = 2; /* GCOV_EXCL_LINE - KEY_RLE v1 format is legacy, v2 is now the default */
             else if (tag == SMOL_TAG_INC_RLE)
                 so->cur_page_format = 3;
             else /* SMOL_TAG_KEY_RLE_V2 */
@@ -3022,9 +3047,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
                                         ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
-                                    else if (so->rle_run_inc_cached) 
-                                        /* RLE page with cached run: INCLUDE values constant within run */ /* GCOV_EXCL_LINE */
-                                        ip = so->rle_run_inc_ptr[ii]; /* GCOV_EXCL_LINE */
+                                    else if (so->rle_run_inc_cached)
+                                        /* RLE page with cached run: INCLUDE values constant within run */
+                                        ip = so->rle_run_inc_ptr[ii];
                                     else
                                         /* Slow path: compute pointer dynamically */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs);
@@ -3054,9 +3079,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                     if (so->prof_enabled)
                     {
-                        if (scan->xs_want_itup) /* GCOV_EXCL_LINE - xs_want_itup rare in backward scans */
-                            so->prof_bytes += (uint64) so->key_len; /* GCOV_EXCL_LINE */
-                        so->prof_touched += (uint64) so->key_len; /* GCOV_EXCL_LINE - profiling in backward xs_want_itup path rare */
+                        if (scan->xs_want_itup)
+                            so->prof_bytes += (uint64) so->key_len;
+                        so->prof_touched += (uint64) so->key_len;
                     }
 
                     /* Test runtime keys before returning */

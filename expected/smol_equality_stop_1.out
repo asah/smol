@@ -1,5 +1,6 @@
 -- Test equality bound stop optimization (lines 980-981)
 -- This test verifies that when scanning for k=X, SMOL stops as soon as it finds a page where first_key > X
+SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET enable_seqscan = off;
