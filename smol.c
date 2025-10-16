@@ -1044,13 +1044,10 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
         if (cmp != 0) return (cmp > 0) - (cmp < 0);
         return (klen > blen) - (klen < blen);
     }
-#ifdef SMOL_PLANNER_BACKWARD_UPPER
-    /* Generic comparator only needed for backward scans with upper bounds on non-INT/TEXT types.
-     * Since planner doesn't generate backward scans with upper bounds, this is unreachable. */
-    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
-#else
-    return 0; /* GCOV_EXCL_LINE - unreachable without SMOL_PLANNER_BACKWARD_UPPER */
-#endif
+    /* Generic comparator for backward scans with upper bounds on non-INT/TEXT types (e.g., UUID, TIMESTAMP, FLOAT8). */
+    if (so->have_upper_bound)
+        return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
+    return 0; /* No upper bound - all keys pass */
 }
 
 /* Page-level bounds checking: returns true if page might have matching tuples
