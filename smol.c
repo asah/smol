@@ -222,10 +222,8 @@ static int smol_cas_fail_every = 0;  /* 0=normal, N=fail every Nth CAS */
 static int smol_growth_threshold_test = 0;  /* 0=normal (8M), >0=override threshold for testing growth */
 static int smol_force_loop_guard_test = 0;  /* 0=off, >0=force n_this=0 after N iterations to test loop guard */
 static int smol_loop_guard_iteration = 0;   /* Counter for loop guard test */
-static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children per internal node to force tall trees */
 static int smol_test_force_realloc_at = 0;  /* 0=disabled, >0=force reallocation when next_n reaches this value */
 static bool smol_test_force_page_bounds_check = false;  /* Force page-level bounds checking even when planner doesn't set it up */
-static int smol_test_max_tuples_per_page = 0;  /* 0=unlimited, >0=cap tuples per leaf page to force taller trees */
 static int smol_test_force_parallel_workers = 0;  /* 0=use planner's decision, >0=force N parallel workers for testing */
 /* Note: Parallel CAS retry (line ~1700) proved too difficult to reliably test with synthetic worker coordination */
 
@@ -254,6 +252,10 @@ static int smol_test_force_parallel_workers = 0;  /* 0=use planner's decision, >
 #define SMOL_ATOMIC_READ_U32(ptr) pg_atomic_read_u32(ptr)
 #define SMOL_ATOMIC_CAS_U32(ptr, expected, newval) pg_atomic_compare_exchange_u32(ptr, expected, newval)
 #endif
+
+/* Test GUCs available in all builds for testing edge cases */
+static int smol_test_max_internal_fanout = 0;  /* 0=unlimited, >0=limit children per internal node to force tall trees */
+static int smol_test_max_tuples_per_page = 0;  /* 0=unlimited, >0=cap tuples per leaf page to force taller trees */
 
 void _PG_init(void);
 
@@ -333,17 +335,6 @@ _PG_init(void)
                             0,
                             NULL, NULL, NULL);
 
-    DefineCustomIntVariable("smol.test_max_internal_fanout",
-                            "TEST ONLY: Limit internal node fanout to force tall trees",
-                            "For coverage testing: limit children per internal node (0=unlimited, >0=max children)",
-                            &smol_test_max_internal_fanout,
-                            0, /* default: unlimited */
-                            0, /* min */
-                            10000, /* max */
-                            PGC_USERSET,
-                            0,
-                            NULL, NULL, NULL);
-
     DefineCustomIntVariable("smol.test_force_realloc_at",
                             "TEST ONLY: Force next_blks reallocation when next_n reaches this value",
                             "For coverage testing: trigger array reallocation (0=disabled, >0=force at value)",
@@ -364,17 +355,6 @@ _PG_init(void)
                              0,
                              NULL, NULL, NULL);
 
-    DefineCustomIntVariable("smol.test_max_tuples_per_page",
-                            "TEST ONLY: Cap tuples per leaf page to force taller trees",
-                            "For coverage testing: limit tuples per page (0=unlimited)",
-                            &smol_test_max_tuples_per_page,
-                            0, /* default: unlimited */
-                            0, /* min */
-                            10000, /* max */
-                            PGC_USERSET,
-                            0,
-                            NULL, NULL, NULL);
-
     DefineCustomIntVariable("smol.test_force_parallel_workers",
                             "For coverage testing: force N parallel workers (0=use planner's decision)",
                             "For coverage testing: force N parallel workers (0=use planner's decision)",
@@ -386,6 +366,29 @@ _PG_init(void)
                             0,
                             NULL, NULL, NULL);
 #endif
+
+    /* Test GUCs available in all builds */
+    DefineCustomIntVariable("smol.test_max_internal_fanout",
+                            "TEST ONLY: Limit internal node fanout to force tall trees",
+                            "For coverage testing: limit children per internal node (0=unlimited, >0=max children)",
+                            &smol_test_max_internal_fanout,
+                            0, /* default: unlimited */
+                            0, /* min */
+                            10000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.test_max_tuples_per_page",
+                            "TEST ONLY: Cap tuples per leaf page to force taller trees",
+                            "For coverage testing: limit tuples per page (0=unlimited)",
+                            &smol_test_max_tuples_per_page,
+                            0, /* default: unlimited */
+                            0, /* min */
+                            10000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
 
     DefineCustomRealVariable("smol.cost_page",
                              "Cost multiplier for SMOL page I/O (values > 1 penalize smol)",
@@ -2443,14 +2446,27 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* position within leaf: set to end; we'll walk backward */
             buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
             page = BufferGetPage(buf);
+
+            if (so->two_col)
             {
-            uint16 n = smol_leaf_nitems(page);
-            /* For backward scans, start at the end and scan backward */
-            so->cur_off = n;
-            so->cur_buf = buf; so->have_pin = true;
-            so->initialized = true;
-            so->last_dir = dir;
-            SMOL_LOGF("init backward cur_blk=%u off=%u", so->cur_blk, so->cur_off);
+                /* Two-column backward scan: initialize leaf_i for backward iteration */
+                so->leaf_n = smol12_leaf_nrows(page);
+                so->leaf_i = (so->leaf_n > 0) ? (so->leaf_n - 1) : 0;
+                so->cur_buf = buf; so->have_pin = true;
+                so->initialized = true;
+                so->last_dir = dir;
+                smol_run_reset(so);
+                SMOL_LOGF("init backward two-col cur_blk=%u leaf_i=%u leaf_n=%u", so->cur_blk, so->leaf_i, so->leaf_n);
+            }
+            else
+            {
+                /* Single-column backward scan: use cur_off */
+                uint16 n = smol_leaf_nitems(page);
+                so->cur_off = n;
+                so->cur_buf = buf; so->have_pin = true;
+                so->initialized = true;
+                so->last_dir = dir;
+                SMOL_LOGF("init backward cur_blk=%u off=%u", so->cur_blk, so->cur_off);
             }
         }
         else
@@ -2852,7 +2868,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     int c = smol_cmp_keyptr_to_bound(so, k1p);
                     if (so->bound_strict ? (c <= 0) : (c < 0))
-                    { so->leaf_i++; continue; }
+                    {
+                        if (dir == BackwardScanDirection) so->leaf_i--; else so->leaf_i++;
+                        continue;
+                    }
                     if (so->have_k1_eq && c > 0)
                     {
                         /* Leading-key equality: once we see > bound on any leaf, we're done overall. */
@@ -2881,7 +2900,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     else if (so->key_len2 == 4) { int32 t; memcpy(&t, k2p, 4); v = (int64) t; }
                     else /* 8 */ { int64 t; memcpy(&t, k2p, 8); v = t; }
                     if (v != so->k2_eq)
-                    { so->leaf_i++; continue; }
+                    {
+                        if (dir == BackwardScanDirection) so->leaf_i--; else so->leaf_i++;
+                        continue;
+                    }
                 }
                 /* Optimized copies for common fixed lengths; fallback for others */
                 if (so->key_len == 2) smol_copy2(so->itup_data, k1p);
@@ -2899,12 +2921,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 /* Test runtime keys before returning */
                 if (!smol_test_runtime_keys(scan, so))
                 {
-                    so->leaf_i++;
+                    if (dir == BackwardScanDirection) so->leaf_i--; else so->leaf_i++;
                     continue; /* Skip this tuple, doesn't match all keys */
                 }
 
                 scan->xs_itup = so->itup; ItemPointerSet(&(scan->xs_heaptid), 0, 1);
-                so->leaf_i++;
+                if (dir == BackwardScanDirection) so->leaf_i--; else so->leaf_i++;
                 if (so->prof_enabled) { so->prof_rows++; so->prof_bytes += (uint64)(so->key_len + so->key_len2); }
                 return true;
             }
@@ -4256,11 +4278,9 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 n_this++;
                 j++;
 
-#ifdef SMOL_TEST_COVERAGE
                 /* Test GUC: cap tuples per page */
                 if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
                     break;
-#endif
             }
 
             SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
@@ -4646,11 +4666,9 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
             use_inc_rle = false;
         }
 
-#ifdef SMOL_TEST_COVERAGE
         /* Test GUC: cap tuples per page to force taller trees */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
-#endif
 
         SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
             (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
@@ -4855,11 +4873,9 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
             use_inc_rle = false;
         }
 
-#ifdef SMOL_TEST_COVERAGE
         /* Test GUC: cap tuples per page to force taller trees */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
-#endif
 
         SMOL_DEFENSIVE_CHECK(n_this > 0, ERROR,
             (errmsg("smol: cannot fit tuple with INCLUDE on a leaf (perrow=%zu avail=%zu)", (size_t) perrow, (size_t) avail)));
@@ -5400,14 +5416,12 @@ smol_build_internal_levels(Relation idx,
                     break;
                 }
                 children_added++;
-#ifdef SMOL_TEST_COVERAGE
                 /* For testing: limit fanout to force tall trees */
                 if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
                 {
                     i++;  /* Move to next child for next page */
                     break;
                 }
-#endif
             }
             pfree(item);
             MarkBufferDirty(ibuf);
@@ -5501,14 +5515,12 @@ smol_build_internal_levels_bytes(Relation idx,
                 if (off == InvalidOffsetNumber)
                     break; /* GCOV_EXCL_LINE - requires multi-column variable-width keys feature */
                 children_added++;
-#ifdef SMOL_TEST_COVERAGE
                 /* For testing: limit fanout to force tall trees */
                 if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
                 {
-                    i++;  
-                    break; 
+                    i++;
+                    break;
                 }
-#endif
             }
             MarkBufferDirty(ibuf);
 #ifdef SMOL_TEST_COVERAGE
@@ -5617,11 +5629,9 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         SMOL_DEFENSIVE_CHECK(max_n_plain > 0, ERROR, (errmsg("smol: cannot fit any tuple on a leaf (key_len=%u)", key_len)));
         Size n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
 
-#ifdef SMOL_TEST_COVERAGE
         /* Test GUC: cap tuples per page to force taller trees */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
-#endif
 
         /* Collect n_this tuples into a buffer for RLE analysis */
         char *keys_buf = (char *) palloc(n_this * key_len);
@@ -5918,7 +5928,6 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
                 delta_size = key_len + sizeof(uint16);
             }
 
-#ifdef SMOL_TEST_COVERAGE
             /* Apply test GUC limit */
             if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
             {
@@ -5928,7 +5937,6 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
                 has_pending = true;
                 break;
             }
-#endif
 
             /* Check nitems limit (uint16 max - must stay below 65535 to avoid overflow in scan loop) */
             if (n_this >= 65534)
