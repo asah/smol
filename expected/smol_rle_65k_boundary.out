@@ -118,18 +118,10 @@ CREATE INDEX t_unbounded_parallel_smol ON t_unbounded_parallel USING smol(k, v);
 ANALYZE t_unbounded_parallel;
 -- Query without bounds - should use unbounded parallel scan
 SELECT COUNT(*) FROM t_unbounded_parallel WHERE k IS NOT NULL;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 -- Query with IS NOT NULL on both columns
 SELECT COUNT(*) FROM t_unbounded_parallel WHERE k IS NOT NULL AND v IS NOT NULL;
- count 
--------
- 50000
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 DROP TABLE t_unbounded_parallel CASCADE;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;

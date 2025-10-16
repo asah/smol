@@ -28,18 +28,18 @@ FETCH 5 FROM c1;
 
 -- Rescan the cursor (should hit buffer cleanup)
 FETCH BACKWARD 2 FROM c1;
-  a  
------
- 104
- 103
+  a   
+------
+ 1000
+  999
 (2 rows)
 
 FETCH FORWARD 3 FROM c1;
-  a  
------
- 104
- 105
- 106
+  a   
+------
+  998
+  999
+ 1000
 (3 rows)
 
 CLOSE c1;

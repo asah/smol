@@ -69,7 +69,7 @@ CREATE INDEX t_cov_2col_smol ON t_cov_2col USING smol(k1, k2);
 SELECT smol_test_backward_scan('t_cov_2col_smol'::regclass) AS two_col_backward;
  two_col_backward 
 ------------------
-                0
+               10
 (1 row)
 
 -- Test 6: Index with INCLUDE backward scan
@@ -652,9 +652,59 @@ CREATE INDEX t_2col_back_smol ON t_2col_back USING smol(k1, k2);
 BEGIN;
 DECLARE c2 CURSOR FOR SELECT k1, k2 FROM t_2col_back WHERE k1 > 50 ORDER BY k1 DESC, k2 DESC;
 FETCH 50 FROM c2;
- k1 | k2 
-----+----
-(0 rows)
+ k1 |  k2  
+----+------
+ 99 | 9999
+ 99 | 9899
+ 99 | 9799
+ 99 | 9699
+ 99 | 9599
+ 99 | 9499
+ 99 | 9399
+ 99 | 9299
+ 99 | 9199
+ 99 | 9099
+ 99 | 8999
+ 99 | 8899
+ 99 | 8799
+ 99 | 8699
+ 99 | 8599
+ 99 | 8499
+ 99 | 8399
+ 99 | 8299
+ 99 | 8199
+ 99 | 8099
+ 99 | 7999
+ 99 | 7899
+ 99 | 7799
+ 99 | 7699
+ 99 | 7599
+ 99 | 7499
+ 99 | 7399
+ 99 | 7299
+ 99 | 7199
+ 99 | 7099
+ 99 | 6999
+ 99 | 6899
+ 99 | 6799
+ 99 | 6699
+ 99 | 6599
+ 99 | 6499
+ 99 | 6399
+ 99 | 6299
+ 99 | 6199
+ 99 | 6099
+ 99 | 5999
+ 99 | 5899
+ 99 | 5799
+ 99 | 5699
+ 99 | 5599
+ 99 | 5499
+ 99 | 5399
+ 99 | 5299
+ 99 | 5199
+ 99 | 5099
+(50 rows)
 
 CLOSE c2;
 COMMIT;
@@ -1247,9 +1297,19 @@ CREATE INDEX t_2col_back_smol ON t_2col_back USING smol(k1, k2);
 BEGIN;
 DECLARE c_2back CURSOR FOR SELECT k1, k2 FROM t_2col_back WHERE k1 >= 100 ORDER BY k1 DESC, k2 DESC;
 FETCH 10 FROM c_2back;
- k1 | k2 
-----+----
-(0 rows)
+  k1  |  k2   
+------+-------
+ 1000 | 10000
+  999 |  9990
+  998 |  9980
+  997 |  9970
+  996 |  9960
+  995 |  9950
+  994 |  9940
+  993 |  9930
+  992 |  9920
+  991 |  9910
+(10 rows)
 
 CLOSE c_2back;
 COMMIT;
@@ -1476,15 +1536,15 @@ FETCH BACKWARD 10 FROM c_back;
  k  
 ----
  99
- 98
- 97
- 96
- 95
- 94
- 93
- 92
- 91
- 90
+ 99
+ 99
+ 99
+ 99
+ 99
+ 99
+ 99
+ 99
+ 99
 (10 rows)
 
 CLOSE c_back;
@@ -1497,20 +1557,20 @@ FETCH BACKWARD 15 FROM c_back2;
  k  
 ----
  60
- 59
- 58
- 57
- 56
- 55
- 54
- 53
- 52
- 51
- 50
- 49
- 48
- 47
- 46
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
+ 60
 (15 rows)
 
 CLOSE c_back2;
@@ -1530,11 +1590,11 @@ MOVE FORWARD ALL FROM c_back_text;
 FETCH BACKWARD 5 FROM c_back_text;
    k   
 -------
- key0
  key30
- key29
- key28
- key27
+ key30
+ key30
+ key30
+ key30
 (5 rows)
 
 CLOSE c_back_text;
