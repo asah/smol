@@ -72,22 +72,14 @@ dclaude:
 .PHONY: bench bench-quick bench-full bench-thrash bench-repeats
 .PHONY: bench-pressure bench-extreme bench-legacy
 
-# Main benchmark targets using Python runner (pretty output)
+# Main benchmark targets using Python runner (new v2 suite)
 bench-quick: start
 	@echo "$(shell tput bold)Running quick benchmark suite...$(shell tput sgr0)"
-	@python3 bench/bench_runner.py --quick
+	@python3 bench/runner.py --quick
 
 bench-full: start
 	@echo "$(shell tput bold)Running full comprehensive benchmark suite...$(shell tput sgr0)"
-	@python3 bench/bench_runner.py --full
-
-bench-thrash: start
-	@echo "$(shell tput bold)Running thrashing test...$(shell tput sgr0)"
-	@python3 bench/bench_runner.py --thrash
-
-bench-repeats: start
-	@echo "$(shell tput bold)Running benchmark with 5 repetitions...$(shell tput sgr0)"
-	@python3 bench/bench_runner.py --quick --repeats 5
+	@python3 bench/runner.py --full
 
 # Convenience alias
 bench: bench-quick
@@ -95,31 +87,30 @@ bench: bench-quick
 # Help target for benchmarks
 bench-help:
 	@echo ""
-	@echo "$(shell tput bold)SMOL Benchmark Suite$(shell tput sgr0)"
+	@echo "$(shell tput bold)SMOL Benchmark Suite v2$(shell tput sgr0)"
 	@echo "════════════════════════════════════════════════════════════════"
 	@echo ""
 	@echo "$(shell tput bold)Quick Start:$(shell tput sgr0)"
 	@echo "  make bench              # Run quick benchmark (alias for bench-quick)"
-	@echo "  make bench-quick        # Quick suite (3 tests, ~30s)"
-	@echo "  make bench-full         # Full comprehensive suite (~2-5 min)"
-	@echo "  make bench-thrash       # Cache efficiency test (large dataset)"
-	@echo "  make bench-repeats      # Quick suite with 5 repetitions"
+	@echo "  make bench-quick        # Quick suite (~30 sec, 17 workloads)"
+	@echo "  make bench-full         # Full comprehensive suite (~15-20 min)"
+	@echo ""
+	@echo "$(shell tput bold)Features:$(shell tput sgr0)"
+	@echo "  • Auto-scales based on shared_buffers"
+	@echo "  • 5 workload classes (timeseries, dimension, events, sparse, composite)"
+	@echo "  • Regression detection against baseline"
+	@echo "  • Decision tree recommendations"
 	@echo ""
 	@echo "$(shell tput bold)Output:$(shell tput sgr0)"
-	@echo "  • Pretty console output with color-coded performance"
-	@echo "  • CSV files saved to results/ directory"
-	@echo "  • Speedup ratios and compression statistics"
-	@echo ""
-	@echo "$(shell tput bold)Legacy SQL Benchmarks:$(shell tput sgr0)"
-	@echo "  make bench-pressure     # Buffer pressure test (20M rows)"
-	@echo "  make bench-extreme      # Extreme compression test"
-	@echo "  make bench-legacy       # Both legacy tests"
+	@echo "  • JSON results in bench/results/"
+	@echo "  • Markdown reports"
+	@echo "  • Actionable SMOL vs BTREE recommendations"
 	@echo ""
 	@echo "$(shell tput bold)Direct Python Usage:$(shell tput sgr0)"
-	@echo "  python3 bench/bench_runner.py --quick"
-	@echo "  python3 bench/bench_runner.py --full --repeats 10"
+	@echo "  python3 bench/runner.py --quick"
+	@echo "  python3 bench/runner.py --full"
 	@echo ""
-	@echo "See bench/README.md for detailed documentation"
+	@echo "Legacy benchmarks archived in bench/archive/"
 	@echo ""
 
 # ---------------------------------------------------------------------------
