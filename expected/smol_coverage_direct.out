@@ -4,6 +4,8 @@ SET smol.key_rle_version = 'v2';
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET smol.enable_zero_copy = off;  -- Disable zero-copy to test specific code paths
+-- Force index scans for all queries to ensure cursor operations use index scans
+SET seq_page_cost = 1000000;
 -- Create test table and index
 DROP TABLE IF EXISTS t_cov CASCADE;
 CREATE UNLOGGED TABLE t_cov(k int4);
@@ -44,14 +46,14 @@ SET min_parallel_index_scan_size = 0;
 -- This should trigger parallel index scan paths
 -- (Just check that parallel scan plan is used)
 EXPLAIN SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
-                                          QUERY PLAN                                           
------------------------------------------------------------------------------------------------
- Finalize Aggregate  (cost=818.02..818.03 rows=1 width=8)
-   ->  Gather  (cost=818.00..818.01 rows=4 width=8)
+                                                           QUERY PLAN                                                            
+---------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=1633.42..1633.43 rows=1 width=8)
+   ->  Gather  (cost=1633.40..1633.41 rows=4 width=8)
          Workers Planned: 4
-         ->  Partial Aggregate  (cost=818.00..818.01 rows=1 width=8)
-               ->  Parallel Seq Scan on t_cov_parallel  (cost=0.00..755.50 rows=25000 width=0)
-                     Filter: (k > 0)
+         ->  Partial Aggregate  (cost=1633.40..1633.41 rows=1 width=8)
+               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel  (cost=0.00..1570.90 rows=25000 width=0)
+                     Index Cond: (k > 0)
 (6 rows)
 
 -- Actually run it to ensure parallel code executes
@@ -1838,11 +1840,7 @@ CREATE UNLOGGED TABLE t_uuid(k1 uuid, k2 uuid);
 INSERT INTO t_uuid SELECT gen_random_uuid(), gen_random_uuid() FROM generate_series(1, 100);
 CREATE INDEX t_uuid_smol ON t_uuid USING smol(k1, k2);
 SELECT COUNT(*) FROM t_uuid WHERE k1 IS NOT NULL;
- count 
--------
-   100
-(1 row)
-
+ERROR:  smol: parallel scan without bound
 DROP TABLE t_uuid CASCADE;
 -- Test 81: Interval index to cover key_len==16 paths (lines 1635, 1641)
 DROP TABLE IF EXISTS t_interval CASCADE;

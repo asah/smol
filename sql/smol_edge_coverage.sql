@@ -6,7 +6,8 @@ CREATE EXTENSION IF NOT EXISTS smol;
 -- Test rare edge cases for additional coverage
 -- Targets: rescan paths, buffer management, parallel edge cases
 
-
+-- Force index scans for all queries
+SET seq_page_cost = 1000000;
 SET enable_seqscan = off;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;

@@ -12,7 +12,7 @@ SHLIB_LINK += --coverage
 endif
 
 # pg_regress tests: keep regression small and fast
-REGRESS = smol_between smol_parallel smol_include smol_types smol_duplicates smol_coverage_direct smol_edge_coverage smol_validate smol_growth smol_include_rle smol_rle_edge_cases smol_copy_coverage smol_validate_catalog smol_int2 smol_cost_nokey smol_options_coverage smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_build_edges smol_include_rle_mismatch smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_cursor_features smol_coverage_complete smol_equality_stop smol_page_bounds_coverage smol_page_advance_bounds smol_rle_include_sizes smol_runtime_keys_coverage smol_multilevel_btree smol_deep_backward_navigation smol_text_include_guc smol_parallel_build_test smol_prefetch_boundary smol_parallel_batch_claiming
+REGRESS = smol_between smol_parallel smol_include smol_types smol_duplicates smol_coverage_direct smol_edge_coverage smol_validate smol_growth smol_include_rle smol_rle_edge_cases smol_copy_coverage smol_validate_catalog smol_int2 smol_cost_nokey smol_options_coverage smol_empty_table smol_rightmost_descend smol_rle_32k_limit smol_build_edges smol_include_rle_mismatch smol_synthetic_tests smol_rle_65k_boundary smol_coverage_gaps smol_100pct_coverage smol_cursor_features smol_coverage_complete smol_equality_stop smol_page_bounds_coverage smol_page_advance_bounds smol_rle_include_sizes smol_runtime_keys_coverage smol_multilevel_btree smol_deep_backward_navigation smol_text_include_guc smol_parallel_build_test smol_prefetch_boundary smol_parallel_batch_claiming smol_coverage_batch_prefetch
 
 # Load extension before each test to allow standalone test execution
 REGRESS_OPTS = --load-extension=smol
@@ -41,6 +41,7 @@ dstart:
 	echo "[docker] starting postgresql..."
 	docker exec -u postgres -w /home/postgres smol make start
 	echo "[docker] done/ready."
+	docker exec -u root -w /home/postgres smol bash -c "npm install -g @anthropic-ai/claude-code"
 
 # jump into the docker instance e.g. to run top
 # -e OPENAI_API_KEY="$(OPENAI_API_KEY)"
@@ -133,7 +134,6 @@ PG_BIN := $(dir $(PG_CONFIG))
 PGDATA := /home/postgres/pgdata
 
 production: clean stop install start installcheck
-	@if ps aux | grep "/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data" | grep -v grep; then pg_ctl -D /usr/local/pgsql/data stop; fi
 	@echo "rebuilding and testing production build from scratch."
 
 buildclean:
@@ -147,9 +147,9 @@ rebuild:
 	  touch smol.c && $(MAKE) build
 
 build:
-	@echo "Building and installing extension: make=$(MAKE)"
+	@echo "Building extension: make=$(MAKE)"
 	@set -euo pipefail; \
-	  $(MAKE) && $(MAKE) install
+	  $(MAKE)
 
 deldata:
 	@echo "deleting $(PGDATA)..."
@@ -175,9 +175,17 @@ start:
 	  i=0; until $(PG_BIN)/pg_isready -h /tmp -p 5432 -d postgres -q || [ $$i -ge 60 ]; do sleep 1; i=$$((i+1)); done; [ $$i -lt 60 ]; \
 	  echo "server ready."
 
-stop:
-	@echo "Stopping PostgreSQL in container"
-	$(PG_BIN)pg_ctl -D $(PGDATA) -m fast -w stop >/dev/null 2>&1 || true
+stop-usrlocalpgsqldata:
+	@if ps aux | grep '/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data' | grep -v grep; then \
+            echo 'stopping PostgreSQL PGDATA=$(PGDATA)'; \
+            pg_ctl -D /usr/local/pgsql/data stop; \
+            sleep 1; \
+        fi
+
+stop-pgdata:
+	@bash -c "if ps aux | grep '/usr/local/pgsql/bin/postgres -D $(PGDATA)' | grep -v grep; then echo 'stopping PostgreSQL PGDATA=$(PGDATA)'; pg_ctl -D '$(PGDATA)' stop; sleep 1; fi"
+
+stop: stop-pgdata stop-usrlocalpgsqldata
 
 # Interactive psql inside the container (run as postgres)
 psql:
@@ -204,30 +212,21 @@ coverage-clean:
 # Build with coverage instrumentation
 coverage-build: coverage-clean
 	@echo "[coverage] Building with coverage instrumentation..."
-	@$(MAKE) clean
-	@COVERAGE=1 $(MAKE) all
+	@COVERAGE=1 $(MAKE) 
 	@sudo COVERAGE=1 $(MAKE) install
 	@echo "[coverage] Coverage build complete."
 
 # Run tests with coverage
-coverage-test:
-	@echo "[coverage] Ensuring PostgreSQL is restarted with new extension..."
-	@$(MAKE) stop
-	@sleep 1
-	@$(MAKE) start
-	@echo "[coverage] Running regression tests with coverage..."
-	@$(MAKE) installcheck || true
-	@echo "[coverage] Stopping PostgreSQL to flush coverage data..."
-	@$(MAKE) stop
-	@sleep 3
-	@echo "[coverage] Test run complete."
+coverage-test: stop start
+	@set -euo pipefail; \
+	  $(MAKE) installcheck; $(MAKE) stop
 
 # Generate HTML coverage report using lcov
 coverage-html:
 	@echo "[coverage] Generating HTML coverage report..."
 	@if ! command -v lcov >/dev/null 2>&1; then \
-		echo "[coverage] Installing lcov..."; \
-		apt-get update -qq && apt-get install -y -qq lcov >/dev/null 2>&1; \
+		echo "[coverage] lcov not found: installing..."; \
+		sudo apt-get update -qq && sudo apt-get install -y -qq lcov >/dev/null 2>&1; \
 	fi
 	@lcov --capture --directory . --output-file coverage.info --quiet 2>/dev/null || true
 	@lcov --remove coverage.info '/usr/*' --output-file coverage.info --quiet 2>/dev/null || true
@@ -241,7 +240,6 @@ coverage-html:
 
 # Complete coverage workflow - build, test, report, and check
 coverage: coverage-clean coverage-build coverage-test
-	@if ps aux | grep "/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data" | grep -v grep; then pg_ctl -D /usr/local/pgsql/data stop; fi
 	@echo "[coverage] Generating coverage report..."
 	@gcov -o . smol.c > /dev/null 2>&1 || echo "[coverage] gcov execution completed"
 	@echo "[coverage] Checking coverage percentage..."

@@ -1027,12 +1027,16 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
 static inline int
 smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
 {
-    if (so->have_upper_bound && (so->atttypid == INT2OID || so->atttypid == INT4OID || so->atttypid == INT8OID))
+    /* Precondition: This function should only be called when we have an upper bound.
+     * All callers check so->have_upper_bound before calling this function. */
+    Assert(so->have_upper_bound);
+
+    if (so->atttypid == INT2OID || so->atttypid == INT4OID || so->atttypid == INT8OID)
         return smol_cmp_keyptr_bound(keyp, so->key_len, so->atttypid, (int64)
                                      (so->atttypid == INT2OID ? (int64) DatumGetInt16(so->upper_bound_datum)
                                                               : so->atttypid == INT4OID ? (int64) DatumGetInt32(so->upper_bound_datum)
                                                                                         : DatumGetInt64(so->upper_bound_datum)));
-    if (so->have_upper_bound && (so->atttypid == TEXTOID))
+    if (so->atttypid == TEXTOID)
     {
         text *bt = DatumGetTextPP(so->upper_bound_datum);
         int blen = VARSIZE_ANY_EXHDR(bt);
@@ -1044,10 +1048,8 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
         if (cmp != 0) return (cmp > 0) - (cmp < 0);
         return (klen > blen) - (klen < blen);
     }
-    /* Generic comparator for backward scans with upper bounds on non-INT/TEXT types (e.g., UUID, TIMESTAMP, FLOAT8). */
-    if (so->have_upper_bound)
-        return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
-    return 0; /* No upper bound - all keys pass */
+    /* Generic comparator for other types (e.g., UUID, TIMESTAMP, FLOAT8) */
+    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
 }
 
 /* Page-level bounds checking: returns true if page might have matching tuples
@@ -1097,11 +1099,11 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     {
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
-        { /* GCOV_EXCL_START - defensive: prefetch logic avoids loading pages beyond bounds */
+        {
             /* first_key > upper_bound → past end of range, stop scan */
             *stop_scan_out = true;
             return false;
-        } /* GCOV_EXCL_STOP */
+        }
     }
 
     /* Equality bound check: if first key exceeds the equality value, stop scan
@@ -2507,7 +2509,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                             { so->cur_blk = left; so->chunk_left = claimed; break; }
-                            continue; /* GCOV_EXCL_LINE - CAS retry on race condition, too difficult to reliably test (see line 228 comment) */
+                            continue; /* GCOV_EXCL_LINE - CAS retry on race condition, too difficult to reliably test */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
@@ -3059,7 +3061,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             {
                                 /* Defensive: PostgreSQL byval types are 1,2,4,8,16 bytes only */
                                 SMOL_DEFENSIVE_CHECK(false, ERROR, /* GCOV_EXCL_LINE - defensive check, should never execute */
-                                    (errmsg("smol: unexpected key_len=%u in RLE path, expected 1/2/4/8/16", so->key_len)));
+                                    (errmsg("smol: unexpected key_len=%u in RLE path, expected 1/2/4/8/16", so->key_len))); /* GCOV_EXCL_LINE */
                                 smol_copy_small(so->itup_data, keyp, so->key_len); /* GCOV_EXCL_LINE - defensive fallback */
                             }
                             /* Copy INCLUDE columns */
@@ -3289,7 +3291,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             {
                                 /* Defensive: PostgreSQL byval types are 1,2,4,8,16 bytes only */
                                 SMOL_DEFENSIVE_CHECK(false, ERROR, /* GCOV_EXCL_LINE - defensive check, should never execute */
-                                    (errmsg("smol: unexpected key_len=%u in plain path, expected 1/2/4/8/16", so->key_len)));
+                                    (errmsg("smol: unexpected key_len=%u in plain path, expected 1/2/4/8/16", so->key_len))); /* GCOV_EXCL_LINE */
                                 smol_copy_small(so->itup_data, keyp, so->key_len); /* GCOV_EXCL_LINE - defensive fallback */
                             }
                             if (so->ninclude > 0)
@@ -3433,7 +3435,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             if (pb < nblocks)
                                 PrefetchBuffer(idx, MAIN_FORKNUM, pb);
                             else
-                                break; /* GCOV_EXCL_LINE - break when prefetch reaches end of small index, rare in practice */
+                                break; /* break when prefetch reaches end of index */
                         }
                     }
                 }

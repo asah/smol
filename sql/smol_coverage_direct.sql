@@ -6,6 +6,9 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 SET smol.enable_zero_copy = off;  -- Disable zero-copy to test specific code paths
 
+-- Force index scans for all queries to ensure cursor operations use index scans
+SET seq_page_cost = 1000000;
+
 -- Create test table and index
 DROP TABLE IF EXISTS t_cov CASCADE;
 CREATE UNLOGGED TABLE t_cov(k int4);
