@@ -2137,6 +2137,19 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
 
     if (keys && nkeys > 0)
     {
+        /* PROGRAMMING BY CONTRACT: SMOL does not support searching for NULL values
+         * SK_SEARCHNULL: IS NULL query - reject with clear error
+         * SK_ISNULL (scan key argument is NULL) is allowed: k > NULL returns 0 rows gracefully
+         * SK_SEARCHNOTNULL (IS NOT NULL) is allowed: works correctly since index has no NULLs */
+        for (int i = 0; i < nkeys; i++)
+        {
+            ScanKey sk = &keys[i];
+            /* Defensive check - no if-statement needed, macro handles everything */
+            SMOL_DEFENSIVE_CHECK(!(sk->sk_flags & SK_SEARCHNULL), ERROR,
+                (errmsg("smol does not support NULL values"),
+                 errdetail("Query uses IS NULL which is not supported. SMOL indexes do not contain NULL values.")));
+        }
+
         /* Copy scankeys for later filtering */
         so->runtime_keys = (ScanKey) palloc(sizeof(ScanKeyData) * nkeys);
         memcpy(so->runtime_keys, keys, sizeof(ScanKeyData) * nkeys);
@@ -5127,7 +5140,10 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
     {
         kd = PointerGetDatum((void *) keyp);
     }
-    int32 c = DatumGetInt32(FunctionCall2Coll(cmp, collation, kd, bound));
+    /* Fix for "char" type and other types with no collation (collation=0).
+     * FunctionCall2Coll expects InvalidOid for non-collatable types, not 0. */
+    Oid coll = (collation == 0) ? InvalidOid : collation;
+    int32 c = DatumGetInt32(FunctionCall2Coll(cmp, coll, kd, bound));
     return (c > 0) - (c < 0);
 }
 

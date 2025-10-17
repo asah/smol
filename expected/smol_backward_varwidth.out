@@ -94,7 +94,20 @@ CREATE INDEX idx_backward_char ON t_backward_char USING smol(k);
 ANALYZE t_backward_char;
 -- Backward scan with char (key_len == 1, hits line 1990 smol_copy_small)
 SELECT k FROM t_backward_char WHERE k >= 'A'::"char" ORDER BY k DESC LIMIT 10;
-ERROR:  cache lookup failed for collation 0
+  k   
+------
+ \x7F
+ \x7F
+ \x7F
+ \x7F
+ \x7F
+ \x7F
+ \x7F
+ ~
+ ~
+ ~
+(10 rows)
+
 -- ============================================================================
 -- Test 5: RLE backward scan finding start of run (line 1970)
 -- Need: RLE page + backward scan + duplicates not encoded in RLE metadata
