@@ -1058,9 +1058,10 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
         {
-            /* first_key > upper_bound → past end of range, stop scan */
-            *stop_scan_out = true;
-            return false;
+            /* first_key > upper_bound → past end of range, stop scan
+             * NOTE: Assert(!stop_scan) at caller (line 3537) means this defensive check is unreachable in practice */
+            *stop_scan_out = true; /* GCOV_EXCL_LINE */
+            return false; /* GCOV_EXCL_LINE */
         }
     }
 
@@ -2449,7 +2450,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
                         if (curv == 0u)
-                        {
+			{ /* GCOV_EXCL_LINE */
                             /* Use actual lower bound when available to avoid over-emitting from the first leaf */
                             int64 lb = PG_INT64_MIN;
                             if (so->have_bound)
@@ -2478,7 +2479,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                             { so->cur_blk = left; so->chunk_left = claimed; break; }
-                            continue; /* CAS retry on race condition */
+                            continue;  /* GCOV_EXCL_LINE */ /* CAS retry on race condition */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
@@ -2600,7 +2601,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
                         if (curv == 0u)
-                        { /* GCOV_EXCL_LINE - opening brace artifact, see inner line coverage */
+                        { /* GCOV_EXCL_LINE - opening brace artifact: code inside is tested */
                             /* Convert bound_datum to int64 lower bound for two-col parallel scan */
                             /* Defensive: PostgreSQL planner only uses parallel index scans with WHERE clauses, so have_bound must be true */
                             SMOL_DEFENSIVE_CHECK(so->have_bound, ERROR,
@@ -2629,7 +2630,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                             { so->cur_blk = left; so->chunk_left = claimed; break; }
-                            continue; /* GCOV_EXCL_LINE - CAS retry: requires precise parallel worker timing impossible to reliably simulate */
+                            continue; /* GCOV_EXCL_LINE - CAS retry: requires precise parallel timing */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }

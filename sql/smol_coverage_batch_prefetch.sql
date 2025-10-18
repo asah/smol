@@ -34,8 +34,14 @@ INSERT INTO t_batch_twocol SELECT i/100, i%100, i FROM generate_series(1, 100000
 CREATE INDEX t_batch_twocol_idx ON t_batch_twocol USING smol (k1, k2);
 ANALYZE t_batch_twocol;
 
-EXPLAIN SELECT COUNT(*) FROM t_batch_twocol WHERE k1 > 0;
-SELECT COUNT(*) FROM t_batch_twocol WHERE k1 > 0;
+-- Force index-only scan to encourage parallel index scan
+-- This triggers the two-column parallel scan path (lines 2597-2728)
+SET enable_indexonlyscan = on;
+SET enable_seqscan = off;
+-- Use a selective WHERE to make index scan attractive (triggers parallel index-only scan)
+SELECT COUNT(*) FROM t_batch_twocol WHERE k1 > 900;
+-- Reset
+SET enable_seqscan = on;
 
 -- Backward scan with batch claiming - verify rows are returned in descending order
 SELECT k FROM t_batch_coverage WHERE k >= 99990 ORDER BY k DESC;
@@ -74,11 +80,21 @@ SET smol.prefetch_depth = 1;
 
 -- UUID backward scan with upper bound
 CREATE UNLOGGED TABLE t_uuid_upper (k uuid);
-INSERT INTO t_uuid_upper SELECT ('00000000-0000-0000-0000-'|| lpad(i::text, 12, '0'))::uuid FROM generate_series(1, 100) i;
+-- Insert 10000 rows to ensure multiple pages
+INSERT INTO t_uuid_upper SELECT ('00000000-0000-0000-0000-'|| lpad(i::text, 12, '0'))::uuid FROM generate_series(1, 10000) i;
 CREATE INDEX t_uuid_upper_idx ON t_uuid_upper USING smol (k);
 
 -- Backward scan with upper bound on UUID
 SELECT k FROM t_uuid_upper WHERE k < 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid ORDER BY k DESC LIMIT 10;
+
+-- Forward scan with upper bound to trigger lines 1062-1063
+-- Upper bound check: if first key on page exceeds upper bound, stop scan
+-- Force small page size to ensure the bound falls between pages
+SET smol.test_max_tuples_per_page = 100;
+CREATE INDEX t_uuid_upper_idx2 ON t_uuid_upper USING smol (k);
+ANALYZE t_uuid_upper;
+SELECT COUNT(*) FROM t_uuid_upper WHERE k < '00000000-0000-0000-0000-000000000250'::uuid;
+RESET smol.test_max_tuples_per_page;
 
 DROP TABLE t_uuid_upper;
 
