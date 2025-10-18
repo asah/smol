@@ -76,9 +76,16 @@ class WorkloadBase(ABC):
 
         return results
 
+    def get_actual_table_name(self) -> str:
+        """Get the actual table name (override with get_table_name() if defined)"""
+        if hasattr(self, 'get_table_name'):
+            return self.get_table_name()
+        return self.table_name
+
     def build_index(self, engine: str) -> float:
         """Build index and return build time in ms"""
-        idx_name = f"{self.table_name}_{engine}"
+        table = self.get_actual_table_name()
+        idx_name = f"idx_{table}_{engine}"
 
         # Drop if exists
         self.db.execute(f"DROP INDEX IF EXISTS {idx_name};")
@@ -91,8 +98,10 @@ class WorkloadBase(ABC):
 
         # Get index columns
         index_cols = self.get_index_columns()
+        if hasattr(self, 'get_index_column'):
+            index_cols = self.get_index_column()
 
-        sql = f"CREATE INDEX {idx_name} ON {self.table_name} USING {engine}({index_cols}){include_clause};"
+        sql = f"CREATE INDEX {idx_name} ON {table} USING {engine}({index_cols}){include_clause};"
 
         return self.db.execute_timed(sql)
 
@@ -102,7 +111,8 @@ class WorkloadBase(ABC):
 
     def get_index_size(self, engine: str) -> float:
         """Get index size in MB"""
-        idx_name = f"{self.table_name}_{engine}"
+        table = self.get_actual_table_name()
+        idx_name = f"idx_{table}_{engine}"
         size_bytes = self.db.get_relation_size(idx_name)
         return size_bytes / (1024 * 1024)
 
@@ -110,7 +120,8 @@ class WorkloadBase(ABC):
                       build_time_ms: float, index_size_mb: float) -> WorkloadResult:
         """Execute query and return result with metrics"""
 
-        idx_name = f"{self.table_name}_{engine}"
+        table = self.get_actual_table_name()
+        idx_name = f"idx_{table}_{engine}"
 
         # Set PostgreSQL parameters
         self.db.execute("SET enable_seqscan = off;")
@@ -177,4 +188,5 @@ class WorkloadBase(ABC):
 
     def cleanup(self):
         """Clean up table and indexes"""
-        self.db.execute(f"DROP TABLE IF EXISTS {self.table_name} CASCADE;")
+        table = self.get_actual_table_name()
+        self.db.execute(f"DROP TABLE IF EXISTS {table} CASCADE;")

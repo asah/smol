@@ -27,7 +27,7 @@ class IndexOnlyScanWorkload(WorkloadBase):
         self.db.execute("DROP TABLE IF EXISTS ios_test CASCADE;")
         self.db.execute("""
             CREATE TABLE ios_test (
-                id int4 PRIMARY KEY,
+                id int4,
                 status text,
                 value int4,
                 extra text

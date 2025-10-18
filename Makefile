@@ -196,7 +196,7 @@ pgcheck: build start
 # Clean coverage artifacts
 coverage-clean:
 	@echo "[coverage] Cleaning coverage data..."
-	@rm -f *.gcda *.gcno *.gcov smol.so
+	@rm -f *.gcda *.gcno *.gcov smol.so smol.o
 	@rm -rf coverage_html
 	@echo "[coverage] Coverage data cleaned."
 

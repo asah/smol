@@ -24,47 +24,41 @@ class BackwardScanWorkload(WorkloadBase):
         """Generate sequential data for backward scan testing"""
         rows = self.config.get('rows', 1_000_000)
 
-        self.db.execute("DROP TABLE IF EXISTS bwd_test CASCADE;")
-        self.db.execute("""
-            CREATE TABLE bwd_test (
-                id int4 PRIMARY KEY,
+        self.db.execute(f"DROP TABLE IF EXISTS {self.table_name} CASCADE;")
+        self.db.execute(f"""
+            CREATE UNLOGGED TABLE {self.table_name} (
+                id int4,
                 payload int4
             );
         """)
 
-        print(f"Generating data...", end=' ', flush=True)
         self.db.execute(f"""
-            INSERT INTO bwd_test
+            INSERT INTO {self.table_name}
             SELECT i, i % 1000
             FROM generate_series(1, {rows}) i;
         """)
-        print("done")
+
+        self.db.execute(f"VACUUM (FREEZE, ANALYZE) {self.table_name};")
 
     def get_queries(self):
         """Return backward scan queries"""
         return [
             Query(
                 id='desc_limit100',
-                sql="SELECT * FROM bwd_test ORDER BY id DESC LIMIT 100;",
+                sql=f"SELECT * FROM {self.table_name} ORDER BY id DESC LIMIT 100;",
                 description="Last 100 rows (backward)",
                 repeat=5
             ),
             Query(
                 id='desc_limit10k',
-                sql="SELECT * FROM bwd_test ORDER BY id DESC LIMIT 10000;",
+                sql=f"SELECT * FROM {self.table_name} ORDER BY id DESC LIMIT 10000;",
                 description="Last 10K rows (backward)",
                 repeat=5
             ),
             Query(
                 id='desc_range',
-                sql="SELECT * FROM bwd_test WHERE id > 900000 ORDER BY id DESC;",
+                sql=f"SELECT * FROM {self.table_name} WHERE id > 900000 ORDER BY id DESC;",
                 description="Range + backward scan",
                 repeat=5
             ),
         ]
-
-    def get_table_name(self) -> str:
-        return "bwd_test"
-
-    def get_index_column(self) -> str:
-        return "id"

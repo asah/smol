@@ -27,7 +27,7 @@ class LimitWorkload(WorkloadBase):
         self.db.execute("DROP TABLE IF EXISTS limit_test CASCADE;")
         self.db.execute("""
             CREATE TABLE limit_test (
-                id int4 PRIMARY KEY,
+                id int4,
                 category int4,
                 value int4
             );

@@ -27,7 +27,7 @@ class InClauseWorkload(WorkloadBase):
         self.db.execute("DROP TABLE IF EXISTS in_test CASCADE;")
         self.db.execute("""
             CREATE TABLE in_test (
-                id int4 PRIMARY KEY,
+                id int4,
                 payload text
             );
         """)

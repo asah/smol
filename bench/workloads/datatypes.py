@@ -44,7 +44,7 @@ class DataTypesWorkload(WorkloadBase):
         if dtype == 'date':
             self.db.execute("""
                 CREATE TABLE dtype_test (
-                    id date PRIMARY KEY,
+                    id date,
                     payload int4
                 );
             """)
@@ -59,7 +59,7 @@ class DataTypesWorkload(WorkloadBase):
         else:
             self.db.execute(f"""
                 CREATE TABLE dtype_test (
-                    id {dtype} PRIMARY KEY,
+                    id {dtype},
                     payload int4
                 );
             """)

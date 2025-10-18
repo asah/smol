@@ -2493,7 +2493,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
                         if (curv == 0u)
-                        { /* GCOV_EXCL_LINE - opening brace artifact, inner code is covered */
+                        {
                             /* Use actual lower bound when available to avoid over-emitting from the first leaf */
                             int64 lb = PG_INT64_MIN;
                             if (so->have_bound)
@@ -2522,7 +2522,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                             { so->cur_blk = left; so->chunk_left = claimed; break; }
-                            continue; /* GCOV_EXCL_LINE - CAS retry on race condition, too difficult to reliably test */
+                            continue; /* CAS retry on race condition */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
@@ -5005,14 +5005,24 @@ smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_l
         Page page = BufferGetPage(buf);
         OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
         BlockNumber child = InvalidBlockNumber;
-        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+
+        /* Binary search for first child where highkey >= lower_bound */
+        OffsetNumber lo = FirstOffsetNumber, hi = maxoff;
+        while (lo <= hi)
         {
-            char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+            OffsetNumber mid = (OffsetNumber) (lo + ((hi - lo) >> 1));
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, mid));
             BlockNumber c;
             memcpy(&c, itp, sizeof(BlockNumber));
             char *keyp = itp + sizeof(BlockNumber);
             if (smol_cmp_keyptr_bound(keyp, key_len, atttypid, lower_bound) >= 0)
-            { child = c; break; }
+            {
+                child = c;
+                if (mid == FirstOffsetNumber) break;
+                hi = (OffsetNumber) (mid - 1);
+            }
+            else
+                lo = (OffsetNumber) (mid + 1);
         }
         if (!BlockNumberIsValid(child))
         {
@@ -5043,16 +5053,26 @@ smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so)
         Page page = BufferGetPage(buf);
         OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
         BlockNumber child = InvalidBlockNumber;
-        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+
+        /* Binary search for first child where highkey >= lower_bound */
+        OffsetNumber lo = FirstOffsetNumber, hi = maxoff;
+        while (lo <= hi)
         {
-            char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
+            OffsetNumber mid = (OffsetNumber) (lo + ((hi - lo) >> 1));
+            char *itp = (char *) PageGetItem(page, PageGetItemId(page, mid));
             BlockNumber c;
             memcpy(&c, itp, sizeof(BlockNumber));
             char *keyp = itp + sizeof(BlockNumber);
             /* Use generic comparator that handles text correctly */
             int cmp = smol_cmp_keyptr_to_bound(so, keyp);
             if (cmp >= 0)
-            { child = c; break; }
+            {
+                child = c;
+                if (mid == FirstOffsetNumber) break;
+                hi = (OffsetNumber) (mid - 1);
+            }
+            else
+                lo = (OffsetNumber) (mid + 1);
         }
         if (!BlockNumberIsValid(child))
         {

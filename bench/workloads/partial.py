@@ -27,7 +27,7 @@ class PartialIndexWorkload(WorkloadBase):
         self.db.execute("DROP TABLE IF EXISTS partial_test CASCADE;")
         self.db.execute("""
             CREATE TABLE partial_test (
-                id int4 PRIMARY KEY,
+                id int4,
                 status text,
                 category int4
             );
