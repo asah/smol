@@ -9,14 +9,6 @@ To discourage inappropriate use, the authors intentionally are not packaging SMO
 
 SMOL indexes are **60-81% smaller** than BTREE while delivering competitive or superior query performance.
 
-### Benchmark Results (PostgreSQL 18, 1M rows)
-
-| Workload | BTREE | SMOL | Advantage |
-|----------|-------|------|-----------|
-| **Unique int4 range scan** | 13.5ms, 21MB | 15ms, 3.9MB | 81% smaller, competitive speed |
-| **Duplicate keys + INCLUDEs** | 3.2ms, 30MB | 3.9ms, 12MB | 60% smaller, competitive |
-| **Two-column selective** | 13.6ms, 21MB | 2.9ms, 7.9MB | **4.7x faster**, 62% smaller |
-
 ### When to Use SMOL
 
 ✅ **Use SMOL when:**

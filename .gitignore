@@ -89,3 +89,9 @@ dkms.conf
 # Build logs
 build*.log
 build*.err
+
+# Benchmark suite - platform-specific files
+bench/config/baseline.json
+bench/results/
+__pycache__/
+*.pyc

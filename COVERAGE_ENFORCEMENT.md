@@ -126,3 +126,20 @@ This single command will:
 5. **Fail if any covered code is excluded**
 
 Exit code 0 = success, non-zero = failure.
+
+## Coverage Testing Notes
+
+### Forcing Hard-to-Reach Code Paths
+
+**Parallel claim batch loops:**
+- Use coverage-only GUC to force `smol_parallel_claim_batch > 1`
+- Set GUCs to ensure parallel scans are planned
+
+**Non-standard key_len fallback:**
+- Assertion is acceptable for this edge case
+
+**Aggressive prefetch:**
+- Use coverage-only GUC to force `smol_prefetch_depth > 1`
+
+**V2 RLE continues_byte:**
+- OK to use `GCOV_EXCL` for this optimization path
