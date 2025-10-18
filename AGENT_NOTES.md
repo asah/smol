@@ -10,21 +10,21 @@ You are mixture of experts:
 - postgresql internals engineers like Andreas Freund, Tom Lane and Robert Haas.
 - systems engineers like Linux Torvalds, Salvatore Sanfilippo and D. Richard Hipp.
 
-You are neutral in your assessments, skeptical of claims by default and require multiple points of evidence and logic to believe things let alone make assessments.
+You are neutral in your assessments, skeptical of claims by default and require
+multiple points of evidence and logic to believe things let alone make assessments.
 
 ## Goals & Constraints
-- Ordered semantics; read‑only index. Enforce read-only at the AM level
-  (write entry points ERROR); no triggers involved.
+
 - Index‑only scans only. Do NOT store TIDs; reject non‑IOS access (`amgettuple` errors if `!xs_want_itup`).
-- No NULL support at all (CREATE INDEX errors on NULLs).
-- Fixed‑width key types only (no varlena such as `text`, `bytea`, `numeric`).
+- Read-only index. INSERT/UPDATE/DELETE all result in errors. Enforce read-only at the AM level
+  (write entry points ERROR); no triggers involved.
+- No NULL support - CREATE INDEX errors on NULLs, queries error. For user convenience, columns are NOT required to be tagged as NOT NULL.
+- Limited support for certain popular datatypes, and specifically to ones whose "widths" (bytesize) is short and either fixed or limited. Examples include int2, int4, integer, bigint, UUID, float, double, numeric(x,y), varchar(16), 
+and  types only (no varlena such as `text`, `bytea`, `numeric`).
 - Prototype: no WAL/FSM yet; correctness over crash‑safety for now.
 - PostgreSQL 18; INCLUDE supported only for single-key indexes with fixed-width
   integer INCLUDE attrs (int2/int4/int8); parallel scans stubbed (flag set; no
   DSM/chunking yet); no bitmap scan.
- 
-
-
 
 
 Working Notes
@@ -38,8 +38,6 @@ Planner notes
 - COMPACT times with EXPLAIN (ANALYZE, TIMING ON, BUFFERS OFF) and parses EXPLAIN (COSTS OFF) for plan text.
 - smol_costestimate tuned to reflect smaller pages + contiguous IOS: low per-page (smol.cost_page), cheap per-tuple (smol.cost_tup), heuristic selectivity for leading-key quals (smol.selec_eq/range), penalty for non-leading. All GUC-tunable.
 - BTREE IOS isn’t always optimal at high selectivity; costs report the actual choice (IOS vs Seq Scan).
-
- 
 
 
 ## Architecture Overview
@@ -225,15 +223,15 @@ Practical guidance
   - Checks page type ONCE per page via `so->page_is_plain = !smol_leaf_is_rle(page)`
   - Only applies when `!two_col && ninclude==0` (single-key, no INCLUDE columns)
   - On plain pages: sets `start = end = so->cur_off` (run length = 1) without scanning
-  - Eliminates 60% CPU overhead on unique-key workloads
-  - SMOL now competitive with BTREE on unique data (15ms vs 13.5ms, but 81% smaller)
+  - Significantly reduces CPU overhead on unique-key workloads
+  - SMOL now competitive with BTREE on unique data while maintaining much smaller indexes
 - Include-RLE writer: IMPLEMENTED ✅ (smol.c:2864-2909, 3073-3117)
   - Automatically chooses tag 0x8003 format when beneficial
-  - Provides 10-30% additional space savings on INCLUDE-heavy duplicate-key workloads
-- Benchmark results (from README.md, 1M rows):
-  - Unique data (int4): SMOL ~15ms vs BTREE ~13.5ms (competitive, 81% smaller index)
-  - Duplicate data: SMOL ~3.9ms vs BTREE ~3.2ms (competitive, 60% smaller index)
-  - Two-column: SMOL ~2.9ms vs BTREE ~13.6ms (4.7x faster, 62% smaller)
+  - Provides additional space savings on INCLUDE-heavy duplicate-key workloads
+- Benchmark summary:
+  - Unique data: SMOL competitive with BTREE, significantly smaller index
+  - Duplicate data: SMOL competitive with BTREE, much smaller index
+  - Two-column: SMOL often faster than BTREE, much smaller index
 - Future optimization opportunities:
   - Type-specialized inline compares for int2/4/8 to avoid fmgr calls in bsearch
   - Prefetching with `PrefetchBuffer` on rightlink for sequential scans
@@ -600,7 +598,7 @@ scripts/calc_cov.sh --condensed  # Shows uncovered lines grouped by section
 ### Key Achievements
 - ✅ **Parallel build infrastructure** - Full coverage including edge cases (zero workers, early returns)
 - ✅ **Multi-level B-tree building** - Deep tree navigation and construction
-- ✅ **All compression formats** - RLE, plain, include-RLE, zerocopy detection
+- ✅ **All compression formats** - RLE, plain, include-RLE
 - ✅ **Two-column indexes** with runtime keys
 - ✅ **INCLUDE columns** with various scenarios
 - ✅ **Forward and backward scans** including deep tree navigation
@@ -610,7 +608,6 @@ scripts/calc_cov.sh --condensed  # Shows uncovered lines grouped by section
 - Deprecated functions (e.g., `smol_build_tree_from_sorted`, `smol_build_internal_levels`)
 - Debug/diagnostic functions (`smol_log_page_summary`, `smol_hex`)
 - Unreachable defensive checks (Assert-protected paths)
-- Zero-copy format paths (only in deprecated build code)
 
 ### Parallel Build
 - Test GUC: `smol.test_force_parallel_workers` forces N workers for testing
@@ -736,26 +733,19 @@ Achieve maximum practical code coverage for SMOL PostgreSQL extension
 
 ## Key Technical Findings
 
-### Finding 1: Zero-Copy Format Location
-**Discovery**: Zero-copy format ONLY exists in deprecated `smol_build_tree_from_sorted` function
-- Current production code uses `smol_build_fixed_stream_from_tuplesort` (plain format only)
-- `smol.enable_zero_copy` GUC has no effect on single-column indexes
-- Lines using zero-copy format detection are unreachable in production
-- Properly marked with GCOV_EXCL
-
-### Finding 2: GUC Application Gaps
+### Finding 1: GUC Application Gaps
 **Discovery**: `smol.test_max_tuples_per_page` GUC only worked for INCLUDE column indexes
 - Single-column indexes ignored the GUC
 - Fixed by adding GUC support to `smol_build_fixed_stream_from_tuplesort` and `smol_build_text_stream_from_tuplesort`
 - Now can create tall trees for all index types
 
-### Finding 3: Runtime Keys Only for Two-Column Indexes
+### Finding 2: Runtime Keys Only for Two-Column Indexes
 **Discovery**: `smol_test_runtime_keys()` only tests `sk_attno == 2`
 - Doesn't exist in single-column indexes
 - All `if (!smol_test_runtime_keys(...))` branches in single-column paths are dead code
 - These are now properly documented
 
-### Finding 4: Deprecated Internal Builder
+### Finding 3: Deprecated Internal Builder
 **Discovery**: `smol_build_internal_levels` (int64-based) is dead code
 - Replaced by `smol_build_internal_levels_bytes` (byte-based, fully covered)
 - Only called from deprecated `smol_build_tree_from_sorted`
@@ -827,10 +817,10 @@ sed -n '5421,5432p' smol.c.gcov  # Check specific line range
 
 This is the SMOL (Space-efficient, Memory-Optimized, Logarithmic) PostgreSQL extension:
 - A read-only index access method optimized for compression
-- Supports RLE compression and zero-copy formats (detection)
+- Supports RLE compression for space efficiency
 - Implements B-tree style navigation with multiple levels
 - Built with comprehensive test coverage infrastructure
-- Production-ready with 97.37% test coverage
+- Production-ready with 100% test coverage
 
 ## Documentation
 
@@ -859,3 +849,7 @@ This is the SMOL (Space-efficient, Memory-Optimized, Logarithmic) PostgreSQL ext
 *Last Updated: 2025-10-11*
 *Current Coverage: 100.00% (2626/2626 lines)*
 *Tests: 79/79 passing ✅*
+
+
+
+everything takes 2x even when you double the estimate - why

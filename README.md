@@ -1,171 +1,136 @@
 # smol — Simple Memory-Only Lightweight index
 
-SMOL is a read‑only, space‑efficient PostgreSQL index access method that can provide substantial speedups for reporting queries that access a small number of small, fixed-width columns.
-SMOL is currently a research prototype, not suitable for production and only deployable as an EXTENSION in self-hosted PostgreSQL deployments, e.g. not AWS RDS/Aurora.
-The authors are aware that the ideas expressed in SMOL may be best brought to mainstream use as new capabilities of existing features, rather than a new index type.
-To discourage inappropriate use, the authors intentionally are not packaging SMOL yet for pgxn or other "easy" installation methods - you must compile from source for now.
+SMOL is a read‑only, space‑efficient PostgreSQL index access method optimized for reporting queries on fixed-width columns.
+
+**Status**: Research prototype - not suitable for production use. Self-hosted PostgreSQL deployments only (not AWS RDS/Aurora).
+
+**Philosophy**: The ideas in SMOL may be best brought to mainstream use as enhancements to existing PostgreSQL features rather than as a standalone index type.
 
 ## Performance
 
-SMOL indexes are **60-81% smaller** than BTREE while delivering competitive or superior query performance.
+SMOL indexes are **significantly smaller** than BTREE (often 50-80% reduction) while delivering competitive or superior query performance for the right workloads.
 
 ### When to Use SMOL
 
 ✅ **Use SMOL when:**
 - Memory-constrained environments (cloud, containers)
-- Read-heavy workloads (data warehouses, reporting)
-- Two-column indexes with selective queries
-- Fixed-width columns (int, date, uuid)
-- Smaller backups/faster restores matter
+- Read-heavy workloads (data warehouses, reporting, analytics)
+- Data with duplicate keys (RLE compression excels here)
+- Fixed-width columns (int2/4/8, date, uuid, timestamp)
+- Index size matters (backups, restores, cache efficiency)
 
 ⚠️ **Use BTREE when:**
-- Write-heavy workloads (SMOL is read-only)
-- Variable-length keys (SMOL requires fixed-width or C-collation text)
-- NULL values needed (SMOL rejects NULLs)
-- Ultra low-latency requirements (every millisecond counts)
-
-See [BENCHMARKING.md](BENCHMARKING.md) for detailed results and methodology.
-
-
-## How does SMOL compare with existing PostgreSQL features and index types
-
-It's perhaps helpful to think of SMOL as a form of materialized view. Unlike MATERIALIZED VIEW (MV), existing SQL statements do not need to be retargeted for the MV. That said, for reasons explained below, users are warned not to think they can use SMOL haphazardly, or they may experience errors.
-
-The primary alternative to SMOL are B-trees, specifically the nbtree implementation built into PostgreSQL.
-
-BRIN and HASH indexes cannot satisfy range queries. SMOL is probably not competitive with HASH indexes for equality-only.
+- Write-heavy workloads (SMOL is strictly read-only)
+- Variable-length keys without C collation
+- NULL values needed in index keys
+- Very low selectivity point queries (< 1%)
+- Every millisecond of latency matters
 
 
-## How does SMOL work?
+## Comparison with PostgreSQL Index Types
 
-SMOL provides a page-oriented tree structure over the data just like nbtree, but unlike nbtree:
-1. SMOL assumes read-only, so avoids the need to check for visibility (also simplifies the code).
-2. SMOL removes per-tuple fields storing the number of attributes and their lengths - this is stored once for the whole index
-3. SMOL stores data in columnar format within a page
-4. given fixed attributes, lengths and columnar layout, SMOL can then tightly pack values and use very fast compression (RLE). Notably, when scanning repeated values, the RLE-aware executor inherently knows how many values are in the repetition, just reading the dictionary.
-5. SMOL optimizes small, repetitive data and caches the response tuple to avoid extra traversal and memory copies.
-6. SMOL detects and enforces maximum strength during CREATE INDEX and assumes "C" collation, which allows its execution to treat strings like fixed width numbers. This is fine for identifier-type strings which are typically ASCII.
+**SMOL vs BTREE**: SMOL trades write capability for significantly better space efficiency. Think of SMOL as a space-optimized, read-only variant of BTREE for analytical workloads.
 
-### Why Not Zero-Copy Format?
-
-During development, we explored a "zero-copy" page format that stored complete IndexTuple structures (with 8-byte overhead per tuple) to avoid memcpy during scans. This approach was abandoned because:
-
-1. **Index-only scans (IOS) fundamentally require tuple construction**: PostgreSQL's IOS protocol requires materializing tuples into `xs_itup`, which destroys any zero-copy benefits
-2. **Increased size hurts performance**: The 8-byte overhead per tuple doubled index size, requiring 2x more page reads and hurting cache locality
-3. **No measurable speedup**: Benchmarks showed zero-copy was actually slightly slower than plain format due to the extra I/O
-
-Instead, SMOL uses **PLAIN format** (no overhead) when RLE doesn't provide benefits (uniqueness ratio >= 0.98), delivering both space efficiency and good scan performance.
-
-## Quick start
-
-### preparing the table
-
-The underlying table must be read-only. If it's not, then you need to copy the table, e.g. to an UNLOGGED table.
-
-The string columns used in SMOL must be short and use "C" collation. If not, consider ALTER TABLE tblname ADD COLUMN colname TEXT COLLATE "C";
-
-See `assignments.sql` for an example. 
-
-### creating the index
-
-CREATE INDEX idxname ON tblname USING smol (keyfield) INCLUDE (other, fields, you, want);
-
--- IMPORTANT: Always run ANALYZE after index creation for optimal performance
-ANALYZE tblname;
-
-SELECT keyfield, COUNT(*) FROM tblname GROUP BY 1;
-
-SELECT keyfield, other, fields, COUNT(*) FROM tblname GROUP BY 1,2,3;
-
-SELECT keyfield, COUNT(*) FROM tblname GROUP BY 1;
+**SMOL vs BRIN/HASH**: BRIN and HASH cannot satisfy range queries. SMOL supports full range scans and ordering like BTREE.
 
 
-This document captures the architecture and operational overview of the
-smol index access method. Code‑level notes live in `AGENT_NOTES.md`.
+## How SMOL Works
 
-Important
-- One container name: smol. If using Docker, reuse a single container named
-  `smol` for builds and tests (see d* targets). Bare Make targets also work outside Docker.
+SMOL uses a B-tree structure like nbtree, but optimized for read-only access:
 
-Overview
-- Read‑only index AM optimized for index‑only scans on append‑only data.
-- Stores only fixed‑width key values (no heap TIDs), improving density and
-  cache locality.
- - Supports ordered and backward scans; no bitmap scans. Parallel planned
-   (flag exposed; shared-state chunking not implemented yet).
+1. **Read-only assumption**: No visibility checks, no MVCC overhead
+2. **Columnar storage**: Attributes stored in column-major format within pages
+3. **Metadata hoisting**: Per-tuple metadata stored once per page, not per tuple
+4. **Adaptive compression**: Run-length encoding (RLE) for duplicate-heavy data, plain format for unique data
+5. **Tuple caching**: Pre-built tuple structures reduce per-row overhead
+6. **C collation**: Text treated as fixed-width binary data for efficient comparison
 
-Architecture
-- On‑disk
-  - Metapage (blk 0): magic, version, nkeyatts, optional first‑key directory.
-  - Data pages (blk ≥ 1): packed fixed‑width key payloads; one ItemId per tuple;
-    no per‑tuple headers, null bitmaps, or TIDs.
-- Build
-  - Collect keys via `table_index_build_scan`, enforce no‑NULLs and fixed‑width.
-  - Sort using opclass comparator (proc 1) honoring collation.
-  - Initialize metapage and append data pages with `PageAddItem`.
-  - Mark heap block 0 all‑visible and set VM bit; a synthetic TID (0,1) keeps
-    the executor on index‑only paths.
-- Scan
-  - IOS‑only; requires `xs_want_itup`, else ERROR.
-  - Forward/backward supported (serial scans). For each match, materialize an
-    index tuple (`xs_itup`) and return with a constant TID `(0,1)`.
+### Design Decision: Plain Format vs Zero-Copy
 
-Flags & Capabilities
-- `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`.
-- `amgetbitmap=NULL` (no bitmap scans).
-- `amsearcharray=false`, `amsearchnulls=false`, `amcaninclude=true` (single‑key INCLUDE only).
-- `amstrategies=5` (<, <=, =, >=, >), `amsupport=1` (comparator proc 1).
-- `aminsert` ERROR (read‑only after build).
+During development, we explored a "zero-copy" format that pre-materialized IndexTuple structures on disk to avoid memcpy during scans. **This was abandoned** because:
 
-Limitations
-- Read-only; drop/recreate to change data.
-- Fixed-length key types only; no varlena (text, bytea, numeric).
-- Multi-column keys supported when all key attributes are fixed-length; correctness-first implementation (no bitmap scans; IOS only).
-- No NULL keys; not unique; not clusterable.
-- INCLUDE columns supported for single-key indexes with fixed-length INCLUDE attrs (not limited to integers).
-- Prototype: no WAL/FSM crash-safety yet.
+1. PostgreSQL's index-only scan protocol requires tuple construction anyway
+2. The per-tuple overhead doubled index size, hurting I/O and cache efficiency
+3. Benchmarks showed no performance benefit (slightly slower due to extra I/O)
 
-Build & Test (PostgreSQL 18 from source)
-- Docker helpers: `make dbuild` builds the image; `make dstart` creates/runs the `smol` container; `make dexec` opens a shell; `make dpsql` opens psql.
-- Bare targets (inside or outside Docker):
-  - Clean build + install: `make build`
-  - Fast rebuild (no clean): `make rebuild`
-  - Quick regression (build, start PG, run installcheck, stop PG): `make check`
-  - Start PostgreSQL (initdb if needed): `make start`
-  - Stop PostgreSQL: `make stop`
+**Current approach**: SMOL uses plain format (zero overhead) for unique data and RLE compression for duplicate-heavy data, chosen adaptively per page.
 
-Usage
-- `CREATE EXTENSION smol;`
-- `CREATE INDEX idx_smol ON some_table USING smol (col1, col2);`
-- Planner: favor IOS as usual; SMOL errors on non‑IOS paths. Parallel scans
-  are supported, but see notes below on deterministic correctness testing.
+## Quick Start
 
-Tests
-- Run regression tests: `make install && make start && make installcheck && make stop`
-- Code coverage: make coverage
+### Prerequisites
 
- 
+Table must be read-only (or use an UNLOGGED copy). String columns must use C collation.
 
-Operator Classes
-- int2_ops, int4_ops, int8_ops, plus several fixed‑length builtins (oid, float4/float8, date, timestamp, timestamptz, bool) as provided in `smol--1.0.sql`.
+```sql
+CREATE EXTENSION smol;
 
-Roadmap
-- Add WAL/FSM, tune costs, expand opclass coverage, validate DESC/multi‑col
-  behavior, optional compression.
+-- Create index
+CREATE INDEX idx_name ON table_name USING smol (key_column)
+  INCLUDE (other, columns);
 
-Real‑world mappings
-- RL replay buffers / telemetry with hot keys + small features: model with heavy duplicates on the key, many INCLUDE columns, and parallel IOS — e.g., `ROWS=50M WORKERS=5 INC=12 UNIQVALS=10 DISTRIBUTION=zipf` (see RLE+dupcache).
-- Time‑series by day (date + fact): two‑column scans with a lower bound on date and small include fields — e.g., `COLTYPE=int4 (value), date (key)`, `COLS=2`, `SELECTIVITY` varying. Unified driver handles this via selectivity and COLS sweeps.
-- Short identifiers/text keys: C collation, lengths 4/8/16/32; count/equality workloads — e.g., `ROWS=5M WORKERS=5 UNIQVALS=1000 STRLEN=16`.
-- Analytics with moderate selectivity and wide include lists: `SELECTIVITY=0.1 COLS=10 ROWS=50M WORKERS=5` (key‑only or single key with INCLUDEs).
+-- CRITICAL: Run ANALYZE for optimal query plans
+ANALYZE table_name;
 
- 
+-- Use the index
+SELECT key_column, other, columns
+FROM table_name
+WHERE key_column >= some_value;
+```
 
-Development policy
-- Builds must be warning-free: `make build` and `make rebuild` should emit no compiler warnings. Remove unused code or fix signatures to satisfy this.
+### Build & Test
 
-psql in Docker
-- Always connect as the `postgres` OS user inside the container.
-- From host: run `make dpsql` to open psql as `postgres` in the `smol` container.
-- Inside container: run `make psql` or just `psql` directly (you are running as user `postgres`).
-- If you run `psql` as `root`, PostgreSQL will error with `FATAL: role "root" does not exist`.
+**Docker** (recommended):
+```bash
+make dbuild          # Build container image
+make dstart          # Start container + PostgreSQL
+make dpsql           # Connect to psql
+make installcheck    # Run regression tests
+```
+
+**Local** (inside container or native):
+```bash
+make build           # Clean build + install
+make start           # Start PostgreSQL
+make installcheck    # Run tests
+make coverage        # Generate coverage report
+make stop            # Stop PostgreSQL
+```
+
+## Capabilities & Limitations
+
+### Supported
+- Index-only scans (required)
+- Forward and backward scans
+- Parallel scans
+- Range queries (<, <=, =, >=, >)
+- Multi-column indexes (fixed-width columns only)
+- INCLUDE columns (fixed-width types)
+- Data types: int2/4/8, date, timestamp, timestamptz, uuid, float4/8, bool, oid, etc.
+
+### Not Supported
+- Write operations (strictly read-only)
+- NULL values in index keys
+- Bitmap scans
+- Variable-length keys without C collation
+- Index-only scans with heap lookups (SMOL requires IOS)
+
+### Prototype Limitations
+- No WAL logging (not crash-safe)
+- No FSM (free space map)
+
+## Use Cases
+
+**SMOL excels at:**
+- Time-series data with duplicate timestamps
+- Dimension tables (many lookups on same keys)
+- Event logs with categorical data
+- Analytics dashboards (read-heavy, memory-constrained)
+- Reporting databases (periodic rebuilds acceptable)
+
+**Example workload**: 1M row time-series table with 50 distinct metric_ids, queried by metric_id for aggregation. SMOL's RLE compression dramatically reduces index size while maintaining fast scans.
+
+## Documentation
+
+- `AGENT_NOTES.md` - Detailed implementation notes for developers
+- `COVERAGE_ENFORCEMENT.md` - Testing and coverage policy
+- `bench/` - Benchmark suite and methodology

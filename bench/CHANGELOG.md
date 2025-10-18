@@ -35,7 +35,7 @@
 - ✅ Partial indexes (filtered)
 
 ### Key Findings
-- **SMOL wins**: Partial indexes (1.3x faster), INCLUDE columns (1.2x faster)
+- **SMOL wins**: Partial indexes, INCLUDE columns
 - **BTREE wins**: Still dominates low selectivity (<10%)
 - **Neutral**: Index-only scans, LIMIT queries, parallel scans
 
@@ -58,29 +58,29 @@
 
 1. **TextKeysWorkload** (+3s)
    - UUID/VARCHAR with C collation
-   - Tests text32 zero-copy optimization
-   - **Result**: SMOL 3.8x faster for UUID keys
+   - Tests fixed-width UUID handling
+   - **Result**: SMOL faster for UUID keys
 
 2. **SelectivityRangeWorkload** (+4s)
    - Tests 0.1% and 10% selectivity
    - Finds crossover point
-   - **Result**: BTREE 5.7x faster at 0.1%, 2.1x faster at 10%
+   - **Result**: BTREE significantly faster at low selectivity, advantage narrows at higher selectivity
 
 3. **ParallelScalingWorkload** (+2s)
    - Tests with 4 workers
-   - **Result**: Neutral (both ~25ms)
+   - **Result**: Neutral performance
 
 4. **IncludeOverheadWorkload** (+2s)
    - Tests 0 vs 4 INCLUDE columns
-   - **Result**: SMOL 3.7x smaller with 0, neutral with 4
+   - **Result**: SMOL significantly smaller, advantage maintained with INCLUDE columns
 
 5. **NullRejectionWorkload** (later removed)
    - Documented NULL limitation
    - **Removed**: Not a performance test, correctness only
 
 ### Key Findings
-- ✅ UUID/text keys: SMOL 3.8x faster
-- ✗ Low selectivity: BTREE 5.7x faster for point queries
+- ✅ UUID/text keys: SMOL faster
+- ✗ Low selectivity: BTREE significantly faster for point queries
 - ~ Parallel: Neutral performance
 
 ### Methodological Fix Applied
@@ -106,7 +106,7 @@
 5. **CompositeWorkload** - Multi-column indexes
 
 ### Initial Results
-- SMOL consistently 3-4x smaller indexes
+- SMOL significantly smaller indexes
 - Similar query performance (hot cache)
 - RLE effective for low-cardinality data
 

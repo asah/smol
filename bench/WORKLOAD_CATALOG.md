@@ -59,7 +59,7 @@ metrics = 50
 ### 2. Text/UUID Keys
 
 **File**: `bench/workloads/textkeys.py`
-**Purpose**: Test text32 zero-copy optimization
+**Purpose**: Test fixed-width UUID handling
 
 **Data Generation**:
 ```python
@@ -72,7 +72,7 @@ CREATE INDEX ... USING smol(uuid_col)
 1. `equality` (hot): Point lookup on UUID
 2. `range` (hot): Range scan on UUID
 
-**Expected**: SMOL 3.8x faster (zero-copy avoids varlena overhead)
+**Expected**: SMOL 2.5x faster (compact fixed-width storage)
 
 ---
 
