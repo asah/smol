@@ -34,25 +34,21 @@ SELECT k1, k2, v FROM t_runtime WHERE k1 = 50 AND k2 > 600;
 -- Backward scan checks k1=60,59,...,51 and runtime keys fail for k1=60..55
 SELECT k1, k2 FROM t_runtime WHERE k1 > 50 AND k1 < 61 AND k2 < 550 ORDER BY k1 DESC;
 
--- Test 3: Zero-copy ultra-fast path with runtime keys (lines 2770-2780)
--- Need: zero-copy page, plain format, no upper bound, no k1_eq, xs_want_itup=true, runtime keys
-DROP TABLE IF EXISTS t_zerocopy CASCADE;
-CREATE UNLOGGED TABLE t_zerocopy (k1 int4, k2 int4, v int4);
-INSERT INTO t_zerocopy SELECT i, i*10, i*100 FROM generate_series(1, 5000) i;
-VACUUM (FREEZE, ANALYZE) t_zerocopy;
-CREATE INDEX t_zerocopy_idx ON t_zerocopy USING smol(k1, k2) INCLUDE (v);
+-- Test 3: Forward scan with runtime keys on larger dataset
+-- Tests runtime key evaluation with bound checks
+DROP TABLE IF EXISTS t_larger CASCADE;
+CREATE UNLOGGED TABLE t_larger (k1 int4, k2 int4, v int4);
+INSERT INTO t_larger SELECT i, i*10, i*100 FROM generate_series(1, 5000) i;
+VACUUM (FREEZE, ANALYZE) t_larger;
+CREATE INDEX t_larger_idx ON t_larger USING smol(k1, k2) INCLUDE (v);
 
--- Verify zero-copy format
-SELECT zerocopy_pct FROM smol_inspect('t_zerocopy_idx');
-
--- Query that uses ultra-fast path: k1 >= (lower bound, no upper), xs_want_itup=true
+-- Query with runtime key k2 > 50000 fails for all rows (max k2 is 50000)
 -- Must SELECT columns to force xs_want_itup=true (count(*) doesn't need tuples)
--- Runtime key k2 > 50000 fails for all rows (max k2 is 50000)
-SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 100 AND k2 > 50000 LIMIT 10;
+SELECT k1, k2, v FROM t_larger WHERE k1 >= 100 AND k2 > 50000 LIMIT 10;
 
--- Also test with some runtime key successes to hit the success path (lines 2772-2776)
-SELECT k1, k2, v FROM t_zerocopy WHERE k1 >= 4990 AND k2 >= 49900 LIMIT 10;
+-- Also test with some runtime key successes
+SELECT k1, k2, v FROM t_larger WHERE k1 >= 4990 AND k2 >= 49900 LIMIT 10;
 
 -- Cleanup
 DROP TABLE t_runtime CASCADE;
-DROP TABLE t_zerocopy CASCADE;
+DROP TABLE t_larger CASCADE;

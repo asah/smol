@@ -8,17 +8,15 @@ LANGUAGE C;
 CREATE FUNCTION smol_inspect(regclass,
     OUT total_pages int4,
     OUT leaf_pages int4,
-    OUT zerocopy_pages int4,
     OUT key_rle_pages int4,
     OUT inc_rle_pages int4,
-    OUT zerocopy_pct numeric,
     OUT compression_pct numeric)
 RETURNS record
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION smol_inspect(regclass) IS
-'Inspect SMOL index structure: returns page counts and format percentages (zero-copy vs RLE compression)';
+'Inspect SMOL index structure: returns page counts and RLE compression percentage';
 
 -- Test functions for coverage (call AM functions directly to bypass planner)
 CREATE FUNCTION smol_test_backward_scan(regclass)

@@ -46,6 +46,16 @@ SMOL provides a page-oriented tree structure over the data just like nbtree, but
 5. SMOL optimizes small, repetitive data and caches the response tuple to avoid extra traversal and memory copies.
 6. SMOL detects and enforces maximum strength during CREATE INDEX and assumes "C" collation, which allows its execution to treat strings like fixed width numbers. This is fine for identifier-type strings which are typically ASCII.
 
+### Why Not Zero-Copy Format?
+
+During development, we explored a "zero-copy" page format that stored complete IndexTuple structures (with 8-byte overhead per tuple) to avoid memcpy during scans. This approach was abandoned because:
+
+1. **Index-only scans (IOS) fundamentally require tuple construction**: PostgreSQL's IOS protocol requires materializing tuples into `xs_itup`, which destroys any zero-copy benefits
+2. **Increased size hurts performance**: The 8-byte overhead per tuple doubled index size, requiring 2x more page reads and hurting cache locality
+3. **No measurable speedup**: Benchmarks showed zero-copy was actually slightly slower than plain format due to the extra I/O
+
+Instead, SMOL uses **PLAIN format** (no overhead) when RLE doesn't provide benefits (uniqueness ratio >= 0.98), delivering both space efficiency and good scan performance.
+
 ## Quick start
 
 ### preparing the table

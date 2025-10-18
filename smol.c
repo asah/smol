@@ -156,20 +156,11 @@ static int smol_log_sample_n = 8;     /* sample first N items per phase */
 /* Adaptive storage format GUCs */
 typedef enum
 {
-    ZERO_COPY_OFF = 0,
-    ZERO_COPY_ON = 1,
-    ZERO_COPY_AUTO = 2
-} ZeroCopyMode;
-
-typedef enum
-{
     KEY_RLE_V1 = 1,      /* Use V1 format (0x8001u) without continues_byte */
     KEY_RLE_V2 = 2,      /* Use V2 format (0x8002u) with continues_byte */
     KEY_RLE_AUTO = 3     /* Auto-select based on build path (default: V1 for text, V2 for sorted) */
 } KeyRLEVersion;
 
-static int smol_enable_zero_copy = ZERO_COPY_AUTO;  /* Zero-copy mode: off, on, or auto */
-static int  smol_zero_copy_threshold_mb = 1;     /* Max index size (MB) for zero-copy format - very conservative for safety */
 static double smol_rle_uniqueness_threshold = 0.98; /* If nruns/nitems >= this, consider unique (very high threshold) */
 static int smol_key_rle_version = KEY_RLE_AUTO;  /* KEY_RLE format version: v1, v2, or auto */
 
@@ -493,22 +484,6 @@ _PG_init(void)
                             NULL, NULL, NULL);
 
     /* Adaptive storage format GUCs */
-    static const struct config_enum_entry zero_copy_options[] = {
-        {"off", ZERO_COPY_OFF, false},
-        {"on", ZERO_COPY_ON, false},
-        {"auto", ZERO_COPY_AUTO, false},
-        {NULL, 0, false}
-    };
-
-    DefineCustomEnumVariable("smol.enable_zero_copy",
-                            "Enable zero-copy optimization for unique-key workloads",
-                            "auto: decide based on uniqueness and size; on: always use; off: never use",
-                            &smol_enable_zero_copy,
-                            ZERO_COPY_AUTO,
-                            zero_copy_options,
-                            PGC_USERSET, 0,
-                            NULL, NULL, NULL);
-
     static const struct config_enum_entry key_rle_version_options[] = {
         {"v1", KEY_RLE_V1, false},
         {"v2", KEY_RLE_V2, false},
@@ -522,14 +497,6 @@ _PG_init(void)
                             &smol_key_rle_version,
                             KEY_RLE_AUTO,
                             key_rle_version_options,
-                            PGC_USERSET, 0,
-                            NULL, NULL, NULL);
-
-    DefineCustomIntVariable("smol.zero_copy_threshold_mb",
-                            "Maximum index size (MB) for zero-copy format",
-                            "Indexes larger than this use compression even for unique keys",
-                            &smol_zero_copy_threshold_mb,
-                            1, 0, 10000,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
 
@@ -724,7 +691,6 @@ static StrategyNumber smol_translatecmptype(CompareType cmptype, Oid opfamily);
 #define SMOL_META_VERSION 1
 
 /* Leaf page format tags */
-#define SMOL_TAG_ZEROCOPY  0x8000u  /* Zero-copy format: [tag][nitems][keys...] - no memcpy */
 #define SMOL_TAG_KEY_RLE   0x8001u  /* Key-RLE V1: [tag][nitems][nruns][runs...] */
 #define SMOL_TAG_KEY_RLE_V2 0x8002u  /* Key-RLE V2: [tag][nitems][nruns][continues_byte][runs...] - runs can continue across pages */
 #define SMOL_TAG_INC_RLE   0x8003u  /* Include-RLE: [tag][nitems][nruns][runs...] */
@@ -838,7 +804,6 @@ typedef struct SmolScanOpaqueData
 
     /* prebuilt index tuple reused for IOS */
     IndexTuple  itup;           /* allocated once in beginscan */
-    IndexTuple  itup_zerocopy_hdr; /* 8-byte header for zero-copy pages (points to page data) */
     char       *itup_data;      /* pointer to data area inside itup */
     uint16      itup_off2;      /* second-attr offset from data (two-col), else 0 */
     uint16      itup_data_off;  /* data offset from tuple start (for varwidth sizing) */
@@ -894,10 +859,9 @@ typedef struct SmolScanOpaqueData
     BlockNumber rle_cached_page_blk;     /* which page the cache is valid for */
     uint64      rle_cache_hits;          /* cache hit counter for debugging */
     uint64      rle_cache_misses;        /* cache miss counter for debugging */
-    bool        page_is_zerocopy; /* true when current page uses zero-copy format (tag 0x8000) */
     /* Cached page metadata (opt #5): nitems and format cached once per page */
     uint16      cur_page_nitems;    /* cached nitems for current page */
-    uint8       cur_page_format;    /* cached format: 0=plain, 1=zerocopy, 2=key_rle, 3=inc_rle */
+    uint8       cur_page_format;    /* cached format: 0=plain, 2=key_rle, 3=inc_rle */
     /* Cached INCLUDE column base pointers for plain pages (performance optimization) */
     char       *plain_inc_base[16]; /* base pointer for each INCLUDE column on plain pages */
     bool        plain_inc_cached;   /* true when plain_inc_base[] is valid for current page */
@@ -1085,12 +1049,6 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
 
     /* Get first key on page for bounds checking */
     char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-
-    /* For zero-copy pages, skip IndexTuple header to get actual key data */
-    if (so->page_is_zerocopy)
-    { /* GCOV_EXCL_START - zero-copy format only in deprecated smol_build_tree_from_sorted */
-        first_key += sizeof(IndexTupleData);
-    } /* GCOV_EXCL_STOP */
 
     /* Upper bound check: if first key exceeds upper bound, stop entire scan
      * Since keys are sorted across pages (via rightlinks), if first_key > upper_bound
@@ -2059,8 +2017,6 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
                 SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_len[i], so->inc_align[i], so->inc_offs[i], so->inc_is_text[i]);
         }
         so->itup = (IndexTuple) palloc0(sz);
-        /* Allocate zero-copy header (8 bytes: 6-byte TID + 2-byte t_info) for pointing to page data */
-        so->itup_zerocopy_hdr = (IndexTuple) palloc0(sizeof(IndexTupleData));
         so->has_varwidth = key_is_text;
         for (uint16 i=0;i<so->ninclude;i++) if (so->inc_is_text[i]) { so->has_varwidth = true; break; }
         so->itup->t_info = (unsigned short) (sz | (so->has_varwidth ? INDEX_VAR_MASK : 0)); /* updated per-row when key varwidth */
@@ -2562,18 +2518,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         if (so->have_bound && dir != BackwardScanDirection && !so->two_col)
                         {
                             uint16 n2 = smol_leaf_nitems(page);
-                            /* Detect page format for zero-copy adjustment */
-                            ItemId iid_par = PageGetItemId(page, FirstOffsetNumber);
-                            char *base_par = (char *) PageGetItem(page, iid_par);
-                            uint16 tag_par; memcpy(&tag_par, base_par, sizeof(uint16));
-                            bool page_is_zerocopy_par = (tag_par == SMOL_TAG_ZEROCOPY);
                             uint16 lo2 = FirstOffsetNumber, hi2 = n2, ans2 = InvalidOffsetNumber;
                             while (lo2 <= hi2)
                             {
                                 uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
                                 char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                                /* For zero-copy pages, skip IndexTuple header to get key data */
-                                if (page_is_zerocopy_par) kp2 += sizeof(IndexTupleData);
                                 int cc = smol_cmp_keyptr_to_bound(so, kp2);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -2618,20 +2567,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         uint16 n2, lo = FirstOffsetNumber, hi, ans = InvalidOffsetNumber;
                         buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
                         page = BufferGetPage(buf);
-                        /* Detect page format for zero-copy adjustment */
-                        ItemId iid_tmp = PageGetItemId(page, FirstOffsetNumber);
-                        char *base_tmp = (char *) PageGetItem(page, iid_tmp);
-                        uint16 tag_tmp; memcpy(&tag_tmp, base_tmp, sizeof(uint16));
-                        so->page_is_zerocopy = (tag_tmp == SMOL_TAG_ZEROCOPY);
                         n2 = smol_leaf_nitems(page);
                         hi = n2;
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
                             char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                            /* For zero-copy pages, skip IndexTuple header to get key data */
-                            if (so->page_is_zerocopy) 
-                                keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -2801,25 +2742,21 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         }
         buf = so->cur_buf;
         page = BufferGetPage(buf);
-        /* Detect page format: plain, zero-copy, or RLE */
+        /* Detect page format: plain or RLE */
         ItemId iid = PageGetItemId(page, FirstOffsetNumber);
         char *base = (char *) PageGetItem(page, iid);
 	/* memcpy() is same perf but handles unaligned - uint16 tag = *((uint16*)base) is unsafe */
         uint16 tag; memcpy(&tag, base, sizeof(uint16));
 
-        so->page_is_zerocopy = (tag == SMOL_TAG_ZEROCOPY);
-
         /* Opt #5: Cache page metadata once per page (nitems and format) */
-        if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+        if (tag == SMOL_TAG_KEY_RLE ||
             tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE)
         {
             /* Tagged formats: [u16 tag][u16 nitems][...] */
             uint16 nitems;
             memcpy(&nitems, base + sizeof(uint16), sizeof(uint16));
             so->cur_page_nitems = nitems;
-            if (tag == SMOL_TAG_ZEROCOPY)
-                so->cur_page_format = 1; /* GCOV_EXCL_LINE - zero-copy format only used for old indexes, not created by current code */
-            else if (tag == SMOL_TAG_KEY_RLE)
+            if (tag == SMOL_TAG_KEY_RLE)
                 so->cur_page_format = 2; /* GCOV_EXCL_LINE - KEY_RLE v1 format is legacy, v2 is now the default */
             else if (tag == SMOL_TAG_INC_RLE)
                 so->cur_page_format = 3;
@@ -2855,7 +2792,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         {
             /* Reuse iid, base, tag from above */
             /* Plain format has no tag - first u16 is the count n (< 0x8000) */
-            if (tag != 0x8001u && tag != 0x8003u && tag != SMOL_TAG_ZEROCOPY)
+            if (tag != 0x8001u && tag != 0x8003u)
             {
                 uint16 n = tag; /* First u16 is count, not a tag */
                 char *base_ptr = base + sizeof(uint16) + (size_t) n * so->key_len;
@@ -2968,9 +2905,6 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         /* RLE or other format: use cached lookup */
                         keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
                     }
-                    /* For zero-copy pages, skip IndexTuple header to get key data */
-                    if (so->page_is_zerocopy)
-                        keyp += sizeof(IndexTupleData); /* GCOV_EXCL_LINE */
                     /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
                     {
@@ -3149,31 +3083,6 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 while (so->cur_off <= n)
                 {
                     char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                    /* For zero-copy pages, keyp points to IndexTuple header; adjust to key data */
-                    IndexTuple itup_ptr = NULL;
-                    if (so->page_is_zerocopy)
-                    { /* GCOV_EXCL_START - zero-copy format only in deprecated build function */
-                        itup_ptr = (IndexTuple) keyp;  /* Save IndexTuple pointer for later */
-                        keyp += sizeof(IndexTupleData);  /* Skip header to get key data */
-
-                        /* ULTRA-FAST PATH for zero-copy: check qual and return immediately
-                         * Skip all run detection, memcpy, INCLUDE processing for unique-key workloads */ /* GCOV_EXCL_LINE - zero-copy ultra-fast path rarely triggered by planner */
-                        if (so->page_is_plain && !so->have_upper_bound && !so->have_k1_eq && scan->xs_want_itup) /* GCOV_EXCL_LINE */
-                        { /* GCOV_EXCL_LINE */
-                            /* Test runtime keys */ /* GCOV_EXCL_LINE */
-                            if (smol_test_runtime_keys(scan, so)) /* GCOV_EXCL_LINE - single-column indexes have no runtime keys */
-                            { /* GCOV_EXCL_LINE */
-                                scan->xs_itup = itup_ptr; /* GCOV_EXCL_LINE */
-                                ItemPointerSet(&(scan->xs_heaptid), 0, 1); /* GCOV_EXCL_LINE */
-                                so->cur_off++; /* GCOV_EXCL_LINE */
-                                if (so->prof_enabled) so->prof_rows++; /* GCOV_EXCL_LINE */
-                                return true; /* GCOV_EXCL_LINE */
-                            } /* GCOV_EXCL_LINE */
-                            /* Key didn't match, continue to next */ /* GCOV_EXCL_LINE */
-                            so->cur_off++; /* GCOV_EXCL_LINE */
-                            continue; /* GCOV_EXCL_LINE */
-                        } /* GCOV_EXCL_LINE */
-                    } /* GCOV_EXCL_STOP */
                     /* Check upper bound (for BETWEEN queries) */
                     if (so->have_upper_bound)
                     {
@@ -3275,14 +3184,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             }
                         }
                         uint32 row = (uint32) (so->cur_off - 1);
-                        if (so->page_is_zerocopy)
-                        {
-                            /* Zero-copy fast path: keyp already points to complete IndexTuple
-                             * Format: [6B TID][2B t_info][key data]
-                             * No memcpy needed - use page buffer directly */
-                            /* Note: We MUST NOT do the else branches below - they would corrupt the data */
-                        }
-                        else if (so->has_varwidth)
+                        if (so->has_varwidth)
                         {
                             /* Dynamic varlena tuple build */
                             smol_emit_single_tuple(so, page, keyp, row);
@@ -3391,29 +3293,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
 
                     /* Test runtime keys before returning */
-                    /* For zero-copy, temporarily set so->itup to page pointer for runtime key test */ /* GCOV_EXCL_LINE - zero-copy path rarely hit */
-                    IndexTuple saved_itup = so->itup; 
-                    if (so->page_is_zerocopy) 
-                        so->itup = itup_ptr; /* GCOV_EXCL_LINE */
-
-                    if (!smol_test_runtime_keys(scan, so)) 
+                    if (!smol_test_runtime_keys(scan, so))
                     { /* GCOV_EXCL_LINE */
-                        if (so->page_is_zerocopy) /* GCOV_EXCL_LINE */
-                            so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
                         so->cur_off++; /* GCOV_EXCL_LINE */
                         continue; /* Skip this tuple */ /* GCOV_EXCL_LINE */
                     } /* GCOV_EXCL_LINE */
 
-                    if (so->page_is_zerocopy) 
-                        so->itup = saved_itup;  /* Restore */ /* GCOV_EXCL_LINE */
-
                     if (scan->xs_want_itup)
-                    {
-                        if (so->page_is_zerocopy) 
-                            scan->xs_itup = itup_ptr;  /* Zero-copy: direct IndexTuple page pointer */ /* GCOV_EXCL_LINE */
-                        else
-                            scan->xs_itup = so->itup;  /* Non-zero-copy: copied data */
-                    }
+                        scan->xs_itup = so->itup;
                     ItemPointerSet(&(scan->xs_heaptid), 0, 1);
                     so->cur_off++;
                     if (so->prof_enabled) so->prof_rows++;
@@ -3642,21 +3529,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                 if (n_check > 0)
                 {
-                    /* Detect page format for zero-copy bounds checking */
-                    ItemId iid_check = PageGetItemId(np, FirstOffsetNumber);
-                    char *base_check = (char *) PageGetItem(np, iid_check);
-                    uint16 tag_check; memcpy(&tag_check, base_check, sizeof(uint16));
-                    bool page_is_zerocopy_check = (tag_check == SMOL_TAG_ZEROCOPY);
-
-                    /* Temporarily set format for bounds checking */
-                    bool saved_zerocopy = so->page_is_zerocopy;
-                    so->page_is_zerocopy = page_is_zerocopy_check;
-
                     bool stop_scan = false;
                     bool matches pg_attribute_unused() = smol_page_matches_scan_bounds(so, np, n_check, &stop_scan);
-
-                    /* Restore original format flag */
-                    so->page_is_zerocopy = saved_zerocopy;
 
                     /* Page must match bounds - scan logic stops at tuple level before loading non-matching pages */
                     Assert(matches);
@@ -3689,17 +3563,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 if (so->have_bound && dir != BackwardScanDirection)
                 {
                     uint16 n2 = smol_leaf_nitems(np);
-                    /* Check if this page is zero-copy format */
-                    ItemId iid2 = PageGetItemId(np, FirstOffsetNumber);
-                    char *base2 = (char *) PageGetItem(np, iid2);
-                    uint16 tag2; memcpy(&tag2, base2, sizeof(uint16));
-                    bool page2_is_zerocopy = (tag2 == SMOL_TAG_ZEROCOPY);
                     uint16 lo2 = FirstOffsetNumber, hi2 = n2, ans2 = InvalidOffsetNumber;
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
                         char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
-                        if (page2_is_zerocopy) kp2 += sizeof(IndexTupleData);  /* Skip IndexTuple header to get key data */
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -4247,7 +4115,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
             Size fs = PageGetFreeSpace(page);
             Size avail = (fs > sizeof(ItemIdData)) ? (fs - sizeof(ItemIdData)) : 0;
             /* PER-PAGE ADAPTIVE FORMAT SELECTION
-             * Strategy: Start with zero-copy (most expensive), then switch to RLE/plain if beneficial.
+             * Strategy: Use RLE if beneficial, otherwise fallback to plain format.
              * This ensures pages are always maximally filled since SMOL is bulk-loaded and read-only.
              */
 
@@ -4314,7 +4182,6 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
 
             /* Decide format: always use RLE V2 for packed data */
             bool use_rle = true;
-            bool use_zero_copy = false;
             double uniqueness_ratio = (double) rle_nruns / (double) n_this;
 
             /* Check if we should fall back to plain format */
@@ -4325,40 +4192,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 use_rle = false;
             }
 
-            if (use_zero_copy)
-            {
-                /* Zero-copy format: [SMOL_TAG_ZEROCOPY][nitems][IndexTuple1][IndexTuple2]...
-                 * Each IndexTuple: [ItemPointerData t_tid (6B)][uint16 t_info (2B)][key data]
-                 * This allows returning pointers directly without memcpy during scans.
-                 * Trade-off: 8 bytes overhead per tuple, but acceptable for small unique-key indexes. */
-                uint16 tag = SMOL_TAG_ZEROCOPY;
-                char *p = scratch;
-                uint16 nitems16 = (uint16) n_this;
-                memcpy(p, &tag, sizeof(uint16)); p += sizeof(uint16);
-                memcpy(p, &nitems16, sizeof(uint16)); p += sizeof(uint16);
-
-                const char *base = (const char *) keys + ((size_t) i * key_len);
-                Size tuple_size = sizeof(IndexTupleData) + key_len;
-                uint16 t_info = (uint16) tuple_size;
-
-                for (Size idx = 0; idx < n_this; idx++)
-                {
-                    /* Write IndexTuple header */
-                    ItemPointerData tid;
-                    ItemPointerSetInvalid(&tid);  /* Dummy TID for read-only index */
-                    memcpy(p, &tid, sizeof(ItemPointerData)); p += sizeof(ItemPointerData);
-                    memcpy(p, &t_info, sizeof(uint16)); p += sizeof(uint16);
-                    /* Write key data */
-                    memcpy(p, base + idx * key_len, key_len); p += key_len;
-                }
-
-                Size sz = (Size) (p - scratch);
-                OffsetNumber off = PageAddItem(page, (Item) scratch, sz, FirstOffsetNumber, false, false);
-                SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, ERROR,
-                    (errmsg("smol: failed to add leaf payload (zero-copy)")));
-                added = n_this;
-            }
-            else if (use_rle)
+            if (use_rle)
             {
                 /* PHASE 2: RLE with format controlled by GUC */
                 /* Determine which format to use based on GUC setting */
@@ -5186,7 +5020,7 @@ smol_leaf_nitems(Page page)
     char *p = (char *) PageGetItem(page, iid);
     uint16 tag;
     memcpy(&tag, p, sizeof(uint16));
-    if (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+    if (tag == SMOL_TAG_KEY_RLE ||
         tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE)
     {
         /* Tagged formats: [u16 tag][u16 nitems][...] */
@@ -5210,19 +5044,7 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
     uint16 tag;
     memcpy(&tag, p, sizeof(uint16));
 
-    if (tag == SMOL_TAG_ZEROCOPY)
-    {
-        /* Zero-copy format: [tag][nitems][IndexTuple1][IndexTuple2]...
-         * Each IndexTuple: [6B TID][2B t_info][key_len bytes]
-         * Return pointer to the IndexTuple itself (not just key data) */
-        uint16 nitems; /* GCOV_EXCL_LINE - zero-copy format only in deprecated build function */
-        memcpy(&nitems, p + sizeof(uint16), sizeof(uint16)); /* GCOV_EXCL_LINE */
-        SMOL_DEFENSIVE_CHECK(idx >= 1 && idx <= nitems, ERROR, /* GCOV_EXCL_LINE */
-                            (errmsg("smol: zero-copy keyptr index %u out of range [1,%u]", idx, nitems))); /* GCOV_EXCL_LINE */
-        Size tuple_size = sizeof(IndexTupleData) + key_len; /* GCOV_EXCL_LINE */
-        return p + sizeof(uint16) * 2 + ((size_t)(idx - 1)) * tuple_size; /* GCOV_EXCL_LINE */
-    }
-    else if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE))
+    if (!(tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE))
     {
         /* Plain payload: [u16 n][keys...] (no tag, n is first uint16) */
         uint16 n = tag;
@@ -5295,8 +5117,8 @@ smol_leaf_is_rle(Page page)
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *p = (char *) PageGetItem(page, iid);
     uint16 tag; memcpy(&tag, p, sizeof(uint16));
-    /* Zero-copy and RLE formats have tags; plain format uses nitems as first u16 */
-    return (tag == SMOL_TAG_ZEROCOPY || tag == SMOL_TAG_KEY_RLE ||
+    /* RLE formats have tags; plain format uses nitems as first u16 */
+    return (tag == SMOL_TAG_KEY_RLE ||
             tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE);
 }
 
@@ -6954,10 +6776,8 @@ smol_test_backward_scan(PG_FUNCTION_ARGS)
  * Returns a row with:
  *   total_pages int4       - Total number of pages in the index
  *   leaf_pages int4        - Number of leaf pages
- *   zerocopy_pages int4    - Number of pages using zero-copy format
  *   key_rle_pages int4     - Number of pages using key RLE compression
  *   inc_rle_pages int4     - Number of pages using INCLUDE RLE compression
- *   zerocopy_pct numeric   - Percentage of leaf pages using zero-copy
  *   compression_pct numeric - Percentage of leaf pages using RLE (key or include)
  */
 PG_FUNCTION_INFO_V1(smol_inspect);
@@ -6968,14 +6788,13 @@ smol_inspect(PG_FUNCTION_ARGS)
     Oid         indexoid = PG_GETARG_OID(0);
     Relation    idx;
     TupleDesc   tupdesc;
-    Datum       values[7];
-    bool        nulls[7];
+    Datum       values[5];
+    bool        nulls[5];
     HeapTuple   tuple;
     BlockNumber nblocks;
     BlockNumber blkno;
     int32       total_pages = 0;
     int32       leaf_pages = 0;
-    int32       zerocopy_pages = 0;
     int32       key_rle_pages = 0;
     int32       inc_rle_pages = 0;
     Buffer      buf;
@@ -7033,14 +6852,10 @@ smol_inspect(PG_FUNCTION_ARGS)
                                 memcpy(&tag, data, sizeof(uint16));
 
                                 /* Check format tags */
-                                if (tag == SMOL_TAG_ZEROCOPY)
-                                    zerocopy_pages++; /* GCOV_EXCL_LINE */
-                                else if (tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2)
+                                if (tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2)
                                     key_rle_pages++;
                                 else if (tag == SMOL_TAG_INC_RLE)
                                     inc_rle_pages++;
-                                else if (tag < 0x8000)
-                                    zerocopy_pages++;
                             }
                         }
                     }
@@ -7064,23 +6879,18 @@ smol_inspect(PG_FUNCTION_ARGS)
 
     values[0] = Int32GetDatum(total_pages);
     values[1] = Int32GetDatum(leaf_pages);
-    values[2] = Int32GetDatum(zerocopy_pages);
-    values[3] = Int32GetDatum(key_rle_pages);
-    values[4] = Int32GetDatum(inc_rle_pages);
+    values[2] = Int32GetDatum(key_rle_pages);
+    values[3] = Int32GetDatum(inc_rle_pages);
 
     /* Calculate percentages */
     if (leaf_pages > 0)
     {
-        double zerocopy_pct = (100.0 * zerocopy_pages) / leaf_pages;
         double compression_pct = (100.0 * (key_rle_pages + inc_rle_pages)) / leaf_pages;
-
-        values[5] = DirectFunctionCall1(float8_numeric, Float8GetDatum(zerocopy_pct));
-        values[6] = DirectFunctionCall1(float8_numeric, Float8GetDatum(compression_pct));
+        values[4] = DirectFunctionCall1(float8_numeric, Float8GetDatum(compression_pct));
     }
     else
     {
-        values[5] = DirectFunctionCall1(float8_numeric, Float8GetDatum(0.0));
-        values[6] = DirectFunctionCall1(float8_numeric, Float8GetDatum(0.0));
+        values[4] = DirectFunctionCall1(float8_numeric, Float8GetDatum(0.0));
     }
 
     tuple = heap_form_tuple(tupdesc, values, nulls);

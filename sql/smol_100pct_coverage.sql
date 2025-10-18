@@ -94,7 +94,7 @@ DROP TABLE IF EXISTS t_empty_inspect CASCADE;
 CREATE UNLOGGED TABLE t_empty_inspect (k int4);
 CREATE INDEX t_empty_inspect_idx ON t_empty_inspect USING smol(k);
 -- Empty index should have height=0, triggering lines 6423-6424
-SELECT total_pages, zerocopy_pct, compression_pct FROM smol_inspect('t_empty_inspect_idx');
+SELECT total_pages, compression_pct FROM smol_inspect('t_empty_inspect_idx');
 
 -- Test 7: Parallel build with max_parallel_maintenance_workers=0 (line 6578)
 -- Setting to 0 should trigger early return
