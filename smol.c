@@ -2450,7 +2450,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     {
                         uint32 curv = SMOL_ATOMIC_READ_U32(&ps->curr);
                         if (curv == 0u)
-			{ /* GCOV_EXCL_LINE */
+			{
                             /* Use actual lower bound when available to avoid over-emitting from the first leaf */
                             int64 lb = PG_INT64_MIN;
                             if (so->have_bound)
@@ -2478,8 +2478,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             uint32 expect = 0u;
                             uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
-                            { so->cur_blk = left; so->chunk_left = claimed; break; }
-                            continue;  /* GCOV_EXCL_LINE */ /* CAS retry on race condition */
+                            {
+			        so->cur_blk = left; so->chunk_left = claimed;
+				break;
+			    }
+                            continue; /* CAS retry on race condition */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
@@ -2501,7 +2504,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         uint32 expected = curv;
                         uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
                         if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expected, newv))
-                        { so->cur_blk = (BlockNumber) curv; so->chunk_left = claimed; break; }
+                        {
+			    so->cur_blk = (BlockNumber) curv;
+			    so->chunk_left = claimed;
+			    break;
+			}
                     }
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
