@@ -55,6 +55,128 @@ During development, we explored a "zero-copy" format that pre-materialized Index
 
 **Current approach**: SMOL uses plain format (zero overhead) for unique data and RLE compression for duplicate-heavy data, chosen adaptively per page.
 
+### Index Structure
+
+```mermaid
+graph TB
+    subgraph "SMOL Index Structure"
+        Meta["Metapage (blk 0)<br/>- Magic/version<br/>- Key metadata<br/>- Root block"]
+
+        Root["Root Internal Node<br/>(if tree height > 1)"]
+
+        L1["Leaf Page 1<br/>Plain Format"]
+        L2["Leaf Page 2<br/>RLE Format"]
+        L3["Leaf Page 3<br/>Plain Format"]
+
+        Meta --> Root
+        Root --> L1
+        Root --> L2
+        Root --> L3
+
+        L1 --> L2
+        L2 --> L3
+    end
+
+    subgraph "Leaf Page Formats"
+        Plain["Plain Format<br/>Key1|Key2|...|KeyN<br/>Inc1|Inc2|...|IncN<br/>Minimal overhead"]
+
+        RLE["RLE Format<br/>RunLen1|Key1|Inc1<br/>RunLen2|Key2|Inc2<br/>Compressed duplicates"]
+    end
+
+    L1 -.-> Plain
+    L2 -.-> RLE
+    L3 -.-> Plain
+
+    style Meta fill:#e1f5ff
+    style Root fill:#fff4e1
+    style L1 fill:#e8f5e9
+    style L2 fill:#ffe8e8
+    style L3 fill:#e8f5e9
+```
+
+### Scan Process
+
+```mermaid
+flowchart TD
+    Start([beginscan]) --> Init[Initialize scan state<br/>Parse scan keys]
+    Init --> Rescan[rescan]
+
+    Rescan --> CheckPar{Parallel<br/>scan?}
+    CheckPar -->|Yes| ClaimBatch[Atomic claim batch<br/>of leaf pages]
+    CheckPar -->|No| FindFirst[Find first leaf via<br/>binary search]
+
+    ClaimBatch --> Position
+    FindFirst --> Position[Position to start<br/>of scan range]
+
+    Position --> Gettuple[gettuple]
+
+    Gettuple --> CheckDir{Direction<br/>change?}
+    CheckDir -->|Yes| ResetRun[Reset run state]
+    CheckDir -->|No| CheckRun{In active<br/>run?}
+
+    ResetRun --> CheckRun
+
+    CheckRun -->|Yes| EmitFromRun[Emit from cached run<br/>O1 operation]
+    CheckRun -->|No| NewRun[Detect new run<br/>Cache if beneficial]
+
+    EmitFromRun --> BuildTuple[Build IndexTuple<br/>using cached data]
+    NewRun --> ReadPage{Need next<br/>page?}
+
+    ReadPage -->|Yes| Prefetch[Adaptive prefetch<br/>next N pages]
+    ReadPage -->|No| EmitKey[Emit key + INCLUDE]
+
+    Prefetch --> EmitKey
+    EmitKey --> BuildTuple
+
+    BuildTuple --> Filter{Runtime<br/>filters?}
+    Filter -->|Pass| Return[Return tuple]
+    Filter -->|Fail| Gettuple
+
+    Return --> Gettuple
+
+    Gettuple --> End{EOF or<br/>bound?}
+    End -->|No| Gettuple
+    End -->|Yes| EndScan([endscan])
+
+    style Start fill:#e1f5ff
+    style Gettuple fill:#fff4e1
+    style EmitFromRun fill:#e8f5e9
+    style Return fill:#e8f5e9
+    style EndScan fill:#e1f5ff
+```
+
+### Compression Decision
+
+```mermaid
+flowchart TD
+    Start([Collect page data]) --> Count[Count unique runs]
+
+    Count --> Calc[Calculate ratio:<br/>unique_runs / total_items]
+
+    Calc --> Check{Ratio <<br/>threshold?}
+
+    Check -->|Yes, many dups| RLE[Use RLE format<br/>Store run lengths]
+    Check -->|No, mostly unique| Plain[Use plain format<br/>No overhead]
+
+    RLE --> Measure1[Measure actual<br/>compressed size]
+    Plain --> Measure2[Measure plain size]
+
+    Measure1 --> Compare{RLE size <<br/>plain size?}
+    Measure2 --> Write2[Write plain page]
+
+    Compare -->|Yes| Write1[Write RLE page]
+    Compare -->|No| Fallback[Fallback to plain<br/>despite high dups]
+
+    Fallback --> Write2
+    Write1 --> Done([Page complete])
+    Write2 --> Done
+
+    style RLE fill:#ffe8e8
+    style Plain fill:#e8f5e9
+    style Write1 fill:#ffe8e8
+    style Write2 fill:#e8f5e9
+```
+
 ## Quick Start
 
 ### Prerequisites
@@ -79,21 +201,25 @@ WHERE key_column >= some_value;
 
 ### Build & Test
 
-**Docker** (recommended):
+**Docker host**:
 ```bash
 make dbuild          # Build container image
 make dstart          # Start container + PostgreSQL
-make dpsql           # Connect to psql
-make installcheck    # Run regression tests
+make dexec           # login to container
+make dpsql           # one step login to container and run psql
 ```
 
 **Local** (inside container or native):
 ```bash
+make production      # (re)build optimized/non-debug version from scratch
+make coverage        # Generate coverage report
+make bench-quick     # quick benchmark test
+make bench-full      # comprehensive benchmark test
+
 make build           # Clean build + install
 make start           # Start PostgreSQL
-make installcheck    # Run tests
-make coverage        # Generate coverage report
 make stop            # Stop PostgreSQL
+make installcheck    # Run tests
 ```
 
 ## Capabilities & Limitations

@@ -202,8 +202,8 @@ static int smol_key_rle_version = KEY_RLE_AUTO;  /* KEY_RLE format version: v1, 
         (errmsg("smol: invalid byval length %u, expected 1/2/4/8", (unsigned)(len))))
 
 /* Evil hack: artificially inflate key_len to test edge cases */
-static int smol_keylen_inflate = 0;
-#define SMOL_KEYLEN_ADJUST(len) ((uint16)((len) + smol_keylen_inflate))
+static int smol_test_keylen_inflate = 0;  /* test-only: artificial key padding */
+#define SMOL_KEYLEN_ADJUST(len) ((uint16)((len) + smol_test_keylen_inflate))
 
 /* Simulate atomic contention in parallel scans */
 static int smol_simulate_atomic_race = 0;  /* 0=normal, 1=force curv==0, 2=force retry */
@@ -415,10 +415,10 @@ _PG_init(void)
 
 #ifdef SMOL_TEST_COVERAGE
     /* Evil testing hacks - only available in coverage builds */
-    DefineCustomIntVariable("smol.keylen_inflate",
+    DefineCustomIntVariable("smol.test_keylen_inflate",
                             "Test coverage: artificially inflate key_len calculations",
                             NULL,
-                            &smol_keylen_inflate,
+                            &smol_test_keylen_inflate,
                             0, 0, 100,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
@@ -1153,16 +1153,57 @@ typedef struct SmolWorkerExtra
 static void smol_radix_sort_idx_u64(const uint64 *key, uint32 *idx, uint32 *tmp, Size n);
 
 /* Build callback context and helpers */
-typedef struct BuildCtxI16 { int16 **pkeys; Size *pnalloc; Size *pnkeys; } BuildCtxI16;
-typedef struct BuildCtxI32 { int32 **pkeys; Size *pnalloc; Size *pnkeys; } BuildCtxI32;
-typedef struct BuildCtxI64 { int64 **pkeys; Size *pnalloc; Size *pnkeys; } BuildCtxI64;
-/* generic tuplesort collector for arbitrary fixed-length types */
-typedef struct TsBuildCtxAny { Tuplesortstate *ts; Size *pnkeys; } TsBuildCtxAny;
+typedef struct SmolBuildContextInt16
+{
+    int16     **pkeys;
+    Size       *pnalloc;
+    Size       *pnkeys;
+} SmolBuildContextInt16;
+
+typedef struct SmolBuildContextInt32
+{
+    int32     **pkeys;
+    Size       *pnalloc;
+    Size       *pnkeys;
+} SmolBuildContextInt32;
+
+typedef struct SmolBuildContextInt64
+{
+    int64     **pkeys;
+    Size       *pnalloc;
+    Size       *pnkeys;
+} SmolBuildContextInt64;
+
+/* Generic tuplesort collector for arbitrary fixed-length types */
+typedef struct SmolTuplesortContext
+{
+    Tuplesortstate *ts;
+    Size           *pnkeys;
+} SmolTuplesortContext;
+
 static void ts_build_cb_any(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
-typedef struct TsBuildCtxText { Tuplesortstate *ts; Size *pnkeys; int *pmax; } TsBuildCtxText;
+
+typedef struct SmolTextBuildContext
+{
+    Tuplesortstate *ts;
+    Size           *pnkeys;
+    int            *pmax;
+} SmolTextBuildContext;
+
 static void ts_build_cb_text(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
-/* 2-col generic builders */
-typedef struct { char **pk1; char **pk2; Size *pcap; Size *pcount; uint16 len1; uint16 len2; bool byval1; bool byval2; } PairArrCtx;
+
+/* Two-column generic builders */
+typedef struct SmolPairContext
+{
+    char     **pk1;
+    char     **pk2;
+    Size      *pcap;
+    Size      *pcount;
+    uint16     len1;
+    uint16     len2;
+    bool       byval1;
+    bool       byval2;
+} SmolPairContext;
 static void smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state);
 /* Single-key + INCLUDE collection (generic fixed-length include attrs) */
 typedef struct CollectIncCtx {
@@ -1627,7 +1668,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             (errmsg("smol text keys require C/POSIX collation")));
         TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
         Tuplesortstate *ts;
-        TsBuildCtxText cb; int maxlen = 0;
+        SmolTextBuildContext cb; int maxlen = 0;
         if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
         /* Set up parallel coordination if workers were launched */
         SortCoordinate coordinate = NULL;
@@ -1706,7 +1747,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             coordinate->sharedsort = buildstate.smolleader->sharedsort;
         }
         ts = tuplesort_begin_index_btree(heap, index, false, false, maintenance_work_mem, coordinate, TUPLESORT_NONE);
-        TsBuildCtxAny gcb; gcb.ts = ts; gcb.pnkeys = &nkeys;
+        SmolTuplesortContext gcb; gcb.ts = ts; gcb.pnkeys = &nkeys;
 
         /* In parallel mode, only workers scan the table. Leader just waits and merges. */
         if (!buildstate.smolleader)
@@ -1750,7 +1791,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     {
         Size cap = 0, n = 0;
         char *k1buf = NULL, *k2buf = NULL;
-        PairArrCtx cctx = { &k1buf, &k2buf, &cap, &n, key_len, key_len2, false, false };
+        SmolPairContext cctx = { &k1buf, &k2buf, &cap, &n, key_len, key_len2, false, false };
         {
             int16 l; bool bv; char al;
             get_typlenbyvalalign(atttypid, &l, &bv, &al); cctx.byval1 = bv;
@@ -6141,7 +6182,7 @@ smol_prev_leaf(Relation idx, BlockNumber cur)
 static void
 ts_build_cb_any(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    TsBuildCtxAny *c = (TsBuildCtxAny *) state;
+    SmolTuplesortContext *c = (SmolTuplesortContext *) state;
     (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR, (errmsg("smol does not support NULL values")));
     tuplesort_putindextuplevalues(c->ts, rel, tid, values, isnull);
@@ -6151,7 +6192,7 @@ ts_build_cb_any(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool
 static void
 ts_build_cb_text(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    TsBuildCtxText *c = (TsBuildCtxText *) state; (void) tupleIsAlive;
+    SmolTextBuildContext *c = (SmolTextBuildContext *) state; (void) tupleIsAlive;
     if (isnull[0]) ereport(ERROR,(errmsg("smol does not support NULL values")));
     text *t = DatumGetTextPP(values[0]); int blen = VARSIZE_ANY_EXHDR(t);
     if (blen > *c->pmax) *c->pmax = blen;
@@ -6167,7 +6208,7 @@ ts_build_cb_text(Relation rel, ItemPointer tid, Datum *values, bool *isnull, boo
 static void
 smol_build_cb_pair(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bool tupleIsAlive, void *state)
 {
-    PairArrCtx *c = (PairArrCtx *) state;
+    SmolPairContext *c = (SmolPairContext *) state;
     (void) rel; (void) tid; (void) tupleIsAlive;
     if (isnull[0] || isnull[1]) ereport(ERROR, (errmsg("smol does not support NULL values")));
     if (*c->pcount == *c->pcap)
@@ -7258,7 +7299,7 @@ smol_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 
         if (atttypid == TEXTOID)
         {
-            TsBuildCtxText cb;
+            SmolTextBuildContext cb;
             int maxlen = 0;
             cb.ts = ts;
             cb.pnkeys = &nkeys;
@@ -7281,7 +7322,7 @@ smol_parallel_build_main(dsm_segment *seg, shm_toc *toc)
         }
         else
         {
-            TsBuildCtxAny cb;
+            SmolTuplesortContext cb;
             cb.ts = ts;
             cb.pnkeys = &nkeys;
             table_index_build_scan(heap, index, indexInfo, true, true,
