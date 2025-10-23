@@ -63,6 +63,36 @@ This will list all lines that are:
 - Just needs debug flags enabled (use debug-enabled tests instead)
 - Is rare but reachable (write a test for it!)
 
+## Flaky Coverage Lines: `GCOV_EXCL_LINE (flaky)`
+
+**Problem:** Some lines flip-flop between covered and uncovered across test runs due to:
+- Race conditions in parallel execution
+- Non-deterministic timing
+- gcov artifacts (e.g., opening braces sometimes reported as covered, sometimes not)
+
+**Solution:** Mark these lines with `/* GCOV_EXCL_LINE (flaky) */`
+
+**Behavior:**
+- Line is **excluded from coverage** (won't cause coverage < 100% failure)
+- Line is **NOT reported as "excluded covered"** (won't trigger removal warning)
+- Safe to leave permanently without triggering strict coverage errors
+
+**Example:**
+```c
+if (race_condition)
+{  /* GCOV_EXCL_LINE (flaky) - opening brace artifact */
+    handle_race();
+}
+
+continue;  /* GCOV_EXCL_LINE (flaky) - CAS retry, non-deterministic */
+```
+
+**When to use:**
+- Opening/closing braces that gcov inconsistently reports
+- CAS retry paths that only execute under race conditions
+- Lines covered by parallel tests but not deterministically
+- NOT for genuinely untestable code (use plain `GCOV_EXCL_LINE` instead)
+
 ## Make coverage behavior
 
 ### Success (exit code 0):

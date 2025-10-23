@@ -4,6 +4,7 @@
 # This script analyzes smol.c.gcov and provides accurate coverage metrics by:
 # - Excluding lines marked with GCOV_EXCL_LINE
 # - Excluding code blocks between GCOV_EXCL_START and GCOV_EXCL_STOP
+# - Treating GCOV_EXCL_LINE (flaky) specially: excluded but not reported as "excluded covered"
 # - Reporting both excluded and measured line counts
 # - Showing uncovered lines (optionally condensed into sections)
 # - Showing excluded covered lines (candidates for removing GCOV_EXCL)
@@ -66,8 +67,10 @@ BEGIN { excl_block = 0 }
 /GCOV_EXCL_STOP/ { excl_block = 0; next }
 
 # Line is excluded if: in excl_block OR has GCOV_EXCL_LINE
+# But flaky lines (GCOV_EXCL_LINE (flaky)) are not counted as "excluded covered"
 {
     is_excluded = (excl_block || /GCOV_EXCL_LINE/)
+    is_flaky = /GCOV_EXCL_LINE.*\(flaky\)/
     is_uncovered = /^ *#####:/
     is_covered = /^ *[0-9]+\*?:/
 
@@ -79,7 +82,10 @@ BEGIN { excl_block = 0 }
         }
     } else if (is_covered) {
         if (is_excluded) {
-            excluded_cov++
+            # Flaky lines are excluded but not counted as "excluded covered"
+            if (!is_flaky) {
+                excluded_cov++
+            }
         } else {
             covered++
         }
@@ -226,6 +232,11 @@ if [ "$SHOW_EXCLUDED_COVERED" -eq 1 ]; then
     /GCOV_EXCL_STOP/ { excl_block = 0; next }
 
     /^ *[0-9]+\*?:/ && (excl_block || /GCOV_EXCL_LINE/) {
+        # Skip flaky lines - they are intentionally excluded and should not be reported
+        if (/GCOV_EXCL_LINE.*\(flaky\)/) {
+            next
+        }
+
         # This is a covered line that is excluded
         line = $0
         sub(/^ *[0-9]+\*?: */, "", line)

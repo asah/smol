@@ -24,9 +24,11 @@ SET min_parallel_index_scan_size = 0;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 
--- Query that should trigger parallel scan with batch claiming
-EXPLAIN SELECT COUNT(*) FROM t_batch_coverage WHERE k > 0;
-SELECT COUNT(*) FROM t_batch_coverage WHERE k > 0;
+-- Disable seq scan to force parallel index scan (for lines 2442, 2474)
+SET enable_seqscan = off;
+
+-- Query that should trigger parallel INDEX scan with batch claiming (single column)
+SELECT COUNT(*) FROM t_batch_coverage WHERE k > 50000;
 
 -- Two-column index to test two-column batch claiming paths
 CREATE UNLOGGED TABLE t_batch_twocol (k1 int4, k2 int4, v int4);
@@ -34,14 +36,9 @@ INSERT INTO t_batch_twocol SELECT i/100, i%100, i FROM generate_series(1, 100000
 CREATE INDEX t_batch_twocol_idx ON t_batch_twocol USING smol (k1, k2);
 ANALYZE t_batch_twocol;
 
--- Force index-only scan to encourage parallel index scan
--- This triggers the two-column parallel scan path (lines 2597-2728)
-SET enable_indexonlyscan = on;
-SET enable_seqscan = off;
--- Use a selective WHERE to make index scan attractive (triggers parallel index-only scan)
-SELECT COUNT(*) FROM t_batch_twocol WHERE k1 > 900;
--- Reset
-SET enable_seqscan = on;
+-- Query with two-column index to trigger parallel index scan (lines 2597+)
+-- enable_seqscan is already off from above
+SELECT COUNT(*) FROM t_batch_twocol WHERE k1 > 500;
 
 -- Backward scan with batch claiming - verify rows are returned in descending order
 SELECT k FROM t_batch_coverage WHERE k >= 99990 ORDER BY k DESC;
@@ -54,8 +51,7 @@ SELECT k FROM t_batch_coverage WHERE k >= 99990 ORDER BY k DESC;
 
 -- Force prefetch depth > 1 to test aggressive prefetching
 SET smol.prefetch_depth = 4;
--- Force index scans instead of seq scans
-SET enable_seqscan = off;
+-- enable_seqscan is already off, continue using index scans
 
 -- Query with prefetching on single-column index (parallel index scan)
 SELECT COUNT(*) FROM t_batch_coverage WHERE k BETWEEN 1000 AND 50000;
