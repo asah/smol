@@ -15,7 +15,7 @@ SET smol.cost_page = 1.5;
 EXPLAIN SELECT * FROM t_cost WHERE k > 500;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
- Index Only Scan using t_cost_idx on t_cost  (cost=0.00..27.83 rows=333 width=4)
+ Index Only Scan using t_cost_idx on t_cost  (cost=0.00..11.88 rows=333 width=4)
    Index Cond: (k > 500)
 (2 rows)
 
@@ -25,7 +25,7 @@ SET smol.cost_tup = 0.8;
 EXPLAIN SELECT * FROM t_cost WHERE k > 500;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
- Index Only Scan using t_cost_idx on t_cost  (cost=0.00..25.33 rows=333 width=4)
+ Index Only Scan using t_cost_idx on t_cost  (cost=0.00..10.83 rows=333 width=4)
    Index Cond: (k > 500)
 (2 rows)
 
@@ -105,7 +105,7 @@ CREATE INDEX t_twocol_int2_idx ON t_twocol_int2 USING smol(a, b) INCLUDE (c);
 SELECT count(*) FROM t_twocol_int2 WHERE a > 50;
  count 
 -------
-    29
+    50
 (1 row)
 
 DROP TABLE IF EXISTS t_twocol_int8 CASCADE;
@@ -115,7 +115,7 @@ CREATE INDEX t_twocol_int8_idx ON t_twocol_int8 USING smol(a, b) INCLUDE (c);
 SELECT count(*) FROM t_twocol_int8 WHERE a > 50;
  count 
 -------
-    76
+    50
 (1 row)
 
 DROP TABLE IF EXISTS t_twocol_char CASCADE;
@@ -125,7 +125,7 @@ CREATE INDEX t_twocol_char_idx ON t_twocol_char USING smol(a, b) INCLUDE (c);
 SELECT count(*) FROM t_twocol_char WHERE a > 25::"char";
  count 
 -------
-     5
+    25
 (1 row)
 
 -- Test 6: smol_inspect with empty index (lines 6423-6424)
@@ -134,10 +134,10 @@ DROP TABLE IF EXISTS t_empty_inspect CASCADE;
 CREATE UNLOGGED TABLE t_empty_inspect (k int4);
 CREATE INDEX t_empty_inspect_idx ON t_empty_inspect USING smol(k);
 -- Empty index should have height=0, triggering lines 6423-6424
-SELECT total_pages, zerocopy_pct, compression_pct FROM smol_inspect('t_empty_inspect_idx');
- total_pages | zerocopy_pct | compression_pct 
--------------+--------------+-----------------
-           2 |            0 |               0
+SELECT total_pages, compression_pct FROM smol_inspect('t_empty_inspect_idx');
+ total_pages | compression_pct 
+-------------+-----------------
+           2 |               0
 (1 row)
 
 -- Test 7: Parallel build with max_parallel_maintenance_workers=0 (line 6578)

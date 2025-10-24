@@ -287,12 +287,13 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
          */
         {
             SmolMeta m; smol_meta_read(index, &m);
-            so->ninclude = (so->two_col ? 0 : m.inc_count);
+            so->ninclude = m.inc_count;  /* Read INCLUDE count for both single-col and two-col */
             for (uint16 i=0;i<so->ninclude;i++)
             {
                 so->inc_len[i] = m.inc_len[i];
                 /* include attrs follow key attrs in the index tupdesc */
-                Form_pg_attribute att = TupleDescAttr(RelationGetDescr(index), 1 /* key attr */ + i);
+                int key_atts = so->two_col ? 2 : 1;
+                Form_pg_attribute att = TupleDescAttr(RelationGetDescr(index), key_atts + i);
                 so->inc_align[i] = att->attalign;
                 Oid attoid = att->atttypid;
                 so->inc_is_text[i] = (attoid == TEXTOID);
@@ -325,9 +326,17 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         }
         else
         {
-            /* Two-col: compute offset/aligned size for key2 */
+            /* Two-col: compute offset/aligned size for key2, then INCLUDE attrs */
             off2 = att_align_nominal(off1 + so->key_len, align2);
-            sz = MAXALIGN(off2 + so->key_len2);
+            Size cur = off2 + so->key_len2;
+            for (uint16 i=0;i<so->ninclude;i++)
+            {
+                cur = att_align_nominal(cur, so->inc_align[i]);
+                so->inc_offs[i] = (uint16) (cur - data_off);
+                Size inc_bytes = so->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_len[i]) : (Size) so->inc_len[i];
+                cur += inc_bytes;
+            }
+            sz = MAXALIGN(cur);
         }
         if (smol_debug_log)
         {
@@ -996,7 +1005,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             while (lo <= hi)
                             {
                                 uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                                char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2);
+                                char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
                                 int c = smol_cmp_keyptr_to_bound(so, k1p);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1034,7 +1043,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2);
+                            char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
                             int c = smol_cmp_keyptr_to_bound(so, k1p);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1136,8 +1145,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (so->leaf_i < so->leaf_n)
             {
                 uint16 row = (uint16) (so->leaf_i + 1);
-                char *k1p = smol12_row_k1_ptr(page, row, so->key_len, so->key_len2);
-                char *k2p = smol12_row_k2_ptr(page, row, so->key_len, so->key_len2);
+                char *k1p = smol12_row_k1_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                char *k2p = smol12_row_k2_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
                 /* Enforce leading-key bound per row for correctness */
                 if (so->have_bound)
                 {
@@ -1192,6 +1201,29 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 else if (so->key_len2 == 8) smol_copy8(so->itup_data + so->itup_off2, k2p);
                 else if (so->key_len2 == 16) smol_copy16(so->itup_data + so->itup_off2, k2p);
                 else smol_copy_small(so->itup_data + so->itup_off2, k2p, so->key_len2);
+
+                /* Copy INCLUDE columns for two-column indexes */
+                if (so->ninclude > 0)
+                {
+                    char *row_ptr = smol12_row_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                    char *inc_start = row_ptr + so->key_len + so->key_len2;
+                    for (uint16 i = 0; i < so->ninclude; i++)
+                    {
+                        char *inc_src = inc_start + so->inc_cumul_offs[i];
+                        char *inc_dst = so->itup_data + so->inc_offs[i];
+                        if (so->inc_is_text[i])
+                        {
+                            /* Text: add VARHDRSZ and copy */
+                            SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_len[i]);
+                            memcpy(VARDATA(inc_dst), inc_src, so->inc_len[i]);
+                        }
+                        else
+                        {
+                            /* Fixed-length: direct copy */
+                            memcpy(inc_dst, inc_src, so->inc_len[i]);
+                        }
+                    }
+                }
 
                 /* Test runtime keys before returning */
                 if (!smol_test_runtime_keys(scan, so))
@@ -1874,7 +1906,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo <= hi)
                     {
                         uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                        char *k1p = smol12_row_k1_ptr(np, mid, so->key_len, so->key_len2);
+                        char *k1p = smol12_row_k1_ptr(np, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
                         int c = smol_cmp_keyptr_to_bound(so, k1p);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }

@@ -12,9 +12,9 @@ PG_CFLAGS += --coverage -O0 -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 
-# pg_regress tests: optimized to 31 essential tests (was 41)
-# Reduced by 24% while maintaining 100% coverage via redundancy analysis
-REGRESS = smol_100pct_coverage smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_deep_backward_navigation smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
+# pg_regress tests: 32 tests including comprehensive error/boundary tests
+# Covers 100% of code with defensive checks and multi-column validation
+REGRESS = smol_100pct_coverage smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_deep_backward_navigation smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_errors smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
 
 # Load extension before each test to allow standalone test execution
 REGRESS_OPTS = --load-extension=smol

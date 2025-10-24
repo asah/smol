@@ -320,13 +320,15 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     /* ninclude is computed from natts (uint16) minus nkeyatts (int16), result cannot be negative */
     Assert(ninclude >= 0);
 
+    /* Enforce INCLUDE column limit (hardcoded array size in SmolMeta and SmolScanOpaque) */
+    if (ninclude > 16)
+        ereport(ERROR, (errmsg("smol supports at most 16 INCLUDE columns, got %d", ninclude)));
+
     if (ninclude > 0)
     {
         /* INCLUDE columns (fixed-width ints or text) - supports single or multi-key indexes */
         int inc_count = ninclude;
         uint16 inc_lens[16]; bool inc_byval[16]; bool inc_is_text[16];
-        if (inc_count > 16)
-            ereport(ERROR, (errmsg("smol supports up to 16 INCLUDE columns")));
         for (int i = 0; i < inc_count; i++)
         {
             Oid t = TupleDescAttr(RelationGetDescr(index), nkeyatts + i)->atttypid;
@@ -343,6 +345,27 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             else
             { inc_lens[i] = (uint16) typlen; inc_byval[i] = byval; inc_is_text[i] = false; }
         }
+
+        /* Validate total row size (conservative estimate with alignment overhead) */
+        {
+            Size total_row_size = key_len;
+            if (nkeyatts == 2)
+                total_row_size += key_len2;
+            for (int i = 0; i < inc_count; i++)
+                total_row_size += inc_lens[i];
+            /* Add conservative alignment overhead: ~8 bytes per column */
+            total_row_size += (nkeyatts + inc_count) * 8;
+            /* Add IndexTuple header overhead (~8 bytes) */
+            total_row_size += MAXALIGN(sizeof(IndexTupleData));
+
+            /* Warn if row size exceeds 250 bytes (leaves room for ~32 rows/page minimum) */
+            if (total_row_size > 250)
+                ereport(WARNING,
+                    (errmsg("smol index row size may be large: estimated %zu bytes", total_row_size),
+                     errdetail("Large rows reduce the number of tuples per page, degrading performance."),
+                     errhint("Consider reducing the number or size of INCLUDE columns.")));
+        }
+
         /* Collect keys + includes into arrays */
         Size cap = 0, n = 0;
         int64 *karr = NULL;

@@ -411,6 +411,7 @@ BEGIN
     END;
     DROP TABLE t_err_many_inc CASCADE;
 END $$;
+ERROR:  smol supports at most 16 INCLUDE columns, got 17
 -- Test 24: Text INCLUDE column optimization (lines 754-778)
 -- This will trigger text INCLUDE stride optimization
 DROP TABLE IF EXISTS t_text_inc_opt CASCADE;

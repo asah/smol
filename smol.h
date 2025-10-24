@@ -563,22 +563,23 @@ smol_norm64(int64 v)
 }
 
 /* Two-column row pointer helpers */
-static inline char *smol12_row_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
+static inline char *smol12_row_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2, uint32 inc_total_len)
 {
     ItemId iid = PageGetItemId(page, FirstOffsetNumber);
     char *base = (char *) PageGetItem(page, iid);
-    size_t off = sizeof(uint16) + (size_t)(row - 1) * ((size_t) key_len1 + (size_t) key_len2);
+    size_t row_size = (size_t) key_len1 + (size_t) key_len2 + (size_t) inc_total_len;
+    size_t off = sizeof(uint16) + (size_t)(row - 1) * row_size;
     return base + off;
 }
 
-static inline char *smol12_row_k1_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
+static inline char *smol12_row_k1_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2, uint32 inc_total_len)
 {
-    return smol12_row_ptr(page, row, key_len1, key_len2) + 0;
+    return smol12_row_ptr(page, row, key_len1, key_len2, inc_total_len) + 0;
 }
 
-static inline char *smol12_row_k2_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2)
+static inline char *smol12_row_k2_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2, uint32 inc_total_len)
 {
-    return smol12_row_ptr(page, row, key_len1, key_len2) + key_len1;
+    return smol12_row_ptr(page, row, key_len1, key_len2, inc_total_len) + key_len1;
 }
 
 /* Single-column + INCLUDE helpers */

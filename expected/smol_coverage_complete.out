@@ -182,13 +182,14 @@ ANALYZE t_twocol_attr2_eq;
 SELECT count(*) FROM t_twocol_attr2_eq WHERE k1 >= 1000 AND k2 = 500;
  count 
 -------
-     0
+     9
 (1 row)
 
 SELECT k1, k2, v FROM t_twocol_attr2_eq WHERE k1 BETWEEN 5000 AND 6000 AND k2 = 750 ORDER BY k1 LIMIT 5;
- k1 | k2 | v 
-----+----+---
-(0 rows)
+  k1  | k2  |   v   
+------+-----+-------
+ 5750 | 750 | 57500
+(1 row)
 
 DROP TABLE t_twocol_attr2_eq CASCADE;
 -- ============================================================================
@@ -2604,13 +2605,33 @@ SET min_parallel_index_scan_size = 0;
 SELECT count(*) FROM t_parallel_twocol WHERE k1 >= 10000;
  count 
 -------
- 92404
+ 90001
 (1 row)
 
 SELECT k1, k2, v FROM t_parallel_twocol WHERE k1 BETWEEN 50000 AND 50100 ORDER BY k1, k2 LIMIT 20;
- k1 | k2 | v 
-----+----+---
-(0 rows)
+  k1   |   k2   |   v    
+-------+--------+--------
+ 50000 | 100000 | 500000
+ 50001 | 100002 | 500010
+ 50002 | 100004 | 500020
+ 50003 | 100006 | 500030
+ 50004 | 100008 | 500040
+ 50005 | 100010 | 500050
+ 50006 | 100012 | 500060
+ 50007 | 100014 | 500070
+ 50008 | 100016 | 500080
+ 50009 | 100018 | 500090
+ 50010 | 100020 | 500100
+ 50011 | 100022 | 500110
+ 50012 | 100024 | 500120
+ 50013 | 100026 | 500130
+ 50014 | 100028 | 500140
+ 50015 | 100030 | 500150
+ 50016 | 100032 | 500160
+ 50017 | 100034 | 500170
+ 50018 | 100036 | 500180
+ 50019 | 100038 | 500190
+(20 rows)
 
 SET max_parallel_workers_per_gather = 0;
 DROP TABLE t_parallel_twocol CASCADE;
