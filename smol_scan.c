@@ -79,7 +79,7 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     } /* GCOV_EXCL_STOP */
 
     /* Get first key on page for bounds checking */
-    char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+    char *first_key = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
 
     /* Upper bound check: if first key exceeds upper bound, stop entire scan */
     if (so->have_upper_bound)
@@ -196,20 +196,20 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
         uint16 n2 = so->cur_page_nitems; /* Opt #5: use cached nitems */
         for (uint16 ii=0; ii<so->ninclude; ii++)
         {
-            cur = att_align_nominal(cur, so->inc_align[ii]);
+            cur = att_align_nominal(cur, so->inc_meta->inc_align[ii]);
             wp = base + cur;
-            char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs);
-            if (so->inc_is_text[ii])
+            char *ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, row, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+            if (so->inc_meta->inc_is_text[ii])
             {
-                if (so->run_active && so->inc_const[ii] && so->run_inc_built[ii] && so->run_inc_vl_len[ii] > 0)
+                if (so->run_active && so->inc_meta->inc_const[ii] && so->inc_meta->run_inc_built[ii] && so->inc_meta->run_inc_vl_len[ii] > 0)
                 {
-                    memcpy(wp, so->run_inc_vl[ii], (size_t) so->run_inc_vl_len[ii]);
-                    cur += (Size) so->run_inc_vl_len[ii];
+                    memcpy(wp, so->inc_meta->run_inc_vl[ii], (size_t) so->inc_meta->run_inc_vl_len[ii]);
+                    cur += (Size) so->inc_meta->run_inc_vl_len[ii];
                 }
                 else
                 {
-                    const char *iend = (const char *) memchr(ip, '\0', so->inc_len[ii]);
-                    int ilen = iend ? (int)(iend - ip) : (int) so->inc_len[ii];
+                    const char *iend = (const char *) memchr(ip, '\0', so->inc_meta->inc_len[ii]);
+                    int ilen = iend ? (int)(iend - ip) : (int) so->inc_meta->inc_len[ii];
                     SET_VARSIZE((struct varlena *) wp, ilen + VARHDRSZ);
                     memcpy(wp + VARHDRSZ, ip, ilen);
                     cur += VARHDRSZ + (Size) ilen;
@@ -217,12 +217,12 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
             }
             else
             {
-                if (so->inc_len[ii] == 2) smol_copy2(wp, ip);
-                else if (so->inc_len[ii] == 4) smol_copy4(wp, ip);
-                else if (so->inc_len[ii] == 8) smol_copy8(wp, ip);
-                else if (so->inc_len[ii] == 16) smol_copy16(wp, ip); /* GCOV_EXCL_LINE - 16-byte INCLUDE columns rarely used */
-                else smol_copy_small(wp, ip, so->inc_len[ii]); /* GCOV_EXCL_LINE - uncommon INCLUDE column lengths rarely used */
-                cur += so->inc_len[ii];
+                if (so->inc_meta->inc_len[ii] == 2) smol_copy2(wp, ip);
+                else if (so->inc_meta->inc_len[ii] == 4) smol_copy4(wp, ip);
+                else if (so->inc_meta->inc_len[ii] == 8) smol_copy8(wp, ip);
+                else if (so->inc_meta->inc_len[ii] == 16) smol_copy16(wp, ip); /* GCOV_EXCL_LINE - 16-byte INCLUDE columns rarely used */
+                else smol_copy_small(wp, ip, so->inc_meta->inc_len[ii]); /* GCOV_EXCL_LINE - uncommon INCLUDE column lengths rarely used */
+                cur += so->inc_meta->inc_len[ii];
             }
         }
     }
@@ -288,24 +288,84 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         {
             SmolMeta m; smol_meta_read(index, &m);
             so->ninclude = m.inc_count;  /* Read INCLUDE count for both single-col and two-col */
+
+            /* Allocate INCLUDE metadata structure if we have INCLUDE columns */
+            if (so->ninclude > 0)
+            {
+                size_t meta_size = sizeof(SmolIncludeMetadata);
+                size_t arrays_size = so->ninclude * (
+                    sizeof(uint16) +      /* inc_len */
+                    sizeof(uint32) +      /* inc_cumul_offs */
+                    sizeof(char) +        /* inc_align */
+                    sizeof(uint16) +      /* inc_offs */
+                    sizeof(void*) +       /* inc_copy */
+                    sizeof(bool) +        /* inc_is_text */
+                    sizeof(bool) +        /* inc_const */
+                    sizeof(int16) +       /* run_inc_len */
+                    sizeof(char*) +       /* plain_inc_base */
+                    sizeof(char*) +       /* rle_run_inc_ptr */
+                    sizeof(bool) +        /* run_inc_built */
+                    sizeof(int16) +       /* run_inc_vl_len */
+                    (VARHDRSZ + 32)       /* run_inc_vl */
+                );
+
+                /* One extra slot for cumulative offsets (stores total) */
+                arrays_size += sizeof(uint32);
+
+                so->inc_meta = (SmolIncludeMetadata *) palloc0(meta_size + arrays_size);
+
+                /* Set up pointers to point into the allocated block */
+                char *arr_base = (char*)so->inc_meta + meta_size;
+                so->inc_meta->inc_len = (uint16*)arr_base;
+                arr_base += so->ninclude * sizeof(uint16);
+                so->inc_meta->inc_cumul_offs = (uint32*)arr_base;
+                arr_base += (so->ninclude + 1) * sizeof(uint32);  /* +1 for total */
+                so->inc_meta->inc_align = arr_base;
+                arr_base += so->ninclude * sizeof(char);
+                so->inc_meta->inc_offs = (uint16*)arr_base;
+                arr_base += so->ninclude * sizeof(uint16);
+                so->inc_meta->inc_copy = (void (**)(char *, const char *))arr_base;
+                arr_base += so->ninclude * sizeof(void*);
+                so->inc_meta->inc_is_text = (bool*)arr_base;
+                arr_base += so->ninclude * sizeof(bool);
+                so->inc_meta->inc_const = (bool*)arr_base;
+                arr_base += so->ninclude * sizeof(bool);
+                so->inc_meta->run_inc_len = (int16*)arr_base;
+                arr_base += so->ninclude * sizeof(int16);
+                so->inc_meta->plain_inc_base = (char**)arr_base;
+                arr_base += so->ninclude * sizeof(char*);
+                so->inc_meta->rle_run_inc_ptr = (char**)arr_base;
+                arr_base += so->ninclude * sizeof(char*);
+                so->inc_meta->run_inc_built = (bool*)arr_base;
+                arr_base += so->ninclude * sizeof(bool);
+                so->inc_meta->run_inc_vl_len = (int16*)arr_base;
+                arr_base += so->ninclude * sizeof(int16);
+                so->inc_meta->run_inc_vl = (char (*)[VARHDRSZ + 32])arr_base;
+            }
+            else
+            {
+                so->inc_meta = NULL;
+            }
+
             for (uint16 i=0;i<so->ninclude;i++)
             {
-                so->inc_len[i] = m.inc_len[i];
+                so->inc_meta->inc_len[i] = m.inc_len[i];
                 /* include attrs follow key attrs in the index tupdesc */
                 int key_atts = so->two_col ? 2 : 1;
                 Form_pg_attribute att = TupleDescAttr(RelationGetDescr(index), key_atts + i);
-                so->inc_align[i] = att->attalign;
+                so->inc_meta->inc_align[i] = att->attalign;
                 Oid attoid = att->atttypid;
-                so->inc_is_text[i] = (attoid == TEXTOID);
+                so->inc_meta->inc_is_text[i] = (attoid == TEXTOID);
             }
             /* Precompute cumulative offsets for O(1) INCLUDE pointer arithmetic */
             uint32 cumul = 0;
             for (uint16 i=0;i<so->ninclude;i++)
             {
-                so->inc_cumul_offs[i] = cumul;
-                cumul += so->inc_len[i];
+                so->inc_meta->inc_cumul_offs[i] = cumul;
+                cumul += so->inc_meta->inc_len[i];
             }
-            so->inc_cumul_offs[so->ninclude] = cumul;  /* Total for "skip all includes" case */
+            if (so->ninclude > 0)
+                so->inc_meta->inc_cumul_offs[so->ninclude] = cumul;  /* Total for "skip all includes" case */
         }
         so->align1 = align1;
         so->align2 = align2;
@@ -317,9 +377,9 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             Size cur = off1 + stored_key_size;
             for (uint16 i=0;i<so->ninclude;i++)
             {
-                cur = att_align_nominal(cur, so->inc_align[i]);
-                so->inc_offs[i] = (uint16) (cur - data_off);
-                Size inc_bytes = so->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_len[i]) : (Size) so->inc_len[i];
+                cur = att_align_nominal(cur, so->inc_meta->inc_align[i]);
+                so->inc_meta->inc_offs[i] = (uint16) (cur - data_off);
+                Size inc_bytes = so->inc_meta->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_meta->inc_len[i]) : (Size) so->inc_meta->inc_len[i];
                 cur += inc_bytes;
             }
             sz = MAXALIGN(cur);
@@ -331,9 +391,9 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             Size cur = off2 + so->key_len2;
             for (uint16 i=0;i<so->ninclude;i++)
             {
-                cur = att_align_nominal(cur, so->inc_align[i]);
-                so->inc_offs[i] = (uint16) (cur - data_off);
-                Size inc_bytes = so->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_len[i]) : (Size) so->inc_len[i];
+                cur = att_align_nominal(cur, so->inc_meta->inc_align[i]);
+                so->inc_meta->inc_offs[i] = (uint16) (cur - data_off);
+                Size inc_bytes = so->inc_meta->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_meta->inc_len[i]) : (Size) so->inc_meta->inc_len[i];
                 cur += inc_bytes;
             }
             sz = MAXALIGN(cur);
@@ -342,11 +402,11 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         {
             SMOL_LOGF("beginscan layout: key_len=%u two_col=%d ninclude=%u sz=%zu", so->key_len, so->two_col, so->ninclude, (size_t) sz);
             for (uint16 i=0;i<so->ninclude;i++)
-                SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_len[i], so->inc_align[i], so->inc_offs[i], so->inc_is_text[i]);
+                SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_meta->inc_len[i], so->inc_meta->inc_align[i], so->inc_meta->inc_offs[i], so->inc_meta->inc_is_text[i]);
         }
         so->itup = (IndexTuple) palloc0(sz);
         so->has_varwidth = key_is_text;
-        for (uint16 i=0;i<so->ninclude;i++) if (so->inc_is_text[i]) { so->has_varwidth = true; break; }
+        for (uint16 i=0;i<so->ninclude;i++) if (so->inc_meta->inc_is_text[i]) { so->has_varwidth = true; break; }
         so->itup->t_info = (unsigned short) (sz | (so->has_varwidth ? INDEX_VAR_MASK : 0)); /* updated per-row when key varwidth */
         so->itup_data = (char *) so->itup + data_off;
         so->itup_off2 = so->two_col ? (uint16) (off2 - data_off) : 0;
@@ -358,13 +418,13 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         for (uint16 i=0;i<so->ninclude;i++)
         {
             /* Precompute copy function for each INCLUDE column to eliminate hot-path if-else chain */
-            if (so->inc_len[i] == 1) so->inc_copy[i] = smol_copy1;
-            else if (so->inc_len[i] == 2) so->inc_copy[i] = smol_copy2;
-            else if (so->inc_len[i] == 4) so->inc_copy[i] = smol_copy4;
-            else if (so->inc_len[i] == 8) so->inc_copy[i] = smol_copy8;
-            else if (so->inc_len[i] == 16) so->inc_copy[i] = smol_copy16;
+            if (so->inc_meta->inc_len[i] == 1) so->inc_meta->inc_copy[i] = smol_copy1;
+            else if (so->inc_meta->inc_len[i] == 2) so->inc_meta->inc_copy[i] = smol_copy2;
+            else if (so->inc_meta->inc_len[i] == 4) so->inc_meta->inc_copy[i] = smol_copy4;
+            else if (so->inc_meta->inc_len[i] == 8) so->inc_meta->inc_copy[i] = smol_copy8;
+            else if (so->inc_meta->inc_len[i] == 16) so->inc_meta->inc_copy[i] = smol_copy16;
             else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
-                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_len[i]); /* GCOV_EXCL_LINE */
+                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]); /* GCOV_EXCL_LINE */
         }
         /* comparator + key type props */
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
@@ -380,7 +440,14 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_touched = 0;
     so->prof_bsteps = 0;
     so->run_key_built = false;
-    for (int i=0;i<16;i++){ so->run_inc_built[i]=false; so->run_inc_vl_len[i]=0; }
+    if (so->inc_meta)
+    {
+        for (uint16 i=0; i<so->ninclude; i++)
+        {
+            so->inc_meta->run_inc_built[i] = false;
+            so->inc_meta->run_inc_vl_len[i] = 0;
+        }
+    }
     /* Initialize V2 continuation support */
     so->prev_page_last_run_active = false;
     so->prev_page_last_run_text_klen = 0;
@@ -857,7 +924,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             while (lo2 <= hi2)
                             {
                                 uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                                char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                                char *kp2 = smol_leaf_keyptr_ex(page, mid2, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                 int cc = smol_cmp_keyptr_to_bound(so, kp2);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -907,7 +974,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                            char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                             int c = smol_cmp_keyptr_to_bound(so, keyp);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1005,7 +1072,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             while (lo <= hi)
                             {
                                 uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                                char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                                char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_meta ? so->inc_meta->inc_cumul_offs[so->ninclude] : 0);
                                 int c = smol_cmp_keyptr_to_bound(so, k1p);
                                 if (so->prof_enabled) so->prof_bsteps++;
                                 if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1043,7 +1110,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         while (lo <= hi)
                         {
                             uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                            char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                            char *k1p = smol12_row_k1_ptr(page, mid, so->key_len, so->key_len2, so->inc_meta ? so->inc_meta->inc_cumul_offs[so->ninclude] : 0);
                             int c = smol_cmp_keyptr_to_bound(so, k1p);
                             if (so->prof_enabled) so->prof_bsteps++;
                             if ((so->bound_strict ? (c > 0) : (c >= 0))) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1134,7 +1201,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 /* Use precomputed cumulative offsets for O(1) per-column computation */
                 for (uint16 ii = 0; ii < so->ninclude; ii++)
                 {
-                    so->plain_inc_base[ii] = base_ptr + (size_t) n * so->inc_cumul_offs[ii];
+                    so->inc_meta->plain_inc_base[ii] = base_ptr + (size_t) n * so->inc_meta->inc_cumul_offs[ii];
                 }
                 so->plain_inc_cached = true;
             }
@@ -1145,8 +1212,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (so->leaf_i < so->leaf_n)
             {
                 uint16 row = (uint16) (so->leaf_i + 1);
-                char *k1p = smol12_row_k1_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
-                char *k2p = smol12_row_k2_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                char *k1p = smol12_row_k1_ptr(page, row, so->key_len, so->key_len2, so->inc_meta ? so->inc_meta->inc_cumul_offs[so->ninclude] : 0);
+                char *k2p = smol12_row_k2_ptr(page, row, so->key_len, so->key_len2, so->inc_meta ? so->inc_meta->inc_cumul_offs[so->ninclude] : 0);
                 /* Enforce leading-key bound per row for correctness */
                 if (so->have_bound)
                 {
@@ -1205,22 +1272,22 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 /* Copy INCLUDE columns for two-column indexes */
                 if (so->ninclude > 0)
                 {
-                    char *row_ptr = smol12_row_ptr(page, row, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                    char *row_ptr = smol12_row_ptr(page, row, so->key_len, so->key_len2, so->inc_meta->inc_cumul_offs[so->ninclude]);
                     char *inc_start = row_ptr + so->key_len + so->key_len2;
                     for (uint16 i = 0; i < so->ninclude; i++)
                     {
-                        char *inc_src = inc_start + so->inc_cumul_offs[i];
-                        char *inc_dst = so->itup_data + so->inc_offs[i];
-                        if (so->inc_is_text[i])
+                        char *inc_src = inc_start + so->inc_meta->inc_cumul_offs[i];
+                        char *inc_dst = so->itup_data + so->inc_meta->inc_offs[i];
+                        if (so->inc_meta->inc_is_text[i])
                         {
                             /* Text: add VARHDRSZ and copy */
-                            SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_len[i]);
-                            memcpy(VARDATA(inc_dst), inc_src, so->inc_len[i]);
+                            SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_meta->inc_len[i]);
+                            memcpy(VARDATA(inc_dst), inc_src, so->inc_meta->inc_len[i]);
                         }
                         else
                         {
                             /* Fixed-length: direct copy */
-                            memcpy(inc_dst, inc_src, so->inc_len[i]);
+                            memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]);
                         }
                     }
                 }
@@ -1261,7 +1328,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     else
                     {
                         /* RLE or other format: use cached lookup */
-                        keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                        keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                     }
                     /* Check upper bound (for backward scans with <= or < bounds) */
                     if (so->have_upper_bound)
@@ -1327,12 +1394,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 uint16 dummy_end;
                                 /* Try cached run bounds first (O(1)) before linear scan (O(N)) */
                                 bool cached = smol_get_cached_run_bounds(so, so->cur_off, &start, &dummy_end);
-                                if (!cached && !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_len, so->ninclude))
+                                if (!cached && !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &dummy_end, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude))
                                 {
                                     /* RLE page but not encoded: scan backward to find run start */
                                     while (start > FirstOffsetNumber)
                                     {
-                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (start - 1), so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         start--; /* RLE page: scan backward to find start of duplicate run */
@@ -1379,16 +1446,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     /* Use cached pointers when available (fast paths) */
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
-                                        ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
+                                        ip = so->inc_meta->plain_inc_base[ii] + (size_t) row * so->inc_meta->inc_len[ii];
                                     else if (so->rle_run_inc_cached)
                                         /* RLE page with cached run: INCLUDE values constant within run */
-                                        ip = so->rle_run_inc_ptr[ii];
+                                        ip = so->inc_meta->rle_run_inc_ptr[ii];
                                     else
                                         /* Slow path: compute pointer dynamically */
-                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs);
-                                    char *dst = so->itup_data + so->inc_offs[ii];
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, row, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+                                    char *dst = so->itup_data + so->inc_meta->inc_offs[ii];
                                     /* Use precomputed copy function (eliminates if-else chain overhead) */
-                                    so->inc_copy[ii](dst, ip);
+                                    so->inc_meta->inc_copy[ii](dst, ip);
                                 }
                             }
                         }
@@ -1402,11 +1469,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         for (uint16 ii=0; ii<so->ninclude; ii++)
                         {
-                            if (so->inc_is_text[ii])
+                            if (so->inc_meta->inc_is_text[ii])
                             {
-                                char *dst = so->itup_data + so->inc_offs[ii];
+                                char *dst = so->itup_data + so->inc_meta->inc_offs[ii];
                                 int32 vsz = VARSIZE_ANY((struct varlena *) dst);
-                                SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_offs[ii]);
+                                SMOL_LOGF("tuple include[%u] varlena size=%d off=%u", ii, vsz, so->inc_meta->inc_offs[ii]);
                             }
                         }
                     }
@@ -1440,7 +1507,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                 while (so->cur_off <= n)
                 {
-                    char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                    char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                     /* Check upper bound (for BETWEEN queries) */
                     if (so->have_upper_bound)
                     {
@@ -1492,12 +1559,12 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 }
                                 /* Try cached run bounds first (O(1)) before linear scan (O(N)) */
                                 else if (!smol_get_cached_run_bounds(so, so->cur_off, &start, &end) &&
-                                         !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &end, so->inc_len, so->ninclude))
+                                         !smol_leaf_run_bounds_rle_ex(page, so->cur_off, so->key_len, &start, &end, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude))
                                 {
                                     /* RLE page but not encoded: scan forward to find run end */
                                     while (end < n)
                                     {
-                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (end + 1), so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                                        const char *kp = smol_leaf_keyptr_ex(page, (uint16) (end + 1), so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                         if (!smol_key_eq_len(k0, kp, so->key_len))
                                             break;
                                         end++;
@@ -1514,9 +1581,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                          * This optimization is critical for sequential scans returning many rows. */
                                         for (uint16 ii = 0; ii < so->ninclude; ii++)
                                         {
-                                            so->rle_run_inc_ptr[ii] = smol1_inc_ptr_any(page, so->key_len, n,
-                                                                                         so->inc_len, so->ninclude,
-                                                                                         ii, start - 1, so->inc_cumul_offs);
+                                            so->inc_meta->rle_run_inc_ptr[ii] = smol1_inc_ptr_any(page, so->key_len, n,
+                                                                                         so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude,
+                                                                                         ii, start - 1, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                         }
                                         so->rle_run_inc_cached = true;
                                     }
@@ -1576,16 +1643,16 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                     /* Use cached pointers when available (fast paths) */
                                     if (so->plain_inc_cached)
                                         /* Plain page: base pointer + row offset */
-                                        ip = so->plain_inc_base[ii] + (size_t) row * so->inc_len[ii];
+                                        ip = so->inc_meta->plain_inc_base[ii] + (size_t) row * so->inc_meta->inc_len[ii];
                                     else if (so->rle_run_inc_cached)
                                         /* RLE page with cached run: INCLUDE values constant within run */
-                                        ip = so->rle_run_inc_ptr[ii];
+                                        ip = so->inc_meta->rle_run_inc_ptr[ii];
                                     else /* GCOV_EXCL_LINE - defensive fallback: caching now covers all RLE pages with INCLUDE */
                                         /* Slow path: compute pointer dynamically */ /* GCOV_EXCL_LINE */
-                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, row, so->inc_cumul_offs); /* GCOV_EXCL_LINE */
-                                    char *dst = so->itup_data + so->inc_offs[ii];
+                                        ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, row, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL); /* GCOV_EXCL_LINE */
+                                    char *dst = so->itup_data + so->inc_meta->inc_offs[ii];
                                     /* Use precomputed copy function (eliminates if-else chain overhead) */
-                                    so->inc_copy[ii](dst, ip);
+                                    so->inc_meta->inc_copy[ii](dst, ip);
                                 }
                             }
                         }
@@ -1603,18 +1670,18 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 {
                                     bool all_eq = true;
                                     uint16 start = so->run_start_off, end = so->run_end_off;
-                                    char *firstp = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(start - 1), so->inc_cumul_offs);
+                                    char *firstp = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, (uint32)(start - 1), so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                     for (uint16 off = start + 1; off <= end; off++)
                                     {
-                                        char *p2 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(off - 1), so->inc_cumul_offs);
-                                        if (memcmp(firstp, p2, so->inc_len[ii]) != 0)
+                                        char *p2 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, (uint32)(off - 1), so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+                                        if (memcmp(firstp, p2, so->inc_meta->inc_len[ii]) != 0)
                                         { all_eq = false; break; }
                                     }
-                                    so->inc_const[ii] = all_eq;
-                                    if (all_eq && so->inc_is_text[ii])
+                                    so->inc_meta->inc_const[ii] = all_eq;
+                                    if (all_eq && so->inc_meta->inc_is_text[ii])
                                     {
-                                        const char *zend = (const char *) memchr(firstp, '\0', so->inc_len[ii]);
-                                        so->run_inc_len[ii] = (int16) (zend ? (zend - firstp) : so->inc_len[ii]);
+                                        const char *zend = (const char *) memchr(firstp, '\0', so->inc_meta->inc_len[ii]);
+                                        so->inc_meta->run_inc_len[ii] = (int16) (zend ? (zend - firstp) : so->inc_meta->inc_len[ii]);
                                     }
                                 }
                                 so->run_inc_evaluated = true;
@@ -1622,22 +1689,22 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 {
                                     for (uint16 ii=0; ii<so->ninclude; ii++)
                                     {
-                                        if (!so->inc_const[ii]) continue;
-                                        char *ip0 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_len, so->ninclude, ii, (uint32)(so->run_start_off - 1), so->inc_cumul_offs);
-                                        if (so->inc_is_text[ii])
+                                        if (!so->inc_meta->inc_const[ii]) continue;
+                                        char *ip0 = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, (uint32)(so->run_start_off - 1), so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+                                        if (so->inc_meta->inc_is_text[ii])
                                         {
-                                            int ilen0 = 0; while (ilen0 < so->inc_len[ii] && ip0[ilen0] != '\0') ilen0++;
-                                            SET_VARSIZE((struct varlena *) so->run_inc_vl[ii], ilen0 + VARHDRSZ);
-                                            memcpy(so->run_inc_vl[ii] + VARHDRSZ, ip0, ilen0);
-                                            so->run_inc_vl_len[ii] = (int16) (VARHDRSZ + ilen0);
-                                            so->run_inc_built[ii] = true;
+                                            int ilen0 = 0; while (ilen0 < so->inc_meta->inc_len[ii] && ip0[ilen0] != '\0') ilen0++;
+                                            SET_VARSIZE((struct varlena *) so->inc_meta->run_inc_vl[ii], ilen0 + VARHDRSZ);
+                                            memcpy(so->inc_meta->run_inc_vl[ii] + VARHDRSZ, ip0, ilen0);
+                                            so->inc_meta->run_inc_vl_len[ii] = (int16) (VARHDRSZ + ilen0);
+                                            so->inc_meta->run_inc_built[ii] = true;
                                         }
                                         /* fixed-size includes are copied later in fixed path */
                                     }
                                 }
                             }
                             bool all_const = true;
-                            for (uint16 ii=0; ii<so->ninclude; ii++) if (!so->inc_const[ii]) { all_const = false; break; }
+                            for (uint16 ii=0; ii<so->ninclude; ii++) if (!so->inc_meta->inc_const[ii]) { all_const = false; break; }
                             if (all_const && so->cur_off > so->run_start_off)
                                 need_inc_copy = false;
                         }
@@ -1906,7 +1973,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo <= hi)
                     {
                         uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
-                        char *k1p = smol12_row_k1_ptr(np, mid, so->key_len, so->key_len2, so->inc_cumul_offs[so->ninclude]);
+                        char *k1p = smol12_row_k1_ptr(np, mid, so->key_len, so->key_len2, so->inc_meta ? so->inc_meta->inc_cumul_offs[so->ninclude] : 0);
                         int c = smol_cmp_keyptr_to_bound(so, k1p);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (c >= 0) { ans = mid; if (mid == 0) break; hi = (uint16) (mid - 1); }
@@ -1925,7 +1992,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if ((so->bound_strict ? (cc > 0) : (cc >= 0))) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -1945,7 +2012,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     while (lo2 <= hi2)
                     {
                         uint16 mid2 = (uint16) (lo2 + ((hi2 - lo2) >> 1));
-                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_len, so->ninclude, so->inc_cumul_offs);
+                        char *kp2 = smol_leaf_keyptr_ex(np, mid2, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                         int cc = smol_cmp_keyptr_to_bound(so, kp2);
                         if (so->prof_enabled) so->prof_bsteps++;
                         if (cc > 0) { ans2 = mid2; if (mid2 == 0) break; hi2 = (uint16) (mid2 - 1); }
@@ -1986,6 +2053,8 @@ smol_endscan(IndexScanDesc scan)
             FreeAccessStrategy(so->bstrategy);
         if (so->runtime_keys)
             pfree(so->runtime_keys);
+        if (so->inc_meta)
+            pfree(so->inc_meta);
         if (so->prof_enabled)
             elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu",
                  (unsigned long) so->prof_calls,

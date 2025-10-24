@@ -214,6 +214,34 @@ typedef struct SmolLeafRef
     BlockNumber blk;
 } SmolLeafRef;
 
+/*
+ * SmolIncludeMetadata - Dynamically allocated INCLUDE column metadata
+ *
+ * This structure holds all INCLUDE-related arrays that were previously
+ * embedded directly in SmolScanOpaqueData. By allocating this dynamically
+ * based on the actual number of INCLUDE columns (ninclude), we save
+ * significant memory for the common case of 0-3 INCLUDE columns vs the
+ * fixed allocation for 16.
+ *
+ * Allocated in smol_beginscan() when ninclude > 0, freed in smol_endscan().
+ */
+typedef struct SmolIncludeMetadata
+{
+    uint16      *inc_len;           /* length of each INCLUDE column */
+    uint32      *inc_cumul_offs;    /* cumulative offsets for INCLUDE columns */
+    char        *inc_align;         /* alignment for each INCLUDE column */
+    uint16      *inc_offs;          /* offsets in tuple data area */
+    void      (**inc_copy)(char *dst, const char *src);  /* copy functions */
+    bool        *inc_is_text;       /* true if INCLUDE column is text32 */
+    bool        *inc_const;         /* true if INCLUDE value is constant within run */
+    int16       *run_inc_len;       /* cached varlena lengths for run */
+    char       **plain_inc_base;    /* base pointers for plain pages */
+    char       **rle_run_inc_ptr;   /* INCLUDE pointers for RLE runs */
+    bool        *run_inc_built;     /* true if run varlena blob is built */
+    int16       *run_inc_vl_len;    /* varlena blob lengths */
+    char      (*run_inc_vl)[VARHDRSZ + 32];  /* varlena blob storage */
+} SmolIncludeMetadata;
+
 typedef struct SmolScanOpaqueData
 {
     bool        initialized;    /* positioned to first tuple/group? */
@@ -268,17 +296,10 @@ typedef struct SmolScanOpaqueData
     /* fixed-size copy helpers to avoid per-row branches */
     void      (*copy1_fn)(char *dst, const char *src);
     void      (*copy2_fn)(char *dst, const char *src);
-    /* INCLUDE metadata (single-col path) */
+    /* INCLUDE metadata (single-col path) - dynamically allocated */
     uint16      ninclude;
-    uint16      inc_len[16];
-    uint32      inc_cumul_offs[16]; /* cumulative offsets: inc_cumul_offs[i] = sum(inc_len[0..i-1]) */
-    char        inc_align[16];
-    uint16      inc_offs[16];   /* offsets inside tuple data area (from data_off) */
-    void      (*inc_copy[16])(char *dst, const char *src);
-    bool        inc_is_text[16]; /* include attr is text32 (varlena in tuple) */
-    bool        inc_const[16];  /* within current run, include[ii] is constant */
-    bool        run_inc_evaluated; /* inc_const[] computed for current run */
-    int16       run_inc_len[16];   /* cached include varlena lengths for run when inc_const */
+    SmolIncludeMetadata *inc_meta;  /* NULL if ninclude == 0, else dynamically allocated */
+    bool        run_inc_evaluated;  /* inc_const[] computed for current run */
 
     /* lightweight profiling (enabled by smol.profile) */
     bool        prof_enabled;
@@ -318,11 +339,7 @@ typedef struct SmolScanOpaqueData
     /* Cached page metadata (opt #5): nitems and format cached once per page */
     uint16      cur_page_nitems;    /* cached nitems for current page */
     uint8       cur_page_format;    /* cached format: 0=plain, 2=key_rle, 3=inc_rle */
-    /* Cached INCLUDE column base pointers for plain pages (performance optimization) */
-    char       *plain_inc_base[16]; /* base pointer for each INCLUDE column on plain pages */
     bool        plain_inc_cached;   /* true when plain_inc_base[] is valid for current page */
-    /* Cached INCLUDE column pointers for current RLE run (performance optimization) */
-    char       *rle_run_inc_ptr[16]; /* pointer to INCLUDE values for current run on RLE pages */
     bool        rle_run_inc_cached;  /* true when rle_run_inc_ptr[] is valid for current run */
     /* Prebuilt varlena blobs reused within run (text) */
     bool        run_key_built;
@@ -332,9 +349,6 @@ typedef struct SmolScanOpaqueData
     /* Adaptive prefetching for bounded scans (slow-start to avoid over-prefetching) */
     uint16      pages_scanned;     /* total pages successfully scanned (not skipped) */
     uint16      adaptive_prefetch_depth; /* current prefetch depth (grows with scan progress) */
-    bool        run_inc_built[16];
-    int16       run_inc_vl_len[16];
-    char        run_inc_vl[16][VARHDRSZ + 32];
     /* V2 RLE continuation support: tracks if last run on previous page continues to current page */
     bool        prev_page_last_run_active;     /* true if previous page's last run continues */
     char        prev_page_last_run_key[16];    /* key from previous page's last run */
@@ -608,8 +622,11 @@ smol_run_reset(SmolScanOpaque so)
     so->run_inc_evaluated = false;
     so->rle_run_inc_cached = false;
     so->run_key_built = false;
-    for (int i = 0; i < 16; i++)
-        so->run_inc_built[i] = false;
+    if (so->inc_meta)
+    {
+        for (int i = 0; i < so->ninclude; i++)
+            so->inc_meta->run_inc_built[i] = false;
+    }
 }
 
 
