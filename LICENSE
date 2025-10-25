@@ -1,21 +1,48 @@
-MIT License
+PostgreSQL Index License, Version 1.0 (based on Elastic License 2.0)
 
 Copyright (c) 2025 Adam Sah
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software is licensed under the terms of the Elastic License 2.0, with the
+following clarifications and PostgreSQL-specific conditions.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You may use, copy, modify, and redistribute this software, in source or binary
+form, with or without modification, provided that you comply with the following
+conditions:
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. **Permitted Use.**
+   You may use this software for any purpose, including internal use, research,
+   and providing support or consulting services related to PostgreSQL or this
+   software.
+
+2. **Prohibited Use.**
+   You may not:
+   - Provide this software, or any derivative work, to others as part of a
+     hosted, managed, or cloud-based PostgreSQL service or database offering.
+     This includes, but is not limited to, offerings such as managed
+     PostgreSQL-as-a-Service platforms, database appliances, or any service
+     where this software’s functionality is made available to third parties.
+   - Sell, resell, or repackage this software as part of a commercial database
+     product or subscription without a separate commercial license from the
+     copyright holder.
+
+3. **Attribution.**
+   You must include this license notice and attribution to the original author(s)
+   in any redistribution of the software or derivative works.
+
+4. **Relicensing Option.**
+   The author may, at any time, relicense this software under a different license
+   (including an OSI-approved open source license) at their discretion.
+
+5. **No Warranty.**
+   THIS SOFTWARE IS PROVIDED “AS IS,” WITHOUT WARRANTIES OR CONDITIONS OF ANY
+   KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES
+   OR CONDITIONS OF TITLE, NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
+   PARTICULAR PURPOSE.
+
+---
+
+### Reference
+This license is derived from the [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license)
+and intended to provide similar protections against unlicensed commercial
+cloud or database-as-a-service usage, while allowing open development and use
+within the PostgreSQL community.
