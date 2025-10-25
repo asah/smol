@@ -9,9 +9,6 @@
 
 #include "smol.h"
 
-/* Forward declaration for recursive function */
-static BlockNumber smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target, uint16 levels, bool *found);
-
 void
 smol_meta_read(Relation idx, SmolMeta *out)
 {
@@ -376,15 +373,6 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
     }
 }
 
-/* GCOV_EXCL_START - unused wrapper function (all callers use smol_leaf_keyptr_ex directly) */
-/* Wrapper for backward compatibility - assumes single-run or no includes */
-char *
-smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
-{
-    return smol_leaf_keyptr_ex(page, idx, key_len, NULL, 0, NULL);
-}
-/* GCOV_EXCL_STOP */
-
 bool
 smol_key_eq_len(const char *a, const char *b, uint16 key_len)
 {
@@ -397,46 +385,6 @@ smol_key_eq_len(const char *a, const char *b, uint16 key_len)
     { int64 x, y; memcpy(&x, a, 8); memcpy(&y, b, 8); return x == y; }
     return memcmp(a, b, key_len) == 0;
 }
-
-/* GCOV_EXCL_START - unused function (only referenced in comment, never called) */
-bool
-smol_leaf_is_rle(Page page)
-{
-    ItemId iid = PageGetItemId(page, FirstOffsetNumber);
-    char *p = (char *) PageGetItem(page, iid);
-    uint16 tag; memcpy(&tag, p, sizeof(uint16));
-    /* RLE formats have tags; plain format uses nitems as first u16 */
-    return (tag == SMOL_TAG_KEY_RLE ||
-            tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE);
-}
-/* GCOV_EXCL_STOP */
-
-/* GCOV_EXCL_START - debug-only function (requires PGC_SUSET GUC smol.debug_log) */
-void
-smol_log_page_summary(Relation idx)
-{
-    BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
-    int nleaf = 0, ninternal = 0, nmeta = 0;
-    for (BlockNumber blk = 0; blk < nblocks; blk++)
-    {
-        Buffer b = ReadBuffer(idx, blk);
-        Page pg = BufferGetPage(b);
-        if (blk == 0)
-        {
-            nmeta++;
-        }
-        else
-        {
-            SmolPageOpaqueData *op = (SmolPageOpaqueData *) PageGetSpecialPointer(pg);
-            if (op->flags & SMOL_F_LEAF) nleaf++;
-            else if (op->flags & SMOL_F_INTERNAL) ninternal++;
-        }
-        ReleaseBuffer(b);
-    }
-    SMOL_LOGF("page summary: blocks=%u meta=%d internal=%d leaf=%d",
-              (unsigned) nblocks, nmeta, ninternal, nleaf);
-}
-/* GCOV_EXCL_STOP */
 
 /* Return rightmost leaf block number by scanning all pages */
 BlockNumber
@@ -465,118 +413,3 @@ smol_rightmost_leaf(Relation idx)
 
     return rightmost_leaf;
 }
-
-/* GCOV_EXCL_START - unused functions, kept for future reference */
-/* Helper function: find rightmost leaf in a subtree */
-BlockNumber
-smol_rightmost_in_subtree(Relation idx, BlockNumber root, uint16 levels)
-{
-    BlockNumber cur = root;
-    while (levels > 1)
-    {
-        Buffer buf = ReadBuffer(idx, cur);
-        Page page = BufferGetPage(buf);
-        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-        BlockNumber child;
-        char *itp = (char *) PageGetItem(page, PageGetItemId(page, maxoff));
-        memcpy(&child, itp, sizeof(BlockNumber));
-        ReleaseBuffer(buf);
-        cur = child;
-        levels--;
-    }
-    return cur;
-}
-
-/* Helper function: recursively find previous leaf by walking tree */
-static BlockNumber
-smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target, uint16 levels, bool *found)
-{
-    if (levels == 1)
-    {
-        /* Leaf level - check if this is our target */
-        if (node == target)
-        {
-            *found = true;
-            return InvalidBlockNumber; /* No previous sibling at this level */
-        }
-        return node;
-    }
-
-    /* Internal node - scan children */
-    Buffer buf = ReadBuffer(idx, node);
-    Page page = BufferGetPage(buf);
-    OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
-    BlockNumber prev_child = InvalidBlockNumber;
-    BlockNumber result = InvalidBlockNumber;
-
-    for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-    {
-        char *itp = (char *) PageGetItem(page, PageGetItemId(page, off));
-        BlockNumber child;
-        memcpy(&child, itp, sizeof(BlockNumber));
-
-        /* Recursively search this child subtree */
-        BlockNumber candidate = smol_find_prev_leaf_recursive(idx, child, target, levels - 1, found);
-
-        if (*found)
-        {
-            /* Target was found in this subtree */
-            if (candidate != InvalidBlockNumber)
-            {
-                /* Candidate is in this subtree */
-                result = candidate;
-            }
-            else if (prev_child != InvalidBlockNumber)
-            {
-                /* Target was first in this subtree, return rightmost of previous sibling */
-                result = smol_rightmost_in_subtree(idx, prev_child, levels - 1);
-            }
-            else
-            {
-                /* Target was in first child, no previous leaf */
-                result = InvalidBlockNumber;
-            }
-            ReleaseBuffer(buf);
-            return result;
-        }
-
-        prev_child = child;
-    }
-
-    ReleaseBuffer(buf);
-    return InvalidBlockNumber;
-}
-
-/* Return previous leaf sibling by walking tree (works for any height) */
-BlockNumber __attribute__((unused))
-smol_prev_leaf(Relation idx, BlockNumber cur)
-{
-    SmolMeta meta;
-    smol_meta_read(idx, &meta);
-
-    if (meta.height <= 1)
-        return InvalidBlockNumber;
-
-    bool found = false;
-    return smol_find_prev_leaf_recursive(idx, meta.root_blkno, cur, meta.height, &found);
-}
-/* GCOV_EXCL_STOP */
-
-/* Build callbacks and comparators */
-/* GCOV_EXCL_START - debug-only function (requires PGC_SUSET GUC smol.debug_log) */
-char *
-smol_hex(const char *buf, int len, int maxbytes)
-{
-    int n = len < maxbytes ? len : maxbytes;
-    int outsz = n * 2 + 1; /* hex without spaces */
-    char *out = palloc(outsz);
-    for (int i = 0; i < n; i++)
-    {
-        unsigned char b = (unsigned char) buf[i];
-        out[i*2] = "0123456789ABCDEF"[b >> 4];
-        out[i*2+1] = "0123456789ABCDEF"[b & 0x0F];
-    }
-    out[outsz-1] = '\0';
-    return out;
-}
-/* GCOV_EXCL_STOP */

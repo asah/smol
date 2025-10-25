@@ -87,8 +87,8 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
         {
-            *stop_scan_out = true; /* GCOV_EXCL_LINE */
-            return false; /* GCOV_EXCL_LINE */
+	    *stop_scan_out = true;
+            return false;
         }
     }
 
@@ -424,7 +424,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             else if (so->inc_meta->inc_len[i] == 8) so->inc_meta->inc_copy[i] = smol_copy8;
             else if (so->inc_meta->inc_len[i] == 16) so->inc_meta->inc_copy[i] = smol_copy16;
             else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
-                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]); /* GCOV_EXCL_LINE */
+                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]);
         }
         /* comparator + key type props */
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;

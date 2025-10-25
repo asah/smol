@@ -2,7 +2,14 @@ SHELL := /bin/bash
 EXTENSION = smol
 DATA = smol--1.0.sql
 MODULE_big = smol
+
+# Base object files
 OBJS = smol.o smol_utils.o smol_build.o smol_scan.o
+
+# Add coverage helper for inline functions in smol.h (coverage builds only)
+ifeq ($(COVERAGE),1)
+OBJS += smol_h_coverage.o
+endif
 
 PG_CFLAGS=-Wno-declaration-after-statement
 
@@ -18,7 +25,7 @@ endif
 REGRESS_BASE = smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_errors smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
 
 # Coverage-only tests that require test GUCs (smol.test_max_tuples_per_page, smol.test_max_internal_fanout) or debug logging
-REGRESS_COVERAGE_ONLY = smol_100pct_coverage smol_deep_backward_navigation smol_final_coverage
+REGRESS_COVERAGE_ONLY = smol_100pct_coverage smol_deep_backward_navigation smol_final_coverage smol_large_row_warning
 
 # Full test list: 33 tests for coverage builds, 30 for production
 ifeq ($(COVERAGE),1)

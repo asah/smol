@@ -518,7 +518,24 @@ smol_page_opaque(Page page)
     return (SmolPageOpaqueData *) PageGetSpecialPointer(page);
 }
 
-/* Fast copy helpers */
+/*
+ * Fast copy helpers and related functions
+ *
+ * In coverage builds, these are defined as regular functions in smol_h_coverage.c
+ * to allow gcov to measure their coverage. In production builds, they remain
+ * static inline for optimal performance.
+ */
+#ifdef SMOL_TEST_COVERAGE
+/* Coverage build: extern declarations (implemented in smol_h_coverage.c) */
+extern void smol_copy1(char *dst, const char *src);
+extern void smol_copy2(char *dst, const char *src);
+extern void smol_copy4(char *dst, const char *src);
+extern void smol_copy8(char *dst, const char *src);
+extern void smol_copy16(char *dst, const char *src);
+extern void smol_copy_small(char *dst, const char *src, uint16 len);
+extern uint64 smol_norm64(int64 v);
+#else
+/* Production build: static inline for performance */
 static inline void smol_copy1(char *dst, const char *src)
 {
     *dst = *src;
@@ -583,6 +600,7 @@ smol_norm64(int64 v)
 {
     return (uint64) v ^ UINT64_C(0x8000000000000000);
 }
+#endif /* SMOL_TEST_COVERAGE */
 
 /* Two-column row pointer helpers */
 static inline char *smol12_row_ptr(Page page, uint16 row, uint16 key_len1, uint16 key_len2, uint32 inc_total_len)
@@ -681,14 +699,8 @@ extern int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const cha
 extern int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
 extern uint16 smol_leaf_nitems(Page page);
 extern char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc, const uint32 *inc_cumul_offs);
-extern char *smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len);
 extern bool smol_key_eq_len(const char *a, const char *b, uint16 len);
-extern bool smol_leaf_is_rle(Page page);
-extern void smol_log_page_summary(Relation idx);
 extern BlockNumber smol_rightmost_leaf(Relation idx);
-extern BlockNumber smol_rightmost_in_subtree(Relation idx, BlockNumber root, uint16 levels);
-extern BlockNumber smol_prev_leaf(Relation idx, BlockNumber cur);
-extern char *smol_hex(const char *buf, int len, int maxbytes);
 
 /* Parallel build worker entry (must be extern for dynamic loading) */
 extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);

@@ -54,7 +54,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Find all .gcov files
-GCOV_FILES=$(ls *.gcov 2>/dev/null | grep -E '^(smol|smol_utils|smol_build|smol_scan)\.c\.gcov$|^smol\.h\.gcov$')
+# Note: In coverage builds, smol.h inline functions are moved to smol_h_coverage.c
+#       so we exclude smol.h.gcov and include smol_h_coverage.c.gcov instead
+if [ -f "smol_h_coverage.c.gcov" ]; then
+    # Coverage build: include smol_h_coverage.c instead of smol.h
+    GCOV_FILES=$(ls *.gcov 2>/dev/null | grep -E '^(smol|smol_utils|smol_build|smol_scan|smol_h_coverage)\.c\.gcov$')
+else
+    # Production build: include smol.h.gcov
+    GCOV_FILES=$(ls *.gcov 2>/dev/null | grep -E '^(smol|smol_utils|smol_build|smol_scan)\.c\.gcov$|^smol\.h\.gcov$')
+fi
 
 if [ -z "$GCOV_FILES" ]; then
     echo "ERROR: No .gcov files found"
