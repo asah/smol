@@ -9,6 +9,9 @@
 
 #include "smol.h"
 
+/* Forward declaration for recursive function */
+static BlockNumber smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target, uint16 levels, bool *found);
+
 void
 smol_meta_read(Relation idx, SmolMeta *out)
 {
@@ -109,7 +112,6 @@ smol_link_siblings(Relation idx, BlockNumber prev, BlockNumber cur)
     SMOL_LOGF("linked siblings: %u <- -> %u", prev, cur);
 }
 
-/* GCOV_EXCL_START - Deprecated function: replaced by RLE two-pass build */
 BlockNumber
 smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len)
 {
@@ -374,26 +376,29 @@ smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_len
     }
 }
 
+/* GCOV_EXCL_START - unused wrapper function (all callers use smol_leaf_keyptr_ex directly) */
 /* Wrapper for backward compatibility - assumes single-run or no includes */
 char *
 smol_leaf_keyptr(Page page, uint16 idx, uint16 key_len)
 {
     return smol_leaf_keyptr_ex(page, idx, key_len, NULL, 0, NULL);
 }
+/* GCOV_EXCL_STOP */
 
 bool
-smol_key_eq_len(const char *a, const char *b, uint16 len)
+smol_key_eq_len(const char *a, const char *b, uint16 key_len)
 {
     /* Fixed-length, small keys: branch by common sizes */
-    if (len == 2)
+    if (key_len == 2)
     { int16 x, y; memcpy(&x, a, 2); memcpy(&y, b, 2); return x == y; }
-    if (len == 4)
+    if (key_len == 4)
     { int32 x, y; memcpy(&x, a, 4); memcpy(&y, b, 4); return x == y; }
-    if (len == 8)
+    if (key_len == 8)
     { int64 x, y; memcpy(&x, a, 8); memcpy(&y, b, 8); return x == y; }
-    return memcmp(a, b, len) == 0;
+    return memcmp(a, b, key_len) == 0;
 }
 
+/* GCOV_EXCL_START - unused function (only referenced in comment, never called) */
 bool
 smol_leaf_is_rle(Page page)
 {
@@ -404,7 +409,9 @@ smol_leaf_is_rle(Page page)
     return (tag == SMOL_TAG_KEY_RLE ||
             tag == SMOL_TAG_KEY_RLE_V2 || tag == SMOL_TAG_INC_RLE);
 }
+/* GCOV_EXCL_STOP */
 
+/* GCOV_EXCL_START - debug-only function (requires PGC_SUSET GUC smol.debug_log) */
 void
 smol_log_page_summary(Relation idx)
 {
@@ -481,7 +488,7 @@ smol_rightmost_in_subtree(Relation idx, BlockNumber root, uint16 levels)
 }
 
 /* Helper function: recursively find previous leaf by walking tree */
-BlockNumber
+static BlockNumber
 smol_find_prev_leaf_recursive(Relation idx, BlockNumber node, BlockNumber target, uint16 levels, bool *found)
 {
     if (levels == 1)
@@ -556,6 +563,7 @@ smol_prev_leaf(Relation idx, BlockNumber cur)
 /* GCOV_EXCL_STOP */
 
 /* Build callbacks and comparators */
+/* GCOV_EXCL_START - debug-only function (requires PGC_SUSET GUC smol.debug_log) */
 char *
 smol_hex(const char *buf, int len, int maxbytes)
 {
@@ -571,3 +579,4 @@ smol_hex(const char *buf, int len, int maxbytes)
     out[outsz-1] = '\0';
     return out;
 }
+/* GCOV_EXCL_STOP */

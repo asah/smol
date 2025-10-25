@@ -57,25 +57,66 @@ SELECT count(*) FROM t_large WHERE k > 1000;
  99000
 (1 row)
 
--- Test 3: INCLUDE columns with various sizes - backward scan (lines 2701-2703)
--- Covers INCLUDE column copy for sizes 2, 8, 16 bytes in backward scans
+-- Test 3: Large INCLUDE columns - trigger smol_build.c:364 WARNING
+-- Create index with large INCLUDE columns (>250 bytes total row size)
+SET client_min_messages = log;  -- Show WARNING messages
+DROP TABLE IF EXISTS t_large_include CASCADE;
+NOTICE:  table "t_large_include" does not exist, skipping
+CREATE UNLOGGED TABLE t_large_include (
+    k int4,
+    v1 text,  -- Will store large text values
+    v2 text,
+    v3 text
+);
+INSERT INTO t_large_include SELECT i, repeat('x', 100), repeat('y', 100), repeat('z', 100)
+FROM generate_series(1, 10) i;
+-- This should trigger WARNING at smol_build.c:364 (row size > 250 bytes)
+CREATE INDEX t_large_include_idx ON t_large_include USING smol(k) INCLUDE (v1, v2, v3);
+ERROR:  smol text32 INCLUDE exceeds 32 bytes
+SET client_min_messages = warning;  -- Reset
+-- Test 4: INCLUDE columns with various sizes - backward scan
+-- smol_copy_small switch cases (smol.h:554-568) and default (569-576)
+-- Need to exercise cases 1-16 via different INCLUDE column byte sizes
 DROP TABLE IF EXISTS t_inc_sizes CASCADE;
-CREATE UNLOGGED TABLE t_inc_sizes (k int4, v_int2 int2, v_int8 int8, v_uuid uuid);
-INSERT INTO t_inc_sizes SELECT i, (i*2)::int2, (i*100)::int8, gen_random_uuid() FROM generate_series(1, 100) i;
-CREATE INDEX t_inc_sizes_idx ON t_inc_sizes USING smol(k) INCLUDE (v_int2, v_int8, v_uuid);
--- Backward scan to trigger lines 2701-2703
-SELECT k, v_int2, v_int8 FROM t_inc_sizes WHERE k > 90 ORDER BY k DESC LIMIT 5;
-  k  | v_int2 | v_int8 
------+--------+--------
- 100 |    200 |  10000
-  99 |    198 |   9900
-  98 |    196 |   9800
-  97 |    194 |   9700
-  96 |    192 |   9600
+CREATE UNLOGGED TABLE t_inc_sizes (
+    k int4,
+    v1 bool,              -- 1 byte (case 1)
+    v2 int2,              -- 2 bytes (case 2)
+    v4 int4,              -- 4 bytes (case 4)
+    v6 macaddr,           -- 6 bytes (case 6)
+    v8 int8,              -- 8 bytes (case 8)
+    v16 uuid              -- 16 bytes (case 16)
+);
+INSERT INTO t_inc_sizes
+SELECT i, (i % 2 = 0)::bool, (i*2)::int2, i*4,
+       ('08:00:2b:01:02:' || lpad((i%256)::text, 2, '0'))::macaddr,
+       (i*100)::int8, gen_random_uuid()
+FROM generate_series(1, 100) i;
+CREATE INDEX t_inc_sizes_idx ON t_inc_sizes USING smol(k)
+    INCLUDE (v1, v2, v4, v6, v8, v16);
+-- Backward scan to trigger smol_copy_small for various sizes
+SELECT k, v1, v2, v4, v6, v8 FROM t_inc_sizes WHERE k > 90 ORDER BY k DESC LIMIT 5;
+ERROR:  smol: unsupported INCLUDE column size 6
+-- Test 4: Two-column indexes with text INCLUDE - backward scan
+-- smol_scan.c:1284-1285 handles text/varchar INCLUDE columns in two-column indexes
+DROP TABLE IF EXISTS t_twocol_text_include CASCADE;
+CREATE UNLOGGED TABLE t_twocol_text_include (a int4, b int4, vtext text);
+INSERT INTO t_twocol_text_include
+SELECT i, i*2, 'textvalue_' || i FROM generate_series(1, 100) i;
+CREATE INDEX t_twocol_text_include_idx ON t_twocol_text_include USING smol(a, b)
+    INCLUDE (vtext);
+-- Backward scan to trigger text INCLUDE handling (lines 1284-1285)
+SELECT a, b, vtext FROM t_twocol_text_include WHERE a > 90 ORDER BY a DESC, b DESC LIMIT 5;
+  a  |  b  |     vtext     
+-----+-----+---------------
+ 100 | 200 | textvalue_100
+  99 | 198 | textvalue_99
+  98 | 196 | textvalue_98
+  97 | 194 | textvalue_97
+  96 | 192 | textvalue_96
 (5 rows)
 
--- Test 4: Two-column indexes with non-byval keys (lines 6155, 6170)
--- Covers memcpy for non-byval types (text, uuid)
+-- Test 5: Two-column indexes with non-byval keys
 DROP TABLE IF EXISTS t_twocol_text CASCADE;
 CREATE UNLOGGED TABLE t_twocol_text (a text, b text, c int4);
 INSERT INTO t_twocol_text SELECT 'key' || i, 'val' || i, i FROM generate_series(1, 100) i;
@@ -181,7 +222,9 @@ RESET smol.test_max_tuples_per_page;
 -- Cleanup
 DROP TABLE t_cost CASCADE;
 DROP TABLE t_large CASCADE;
+DROP TABLE t_large_include CASCADE;
 DROP TABLE t_inc_sizes CASCADE;
+DROP TABLE t_twocol_text_include CASCADE;
 DROP TABLE t_twocol_text CASCADE;
 DROP TABLE t_twocol_uuid CASCADE;
 DROP TABLE t_twocol_int2 CASCADE;

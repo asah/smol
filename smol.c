@@ -25,10 +25,9 @@ int smol_loop_guard_iteration = 0;
 int smol_test_force_realloc_at = 0;
 bool smol_test_force_page_bounds_check = false;
 int smol_test_force_parallel_workers = 0;
-#endif
-
 int smol_test_max_internal_fanout = 0;
 int smol_test_max_tuples_per_page = 0;
+#endif
 
 /* Sorting globals (used by smol_build.c) */
 char *smol_sort_k1_buffer = NULL, *smol_sort_k2_buffer = NULL;
@@ -109,9 +108,7 @@ _PG_init(void)
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
-#endif
 
-    /* Test GUCs available in all builds */
     DefineCustomIntVariable("smol.test_max_internal_fanout",
                             "TEST ONLY: Limit internal node fanout to force tall trees",
                             "For coverage testing: limit children per internal node (0=unlimited, >0=max children)",
@@ -133,6 +130,7 @@ _PG_init(void)
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
+#endif
 
     DefineCustomRealVariable("smol.cost_page",
                              "Cost multiplier for SMOL page I/O (values > 1 penalize smol)",
@@ -603,6 +601,8 @@ smol_run_synthetic_tests(void)
     }
 }
 
+#endif  /* SMOL_TEST_COVERAGE */
+
 /*
  * smol_test_run_synthetic - Explicitly run synthetic tests for coverage
  *
@@ -614,7 +614,8 @@ PG_FUNCTION_INFO_V1(smol_test_run_synthetic);
 Datum
 smol_test_run_synthetic(PG_FUNCTION_ARGS)
 {
+#ifdef SMOL_TEST_COVERAGE
     smol_run_synthetic_tests();
+#endif
     PG_RETURN_BOOL(true);
 }
-#endif

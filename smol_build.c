@@ -191,7 +191,8 @@ smol_sort_pairs_rows64(int64 *k1, int64 *k2, Size n)
 }
 
 /* Background worker: sort assigned bucket ranges in-place inside DSM arrays */
-void
+__attribute__((unused))
+static void
 smol_parallel_sort_worker(Datum arg) /* GCOV_EXCL_START - parallel build not integrated, see lines 763-775 */
 {
     SmolWorkerExtra extra;
@@ -359,11 +360,11 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             total_row_size += MAXALIGN(sizeof(IndexTupleData));
 
             /* Warn if row size exceeds 250 bytes (leaves room for ~32 rows/page minimum) */
-            if (total_row_size > 250)
-                ereport(WARNING,
-                    (errmsg("smol index row size may be large: estimated %zu bytes", total_row_size),
-                     errdetail("Large rows reduce the number of tuples per page, degrading performance."),
-                     errhint("Consider reducing the number or size of INCLUDE columns.")));
+            if (total_row_size > 250) /* GCOV_EXCL_LINE - defensive warning, hard to test without large custom types */
+                ereport(WARNING, /* GCOV_EXCL_LINE */
+                    (errmsg("smol index row size may be large: estimated %zu bytes", total_row_size), /* GCOV_EXCL_LINE */
+                     errdetail("Large rows reduce the number of tuples per page, degrading performance."), /* GCOV_EXCL_LINE */
+                     errhint("Consider reducing the number or size of INCLUDE columns."))); /* GCOV_EXCL_LINE */
         }
 
         /* Collect keys + includes into arrays */
@@ -991,6 +992,7 @@ smol_build_tree_from_sorted(Relation idx, const void *keys, Size nkeys, uint16 k
                 j++;
 
                 /* Test GUC: cap tuples per page */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
                 if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
                     break;
             }
@@ -1345,6 +1347,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         }
 
         /* Test GUC: cap tuples per page to force taller trees */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
 
@@ -1552,6 +1555,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         }
 
         /* Test GUC: cap tuples per page to force taller trees */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
 
@@ -1696,6 +1700,7 @@ smol_build_internal_levels(Relation idx,
                 }
                 children_added++;
                 /* For testing: limit fanout to force tall trees */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
                 if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
                 {
                     i++;  /* Move to next child for next page */
@@ -1795,6 +1800,7 @@ smol_build_internal_levels_bytes(Relation idx,
                     break; /* GCOV_EXCL_LINE - requires multi-column variable-width keys feature */
                 children_added++;
                 /* For testing: limit fanout to force tall trees */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
                 if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
                 {
                     i++;
@@ -1909,6 +1915,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Size n_this = (remaining < max_n_plain) ? remaining : max_n_plain;
 
         /* Test GUC: cap tuples per page to force taller trees */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
         if (smol_test_max_tuples_per_page > 0 && n_this > (Size) smol_test_max_tuples_per_page)
             n_this = (Size) smol_test_max_tuples_per_page;
 
@@ -2208,6 +2215,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
             }
 
             /* Apply test GUC limit */
+                /* TEST-ONLY: smol_test_* GUC check (compiled out in production) */
             if (smol_test_max_tuples_per_page > 0 && n_this >= (Size) smol_test_max_tuples_per_page)
             {
                 /* Page full due to test limit - save tuple for next page */

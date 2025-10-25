@@ -116,10 +116,18 @@ extern int smol_loop_guard_iteration;
 extern int smol_test_force_realloc_at;
 extern bool smol_test_force_page_bounds_check;
 extern int smol_test_force_parallel_workers;
-#endif
-
+/*
+ * Test-only GUCs for forcing tall tree structures (naming: smol_test_*)
+ * In production builds, these are constant 0, causing compiler to eliminate dead code.
+ * In coverage builds, they're real GUCs that force tall tree structures for testing.
+ */
 extern int smol_test_max_internal_fanout;
 extern int smol_test_max_tuples_per_page;
+#else
+/* Production builds: test GUCs are constant 0 (dead code elimination) */
+#define smol_test_max_internal_fanout 0
+#define smol_test_max_tuples_per_page 0
+#endif
 
 /* ---- Sorting Globals (for build functions) ---- */
 extern char *smol_sort_k1_buffer, *smol_sort_k2_buffer;

@@ -183,8 +183,27 @@ Flags and opclasses
 On-disk tuple and (de)serialization
 - Each tuple is the concatenation of fixed‑width key values in order. Offsets are computed from attribute lengths; advance by `MAXALIGN(attlen)` as needed. Store by‑val types with `store_att_byval`, otherwise `memcpy` fixed‑length by‑ref types. Varlen types are not supported.
 
-C warnings and style
-- GCC/Clang in PGXS environment warn on C90 mixed declarations; stylistically, move declarations to top of block when convenient. Keep functions `static` unless part of AM API. All builds must be warning-free; remove or refactor unused code instead of ignoring warnings. Treat new warnings as regressions.
+## C Warnings and Style - WARNING-FREE REQUIRED ⚠️
+
+**CRITICAL REQUIREMENT**: All builds MUST be warning-free with current compiler settings. No cheating!
+
+### Enforcement
+- Every build must pass `make clean all install` without warnings
+- Treat any new warning as a regression and fix immediately
+- Do not suppress warnings with flags - fix the underlying issue
+- Verify clean build before committing any changes
+
+### Common Fixes
+- Missing prototypes: Add static forward declaration at top of file
+- Unused functions: Mark with `__attribute__((unused))` or remove if truly dead code
+- Conditional compilation: Move function definitions outside `#ifdef` if SQL layer references them
+- Make functions `static` unless part of AM API
+- Move declarations to top of block (C90 style in PGXS environment)
+
+### Recent Warning Fixes (2025-10-24)
+- Fixed missing prototype for `smol_find_prev_leaf_recursive` (smol_utils.c:13)
+- Fixed unused function warning for `smol_parallel_sort_worker` (smol_build.c:193-196)
+- Fixed missing function error for `smol_test_run_synthetic` by moving outside `#ifdef` (smol.c:606-623)
 
 Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.

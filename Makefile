@@ -12,9 +12,20 @@ PG_CFLAGS += --coverage -O0 -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 
-# pg_regress tests: 32 tests including comprehensive error/boundary tests
-# Covers 100% of code with defensive checks and multi-column validation
-REGRESS = smol_100pct_coverage smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_deep_backward_navigation smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_errors smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
+# pg_regress tests: Base production tests (30 tests)
+# Two tests (smol_100pct_coverage, smol_deep_backward_navigation) require test GUCs
+# and are only included in coverage builds
+REGRESS_BASE = smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_errors smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
+
+# Coverage-only tests that require test GUCs (smol.test_max_tuples_per_page, smol.test_max_internal_fanout) or debug logging
+REGRESS_COVERAGE_ONLY = smol_100pct_coverage smol_deep_backward_navigation smol_final_coverage
+
+# Full test list: 33 tests for coverage builds, 30 for production
+ifeq ($(COVERAGE),1)
+REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
+else
+REGRESS = $(REGRESS_BASE)
+endif
 
 # Load extension before each test to allow standalone test execution
 REGRESS_OPTS = --load-extension=smol
@@ -198,7 +209,7 @@ pgcheck: build start
 # Clean coverage artifacts
 coverage-clean:
 	@echo "[coverage] Cleaning coverage data..."
-	@rm -f *.gcda *.gcno *.gcov smol.so smol.o
+	@$(MAKE) clean > /dev/null 2>&1
 	@rm -rf coverage_html
 	@echo "[coverage] Coverage data cleaned."
 
@@ -212,7 +223,7 @@ coverage-build: coverage-clean
 # Run tests with coverage
 coverage-test: stop start
 	@set -euo pipefail; \
-	  $(MAKE) installcheck; $(MAKE) stop
+	  COVERAGE=1 $(MAKE) installcheck; $(MAKE) stop
 
 # Generate HTML coverage report using lcov
 coverage-html:
