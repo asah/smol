@@ -20,15 +20,15 @@ PG_CPPFLAGS += -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 
-# pg_regress tests: Consolidated tests (4 production tests)
-# Consolidates 30 original production tests into 4 files
-REGRESS_BASE = smol_core smol_build smol_scan smol_rle
+# pg_regress tests: Consolidated tests (3 production tests)
+# Consolidates 30 original production tests into 3 files (smol_build merged into smol_core)
+REGRESS_BASE = smol_core smol_scan smol_rle
 
-# Coverage-only tests (4 consolidated tests)
-# Consolidates 4 original coverage-only tests into 3 files + priority 1 coverage
-REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2 smol_advanced smol_16byte_coverage
+# Coverage-only tests (3 consolidated tests)
+# Consolidates coverage-only tests into 3 files (smol_16byte_coverage merged into smol_coverage2)
+REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2 smol_advanced
 
-# Full test list: 34 tests for coverage builds, 30 for production
+# Full test list: 6 tests for coverage builds, 3 for production
 ifeq ($(COVERAGE),1)
 REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
 else
