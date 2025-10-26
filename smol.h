@@ -534,6 +534,8 @@ extern void smol_copy8(char *dst, const char *src);
 extern void smol_copy16(char *dst, const char *src);
 extern void smol_copy_small(char *dst, const char *src, uint16 len);
 extern uint64 smol_norm64(int64 v);
+extern int smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp);
+extern int smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp);
 #else
 /* Production build: static inline for performance */
 static inline void smol_copy1(char *dst, const char *src)
@@ -706,7 +708,8 @@ extern BlockNumber smol_rightmost_leaf(Relation idx);
 extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
 
-/* Bound comparison helpers (inline for performance) */
+/* Bound comparison helpers (inline for performance in production, extern in coverage builds) */
+#ifndef SMOL_TEST_COVERAGE
 static inline int
 smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
 {
@@ -760,5 +763,6 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
     /* Generic comparator for other types (e.g., UUID, TIMESTAMP, FLOAT8) */
     return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
 }
+#endif /* !SMOL_TEST_COVERAGE */
 
 #endif /* SMOL_H */

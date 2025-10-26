@@ -16,6 +16,7 @@ PG_CFLAGS=-Wno-declaration-after-statement
 # Coverage build flags (gcov-compatible)
 ifeq ($(COVERAGE),1)
 PG_CFLAGS += --coverage -O0 -DSMOL_TEST_COVERAGE
+PG_CPPFLAGS += -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 
@@ -38,6 +39,9 @@ endif
 REGRESS_OPTS = --load-extension=smol
 
 # smol_debug_coverage smol_debug_log
+
+# Additional files to clean (coverage artifacts and test results)
+EXTRA_CLEAN = *.gcov *.gcda *.gcno *.gcov.* coverage.info coverage_html results/
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
 PG_CONFIG = /usr/local/pgsql/bin/pg_config
@@ -263,15 +267,27 @@ coverage: coverage-clean coverage-build coverage-test
 	@echo "[coverage] Verifying 100% coverage target..."
 	@scripts/calc_cov.sh | awk ' \
 		/Excluded covered:/ { excl_cov = $$4 + 0 } \
+		/Uncovered:/ { uncov = $$3 + 0 } \
 		/Coverage: / { \
 			gsub(/%/, "", $$2); \
 			cov = $$2 + 0; \
 		} \
 		END { \
 			failed = 0; \
+			total_issues = excl_cov + uncov; \
 			if (cov < 100.00) { \
 				printf "[coverage] ✗ ERROR: Coverage is %.2f%%, target is 100.00%%\n", cov; \
 				failed = 1; \
+				if (total_issues > 0 && total_issues <= 100) { \
+					printf "[coverage]\n"; \
+					printf "[coverage] Showing details (total issues: %d):\n", total_issues; \
+					printf "[coverage] ════════════════════════════════════════\n"; \
+					system("./scripts/calc_cov.sh -v -e"); \
+				} else if (total_issues > 100) { \
+					printf "[coverage] Too many issues (%d) to show inline.\n", total_issues; \
+				} \
+				printf "[coverage]\n"; \
+				printf "[coverage] Run ./scripts/calc_cov.sh -v -e to see details\n"; \
 			} else { \
 				printf "[coverage] ✓ Coverage is %.2f%% (meets target)\n", cov; \
 			} \

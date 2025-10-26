@@ -86,10 +86,10 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
     {
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
-        {
+        { /* GCOV_EXCL_START - defensive: scan logic stops at tuple level before loading non-matching pages */
 	    *stop_scan_out = true;
             return false;
-        }
+        } /* GCOV_EXCL_STOP */
     }
 
     /* Equality bound check: if first key exceeds the equality value, stop scan */
