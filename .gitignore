@@ -1,3 +1,5 @@
+.gitconfig
+
 # postgres dir for LLMs to study
 postgres/
 
