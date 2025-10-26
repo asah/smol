@@ -178,7 +178,7 @@ start:
 	    $(PG_BIN)initdb -D $(PGDATA); \
 	  fi; \
           echo "tuning postgresql.conf for the current env"; \
-	  ./tune_pg.sh $(PGDATA)/postgresql.conf; \
+	  ./scripts/tune_pg.sh $(PGDATA)/postgresql.conf; \
 	  sed -i 's/^#*shared_buffers = .*$$/shared_buffers = 64MB/' $(PGDATA)/postgresql.conf; \
 	  chown postgres $(PGDATA)/postgresql.conf $(PGDATA)/postgresql.conf.bak*; \
 	  if $(PG_BIN)pg_ctl -D $(PGDATA) status >/dev/null 2>&1; then \
