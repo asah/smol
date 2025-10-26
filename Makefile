@@ -232,14 +232,12 @@ coverage-build: coverage-clean
 	@echo "[coverage] Coverage build complete."
 
 # Run tests with coverage
+# Note: BASE tests (smol_core, smol_build, smol_scan, smol_rle) work in both builds.
+# Coverage-only tests use test GUCs and only run with COVERAGE=1.
 coverage-test: stop start
 	@set -euo pipefail; \
-	  mv expected expected_prod; \
-	  mv expected_coverage/expected expected; \
 	  COVERAGE=1 $(MAKE) installcheck; \
-	  $(MAKE) stop; \
-	  mv expected expected_coverage/expected; \
-	  mv expected_prod expected
+	  $(MAKE) stop
 
 # Generate HTML coverage report using lcov
 coverage-html:

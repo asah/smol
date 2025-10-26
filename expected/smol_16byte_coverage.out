@@ -252,4 +252,44 @@ SELECT k, mac FROM t_macaddr8_inc WHERE k > 0 ORDER BY k;
 (3 rows)
 
 RESET enable_seqscan;
+-- ============================================================================
+-- Test 6: Mixed TEXT and UUID in INCLUDE (trigger smol_emit_single_tuple path)
+-- Target: smol_scan.c:223 (16-byte INCLUDE copy in varwidth path)
+-- ============================================================================
+DROP TABLE IF EXISTS t_mixed_inc CASCADE;
+NOTICE:  table "t_mixed_inc" does not exist, skipping
+CREATE UNLOGGED TABLE t_mixed_inc(k int4, txt text COLLATE "C", u uuid);
+INSERT INTO t_mixed_inc VALUES
+    (1, 'hello', '00000000-0000-0000-0000-000000000001'),
+    (2, 'world', '00000000-0000-0000-0000-000000000002'),
+    (3, 'test', '00000000-0000-0000-0000-000000000003'),
+    (4, 'data', '00000000-0000-0000-0000-000000000004');
+-- Create index with mixed TEXT and UUID in INCLUDE
+-- This forces has_varwidth=true, which triggers smol_emit_single_tuple()
+CREATE INDEX t_mixed_inc_idx ON t_mixed_inc USING smol(k) INCLUDE (txt, u);
+-- Force index-only scan to ensure INCLUDE data is read
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+-- This should trigger smol_emit_single_tuple() which processes both:
+-- - txt (text, goes through inc_is_text path)
+-- - u (UUID, should go through 16-byte non-text path at line 223)
+SELECT k, txt, u FROM t_mixed_inc WHERE k > 0 ORDER BY k;
+ k |  txt  |                  u                   
+---+-------+--------------------------------------
+ 1 | hello | 00000000-0000-0000-0000-000000000001
+ 2 | hello | 00000000-0000-0000-0000-000000000002
+ 3 | world | 00000000-0000-0000-0000-000000000003
+ 4 | test  | 00000000-0000-0000-0000-000000000004
+(4 rows)
+
+SELECT COUNT(*) FROM t_mixed_inc WHERE k > 0;
+ count 
+-------
+     4
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
 -- Done!

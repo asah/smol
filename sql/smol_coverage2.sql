@@ -834,3 +834,195 @@ DROP TABLE t_parallel_build CASCADE;
 DROP TABLE t_parallel_inc CASCADE;
 DROP TABLE t_parallel_twocol CASCADE;
 
+-- ============================================================================
+-- smol_equality_stop (moved from smol_core.sql - uses coverage-only GUC)
+-- ============================================================================
+
+SET smol.key_rle_version = 'v2';
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- Force enable page-level bounds checking (planner-dependent optimization)
+SET smol.test_force_page_bounds_check = on;
+
+-- Create a table with carefully chosen data distribution
+-- We want to create a scenario where:
+-- 1. We search for k = 50000 (which DOES exist)
+-- 2. Value 50000 exists and spans to the END of one page
+-- 3. The NEXT page starts with a value > 50000 (e.g., 60000)
+-- 4. Scanner moves from page with 50000 to next page, sees first_key > 50000
+-- This triggers the equality stop optimization (lines 982-983)
+
+DROP TABLE IF EXISTS t_eq_stop CASCADE;
+CREATE UNLOGGED TABLE t_eq_stop (k int4);
+
+-- Insert data to create specific page layout:
+-- Each page holds ~2000 int4 keys
+-- We'll create data where the SCAN starts on one page and advances to the next
+
+-- First, insert values 1-5000 (spans ~2-3 pages)
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(1, 5000) i;
+
+-- Then insert a large gap: skip to 100000
+-- This creates pages where early pages have k < 6000, later pages have k >= 100000
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(100000, 105000) i;
+
+ALTER TABLE t_eq_stop SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_eq_stop;
+
+CREATE INDEX t_eq_stop_smol_idx ON t_eq_stop USING smol(k);
+
+-- Verify page layout
+SELECT
+    leaf_pages >= 2 AS has_multiple_pages
+FROM smol_inspect('t_eq_stop_smol_idx');
+
+-- Test range query that should trigger page-level bounds optimization
+-- The scan should:
+-- 1. Start at k=1, scan through pages with k=1..5000
+-- 2. When advancing to next page, that page has first_key=100000
+-- 3. Query has upper bound k < 6000, so first_key=100000 > 6000
+-- 4. smol_page_matches_scan_bounds() returns false with stop_scan=true
+-- 5. Scan stops early without reading the 100000+ page!
+
+SELECT count(*) AS found_below_6000
+FROM t_eq_stop WHERE k >= 1 AND k < 6000;
+
+-- Verify the data spans multiple pages and includes the gap
+SELECT count(*) AS total_rows FROM t_eq_stop;
+SELECT count(*) AS high_values FROM t_eq_stop WHERE k >= 100000;
+
+-- Cleanup
+DROP TABLE t_eq_stop CASCADE;
+
+-- ============================================================================
+-- smol_deep_backward_navigation (moved from smol_scan.sql - uses coverage-only GUC)
+-- ============================================================================
+
+SET smol.key_rle_version = 'v2';
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Force extremely deep tree structure
+-- Use very small fanout and very few tuples per page to maximize tree height
+SET smol.test_max_tuples_per_page = 20;  -- Very small to create many leaves
+SET smol.test_max_internal_fanout = 3;    -- Very small to create tall internal structure
+
+DROP TABLE IF EXISTS t_deep_backward CASCADE;
+CREATE UNLOGGED TABLE t_deep_backward (k int4, data text);
+
+-- Insert data in a pattern that will create specific tree structure
+-- We need enough data to create height >= 4 with our aggressive GUCs
+-- Height 4: 20 * 3 * 3 * 3 = 540 rows minimum
+-- Use 5000 rows to ensure height >= 5
+INSERT INTO t_deep_backward
+SELECT i, 'data' || i
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_deep_backward_idx ON t_deep_backward USING smol(k);
+
+-- Inspect the tree structure
+SELECT total_pages, leaf_pages FROM smol_inspect('t_deep_backward_idx'::regclass);
+
+-- Force backward scan with specific target
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- Critical: Use smol_test_backward_scan with a target value
+-- that should be the first leaf in a deep subtree.
+-- With our tree structure (fanout=3, 20 tuples/page), we can calculate:
+-- First leaf page has tuples 1-20
+-- Second leaf page has tuples 21-40
+-- Third leaf page has tuples 41-60
+-- Fourth leaf page has tuples 61-80 (this is first child of second internal node)
+--
+-- If we do a backward scan starting from tuple 61, it should:
+-- 1. Find tuple 61 (first tuple of a new internal node's first child)
+-- 2. Need to find previous tuple (60)
+-- 3. That requires going to previous sibling internal node's rightmost leaf
+-- 4. This should trigger smol_rightmost_in_subtree with levels >= 2
+
+-- Try multiple strategic positions that should be at internal node boundaries
+SELECT smol_test_backward_scan('t_deep_backward_idx'::regclass, 61);
+SELECT smol_test_backward_scan('t_deep_backward_idx'::regclass, 121);
+SELECT smol_test_backward_scan('t_deep_backward_idx'::regclass, 181);
+SELECT smol_test_backward_scan('t_deep_backward_idx'::regclass, 241);
+
+-- Also try with ORDER BY DESC to trigger backward navigation
+SELECT k FROM t_deep_backward WHERE k >= 60 AND k <= 65 ORDER BY k DESC;
+SELECT k FROM t_deep_backward WHERE k >= 120 AND k <= 125 ORDER BY k DESC;
+
+-- Reset GUCs
+RESET smol.test_max_tuples_per_page;
+RESET smol.test_max_internal_fanout;
+
+-- Cleanup
+DROP TABLE t_deep_backward CASCADE;
+
+-- ============================================================================
+-- smol_text_include_guc (moved from smol_rle.sql - uses coverage-only GUC)
+-- ============================================================================
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Force small pages to trigger GUC paths
+SET smol.test_max_tuples_per_page = 50;
+
+-- Test 1: Text key with INCLUDE columns
+DROP TABLE IF EXISTS t_text_inc_guc CASCADE;
+CREATE UNLOGGED TABLE t_text_inc_guc (
+    k text COLLATE "C",
+    i1 int4,
+    i2 int4
+);
+
+-- Insert enough data to trigger GUC limiting
+INSERT INTO t_text_inc_guc
+SELECT 'key_' || i, i, i * 2
+FROM generate_series(1, 1000) i;
+
+-- Create index with text key and INCLUDE columns
+-- This should hit line 4489 in smol_build_text_inc_from_sorted
+CREATE INDEX t_text_inc_guc_idx ON t_text_inc_guc USING smol(k) INCLUDE (i1, i2);
+
+-- Verify it created multiple pages
+SELECT total_pages >= 10 AS has_multiple_pages
+FROM smol_inspect('t_text_inc_guc_idx'::regclass);
+
+-- Test 2: Text-only index (no INCLUDE)
+DROP TABLE IF EXISTS t_text_only_guc CASCADE;
+CREATE UNLOGGED TABLE t_text_only_guc (k text COLLATE "C");
+
+INSERT INTO t_text_only_guc
+SELECT 'value_' || lpad(i::text, 6, '0')
+FROM generate_series(1, 1000) i;
+
+-- This should hit line 5159 in smol_build_text_stream_from_tuplesort
+CREATE INDEX t_text_only_guc_idx ON t_text_only_guc USING smol(k);
+
+-- Verify multiple pages created
+SELECT total_pages >= 10 AS has_multiple_pages
+FROM smol_inspect('t_text_only_guc_idx'::regclass);
+
+-- Test a query
+SELECT COUNT(*) FROM t_text_only_guc WHERE k >= 'value_000500' AND k <= 'value_000510';
+
+-- Reset GUC
+RESET smol.test_max_tuples_per_page;
+
+-- Cleanup
+DROP TABLE t_text_inc_guc CASCADE;
+DROP TABLE t_text_only_guc CASCADE;
+

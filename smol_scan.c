@@ -220,7 +220,7 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
                 if (so->inc_meta->inc_len[ii] == 2) smol_copy2(wp, ip);
                 else if (so->inc_meta->inc_len[ii] == 4) smol_copy4(wp, ip);
                 else if (so->inc_meta->inc_len[ii] == 8) smol_copy8(wp, ip);
-                else if (so->inc_meta->inc_len[ii] == 16) smol_copy16(wp, ip); /* GCOV_EXCL_LINE - 16-byte INCLUDE columns rarely used */
+                else if (so->inc_meta->inc_len[ii] == 16) smol_copy16(wp, ip);
                 else smol_copy_small(wp, ip, so->inc_meta->inc_len[ii]); /* GCOV_EXCL_LINE - uncommon INCLUDE column lengths rarely used */
                 cur += so->inc_meta->inc_len[ii];
             }
