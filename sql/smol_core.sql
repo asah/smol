@@ -1,0 +1,744 @@
+-- smol_core.sql: Core functionality tests
+-- Consolidates: types, int2, duplicates, between, equality_stop, empty_table,
+--               errors, validate_catalog, validate_multitype, synthetic_tests
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+
+-- ============================================================================
+-- smol_types
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- 1) uuid single-key
+DROP TABLE IF EXISTS t_uuid CASCADE;
+CREATE UNLOGGED TABLE t_uuid(a uuid);
+INSERT INTO t_uuid SELECT gen_random_uuid() FROM generate_series(1,1000);
+CREATE INDEX t_uuid_smol ON t_uuid USING smol(a);
+SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
+-- basic check: non-empty and ordered when scanning >= first value
+WITH first AS (SELECT a AS m FROM t_uuid ORDER BY a ASC LIMIT 1)
+SELECT count(*) > 0 FROM t_uuid, first WHERE a >= m;
+
+-- 2) money single-key
+DROP TABLE IF EXISTS t_money CASCADE;
+CREATE UNLOGGED TABLE t_money(a money);
+INSERT INTO t_money SELECT (i * 100)::money FROM generate_series(1,1000) i;
+CREATE INDEX t_money_smol ON t_money USING smol(a);
+SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
+SELECT sum(a)::money FROM t_money WHERE a >= '10000'::money;
+
+-- 3) INCLUDE with non-integer fixed-length include (uuid)
+DROP TABLE IF EXISTS t_inc_uuid CASCADE;
+CREATE UNLOGGED TABLE t_inc_uuid(b int4, u uuid);
+INSERT INTO t_inc_uuid SELECT (i % 1000), gen_random_uuid() FROM generate_series(1,5000) i;
+CREATE INDEX t_inc_uuid_smol ON t_inc_uuid USING smol(b) INCLUDE (u);
+SET enable_indexscan=off;  -- force IOS
+SELECT count(*) FROM t_inc_uuid WHERE b > 500;
+
+-- ============================================================================
+-- smol_int2
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS smol;
+
+DROP TABLE IF EXISTS t_int2 CASCADE;
+CREATE TABLE t_int2 (k int2, v text);
+
+-- Insert diverse int2 values including negative, zero, positive, and edge cases
+INSERT INTO t_int2 SELECT 
+    (i - 500)::int2,  -- Range from -500 to 499
+    'value_' || i::text
+FROM generate_series(1, 1000) i;
+
+-- Create SMOL index on int2 column
+CREATE INDEX t_int2_smol ON t_int2 USING smol(k);
+
+-- Test queries
+SELECT count(*) FROM t_int2 WHERE k < -400::int2;
+SELECT count(*) FROM t_int2 WHERE k >= 0::int2;
+SELECT count(*) FROM t_int2 WHERE k BETWEEN -100::int2 AND 100::int2;
+
+-- Test backward scan with int2
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT k FROM t_int2 WHERE k > 400::int2 ORDER BY k DESC LIMIT 5;
+
+-- Cleanup
+DROP TABLE t_int2 CASCADE;
+
+-- ============================================================================
+-- smol_duplicates
+-- ============================================================================
+SET smol.key_rle_version = 'v2';
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+\pset format unaligned
+\pset tuples_only on
+\pset footer off
+\pset pager off
+
+-- Test 1: Small duplicate groups (10 groups of 5 duplicates each)
+DROP TABLE IF EXISTS d CASCADE;
+CREATE UNLOGGED TABLE d(a int2, x int4);
+INSERT INTO d
+SELECT g::int2, (g*100 + r)::int4
+FROM generate_series(1,10) g, generate_series(1,5) r;
+
+CREATE INDEX d_a_smol ON d USING smol(a) INCLUDE (x);
+SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on;
+
+-- Forward run: expect 3 repeated 5, then 4 repeated
+COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
+
+-- Backward run: expect 10 repeated 5, then 9 repeated
+COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
+
+-- INCLUDE path: sum for a=7 is 7*100*5 + sum(1..5) = 3515
+COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;
+
+-- Repeat queries for stability
+COPY (SELECT a FROM d WHERE a >= 3 ORDER BY a LIMIT 8) TO STDOUT;
+COPY (SELECT a FROM d WHERE a >= 9 ORDER BY a DESC LIMIT 7) TO STDOUT;
+COPY (SELECT sum(x)::bigint FROM d WHERE a = 7) TO STDOUT;
+
+DROP INDEX d_a_smol;
+DROP TABLE d;
+
+-- Test 2: Large multi-leaf duplicate run (20k rows, single duplicate key)
+-- This forces multiple leaf pages with the same key, testing run-detection
+-- and INCLUDE dup-caching across page boundaries
+CREATE UNLOGGED TABLE dm(a int4, x int4);
+INSERT INTO dm SELECT 42::int4, i::int4 FROM generate_series(1,20000) i;
+
+CREATE INDEX dm_a_smol ON dm USING smol(a) INCLUDE (x);
+SET enable_seqscan=off; SET enable_indexonlyscan=on;
+
+-- Count and sum checks (run 3 times for stability)
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+
+COPY (SELECT count(*) FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT sum(x)::bigint FROM dm WHERE a = 42) TO STDOUT;
+COPY (SELECT a FROM dm WHERE a = 42 ORDER BY a DESC LIMIT 1) TO STDOUT;
+
+DROP INDEX dm_a_smol;
+DROP TABLE dm;
+
+-- ============================================================================
+-- smol_between
+-- ============================================================================
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test BETWEEN queries (upper bound coverage)
+-- This exercises the have_upper_bound code paths that aren't covered by existing tests
+
+
+-- Test 1: Single-column BETWEEN on int4
+DROP TABLE IF EXISTS t_between CASCADE;
+CREATE UNLOGGED TABLE t_between (a int4);
+INSERT INTO t_between SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX idx_between_smol ON t_between USING smol(a);
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+-- Forward scan with BETWEEN (lower and upper bounds)
+SELECT count(*) FROM t_between WHERE a BETWEEN 100 AND 200;
+SELECT count(*) FROM t_between WHERE a >= 100 AND a < 200;
+SELECT count(*) FROM t_between WHERE a > 100 AND a <= 200;
+SELECT count(*) FROM t_between WHERE a > 100 AND a < 200;
+
+-- Backward scan with BETWEEN
+SELECT count(*) FROM (SELECT a FROM t_between WHERE a BETWEEN 100 AND 200 ORDER BY a DESC) s;
+
+-- Test 2: Two-column index with upper bound
+DROP TABLE IF EXISTS t_between2 CASCADE;
+CREATE UNLOGGED TABLE t_between2 (a int4, b int4);
+INSERT INTO t_between2 SELECT i % 100, i FROM generate_series(1, 5000) i;
+CREATE INDEX idx_between2_smol ON t_between2 USING smol(a, b);
+
+-- Two-column with upper bound
+SELECT count(*) FROM t_between2 WHERE a BETWEEN 10 AND 20;
+SELECT count(*) FROM t_between2 WHERE a >= 10 AND a < 20;
+
+-- Test 3: Upper bound only (< without >=)
+SELECT count(*) FROM t_between WHERE a < 500;
+SELECT count(*) FROM t_between WHERE a <= 500;
+
+-- Test 4: Text columns with BETWEEN
+DROP TABLE IF EXISTS t_text_between CASCADE;
+CREATE UNLOGGED TABLE t_text_between (s text COLLATE "C");
+INSERT INTO t_text_between SELECT 'key_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
+CREATE INDEX idx_text_between ON t_text_between USING smol(s);
+
+SELECT count(*) FROM t_text_between WHERE s BETWEEN 'key_000100' AND 'key_000200';
+SELECT count(*) FROM t_text_between WHERE s >= 'key_000100' AND s < 'key_000200';
+
+-- Test 5: Backward scan with upper bound only
+DROP TABLE IF EXISTS t_back_upper CASCADE;
+CREATE UNLOGGED TABLE t_back_upper (a int4);
+INSERT INTO t_back_upper SELECT i FROM generate_series(1, 500) i;
+CREATE INDEX idx_back_upper ON t_back_upper USING smol(a);
+
+-- Backward scan starting from upper bound
+SELECT count(*) FROM (SELECT a FROM t_back_upper WHERE a <= 400 ORDER BY a DESC) s;
+SELECT count(*) FROM (SELECT a FROM t_back_upper WHERE a < 400 ORDER BY a DESC) s;
+
+-- Test 6: INCLUDE columns with BETWEEN
+DROP TABLE IF EXISTS t_inc_between CASCADE;
+CREATE UNLOGGED TABLE t_inc_between (a int4, b int4, c int4);
+INSERT INTO t_inc_between SELECT i, i*2, i*3 FROM generate_series(1, 1000) i;
+CREATE INDEX idx_inc_between ON t_inc_between USING smol(a) INCLUDE (b, c);
+
+SELECT sum(b), sum(c) FROM t_inc_between WHERE a BETWEEN 100 AND 200;
+
+-- Test 7: Edge cases - bounds at extremes
+SELECT count(*) FROM t_between WHERE a BETWEEN 1 AND 10;
+SELECT count(*) FROM t_between WHERE a BETWEEN 990 AND 1000;
+SELECT count(*) FROM t_between WHERE a BETWEEN 1 AND 1000;
+
+-- Test 8: Empty result BETWEEN
+SELECT count(*) FROM t_between WHERE a BETWEEN 2000 AND 3000;
+
+-- Cleanup
+DROP TABLE t_between CASCADE;
+DROP TABLE t_between2 CASCADE;
+DROP TABLE t_text_between CASCADE;
+DROP TABLE t_back_upper CASCADE;
+DROP TABLE t_inc_between CASCADE;
+
+-- ============================================================================
+-- smol_equality_stop
+-- ============================================================================
+
+SET smol.key_rle_version = 'v2';
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- Force enable page-level bounds checking (planner-dependent optimization)
+SET smol.test_force_page_bounds_check = on;
+
+-- Create a table with carefully chosen data distribution
+-- We want to create a scenario where:
+-- 1. We search for k = 50000 (which DOES exist)
+-- 2. Value 50000 exists and spans to the END of one page
+-- 3. The NEXT page starts with a value > 50000 (e.g., 60000)
+-- 4. Scanner moves from page with 50000 to next page, sees first_key > 50000
+-- This triggers the equality stop optimization (lines 982-983)
+
+DROP TABLE IF EXISTS t_eq_stop CASCADE;
+CREATE UNLOGGED TABLE t_eq_stop (k int4);
+
+-- Insert data to create specific page layout:
+-- Each page holds ~2000 int4 keys
+-- We'll create data where the SCAN starts on one page and advances to the next
+
+-- First, insert values 1-5000 (spans ~2-3 pages)
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(1, 5000) i;
+
+-- Then insert a large gap: skip to 100000
+-- This creates pages where early pages have k < 6000, later pages have k >= 100000
+INSERT INTO t_eq_stop
+SELECT i FROM generate_series(100000, 105000) i;
+
+ALTER TABLE t_eq_stop SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_eq_stop;
+
+CREATE INDEX t_eq_stop_smol_idx ON t_eq_stop USING smol(k);
+
+-- Verify page layout
+SELECT
+    leaf_pages >= 2 AS has_multiple_pages
+FROM smol_inspect('t_eq_stop_smol_idx');
+
+-- Test range query that should trigger page-level bounds optimization
+-- The scan should:
+-- 1. Start at k=1, scan through pages with k=1..5000
+-- 2. When advancing to next page, that page has first_key=100000
+-- 3. Query has upper bound k < 6000, so first_key=100000 > 6000
+-- 4. smol_page_matches_scan_bounds() returns false with stop_scan=true
+-- 5. Scan stops early without reading the 100000+ page!
+
+SELECT count(*) AS found_below_6000
+FROM t_eq_stop WHERE k >= 1 AND k < 6000;
+
+-- Verify the data spans multiple pages and includes the gap
+SELECT count(*) AS total_rows FROM t_eq_stop;
+SELECT count(*) AS high_values FROM t_eq_stop WHERE k >= 100000;
+
+-- Cleanup
+DROP TABLE t_eq_stop CASCADE;
+
+-- ============================================================================
+-- smol_empty_table
+-- ============================================================================
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Test 1: Empty int4 table
+DROP TABLE IF EXISTS t_empty_int CASCADE;
+CREATE TABLE t_empty_int (k int4);
+CREATE INDEX t_empty_int_idx ON t_empty_int USING smol(k);
+SELECT count(*) FROM t_empty_int;
+
+-- Test 2: Empty text table (covers line 3101 in text build path)
+DROP TABLE IF EXISTS t_empty_text CASCADE;
+CREATE TABLE t_empty_text (k text COLLATE "C");
+CREATE INDEX t_empty_text_idx ON t_empty_text USING smol(k);
+SELECT count(*) FROM t_empty_text;
+
+-- Test 3: Empty two-column table
+DROP TABLE IF EXISTS t_empty_pair CASCADE;
+CREATE TABLE t_empty_pair (k int4, v int4);
+CREATE INDEX t_empty_pair_idx ON t_empty_pair USING smol(k, v);
+SELECT count(*) FROM t_empty_pair;
+
+-- Test 4: Empty table with INCLUDE columns (should cover line 3101)
+DROP TABLE IF EXISTS t_empty_inc CASCADE;
+CREATE TABLE t_empty_inc (k int4, v1 int4, v2 text);
+CREATE INDEX t_empty_inc_idx ON t_empty_inc USING smol(k) INCLUDE (v1, v2);
+SELECT count(*) FROM t_empty_inc;
+
+-- Cleanup
+DROP TABLE t_empty_int CASCADE;
+DROP TABLE t_empty_text CASCADE;
+DROP TABLE t_empty_pair CASCADE;
+
+-- ============================================================================
+-- smol_errors
+-- ============================================================================
+
+-- Test 1: INSERT (read-only) - should fail
+DROP TABLE IF EXISTS t_readonly_insert CASCADE;
+CREATE UNLOGGED TABLE t_readonly_insert(k int4);
+INSERT INTO t_readonly_insert SELECT i FROM generate_series(1, 10) i;
+CREATE INDEX t_readonly_insert_smol ON t_readonly_insert USING smol(k);
+
+DO $$
+BEGIN
+    INSERT INTO t_readonly_insert VALUES (100);
+    RAISE EXCEPTION 'INSERT should have failed';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'Test 1 PASS: INSERT correctly rejected (read-only)';
+END $$;
+
+-- Test 2: UPDATE (read-only) - should fail
+DO $$
+BEGIN
+    UPDATE t_readonly_insert SET k = 999 WHERE k = 1;
+    RAISE EXCEPTION 'UPDATE should have failed';
+EXCEPTION WHEN OTHERS THEN
+    -- UPDATE doesn't go through aminsert in all cases, but table is unlogged so this is defensive
+    RAISE NOTICE 'Test 2 PASS: UPDATE handled (table is unlogged, may not hit aminsert)';
+END $$;
+
+-- Test 3: DELETE (read-only) - should not fail
+-- SMOL doesn't support ambulkdelete, but DELETE still works via heap operations
+DELETE FROM t_readonly_insert WHERE k = 1;
+DO $$ BEGIN RAISE NOTICE 'Test 3 PASS: DELETE works (heap operation, no ambulkdelete needed)'; END $$;
+
+DROP TABLE t_readonly_insert CASCADE;
+
+-- Test 4: Too many key columns (>2) - should fail at CREATE INDEX
+DROP TABLE IF EXISTS t_too_many_keys CASCADE;
+CREATE UNLOGGED TABLE t_too_many_keys(a int4, b int4, c int4);
+INSERT INTO t_too_many_keys SELECT i, i+1, i+2 FROM generate_series(1, 10) i;
+
+DO $$
+BEGIN
+    CREATE INDEX t_too_many_keys_smol ON t_too_many_keys USING smol(a, b, c);
+    RAISE EXCEPTION 'CREATE INDEX with 3 keys should have failed';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Test 4 PASS: Too many key columns rejected: %', SQLERRM;
+END $$;
+
+DROP TABLE t_too_many_keys CASCADE;
+
+-- Test 5: Too many INCLUDE columns (>16) - should fail at CREATE INDEX
+DROP TABLE IF EXISTS t_too_many_includes CASCADE;
+CREATE UNLOGGED TABLE t_too_many_includes(
+    k int4,
+    i1 int4, i2 int4, i3 int4, i4 int4,
+    i5 int4, i6 int4, i7 int4, i8 int4,
+    i9 int4, i10 int4, i11 int4, i12 int4,
+    i13 int4, i14 int4, i15 int4, i16 int4,
+    i17 int4  -- 17th INCLUDE column should fail
+);
+INSERT INTO t_too_many_includes SELECT i, i,i,i,i, i,i,i,i, i,i,i,i, i,i,i,i, i FROM generate_series(1, 10) i;
+
+DO $$
+BEGIN
+    CREATE INDEX t_too_many_includes_smol ON t_too_many_includes USING smol(k)
+        INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16, i17);
+    RAISE EXCEPTION 'CREATE INDEX with 17 INCLUDE columns should have failed';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Test 5 PASS: Too many INCLUDE columns rejected: %', SQLERRM;
+END $$;
+
+DROP TABLE t_too_many_includes CASCADE;
+
+-- Test 6: Large row size warning (>250 bytes estimated)
+-- Create an index with many large INCLUDE columns to trigger the warning
+DROP TABLE IF EXISTS t_large_row CASCADE;
+CREATE UNLOGGED TABLE t_large_row(
+    k int4,
+    i1 uuid, i2 uuid, i3 uuid, i4 uuid,  -- 4 * 16 = 64 bytes
+    i5 uuid, i6 uuid, i7 uuid, i8 uuid   -- 4 * 16 = 64 bytes
+    -- Total: 4 (key) + 128 (includes) + alignment = ~160+ bytes, should trigger warning
+);
+INSERT INTO t_large_row SELECT i,
+    gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+    gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid()
+    FROM generate_series(1, 10) i;
+
+-- This should generate a WARNING about large row size
+CREATE INDEX t_large_row_smol ON t_large_row USING smol(k)
+    INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8);
+
+DO $$ BEGIN RAISE NOTICE 'Test 6 PASS: Large row size index created (may have generated WARNING)'; END $$;
+
+DROP TABLE t_large_row CASCADE;
+
+-- Test 7: Variable-length key type (not text) - should fail
+DROP TABLE IF EXISTS t_invalid_varlena_key CASCADE;
+CREATE UNLOGGED TABLE t_invalid_varlena_key(k bytea);
+INSERT INTO t_invalid_varlena_key VALUES (E'\\xDEADBEEF'::bytea);
+
+DO $$
+BEGIN
+    CREATE INDEX t_invalid_varlena_key_smol ON t_invalid_varlena_key USING smol(k);
+    RAISE EXCEPTION 'CREATE INDEX with bytea key should have failed';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Test 7 PASS: Variable-length non-text key rejected: %', SQLERRM;
+END $$;
+
+DROP TABLE t_invalid_varlena_key CASCADE;
+
+-- Test 8: Variable-length second key (2-column index) - should fail
+DROP TABLE IF EXISTS t_invalid_varlena_key2 CASCADE;
+CREATE UNLOGGED TABLE t_invalid_varlena_key2(k1 int4, k2 text);
+INSERT INTO t_invalid_varlena_key2 VALUES (1, 'test');
+
+DO $$
+BEGIN
+    CREATE INDEX t_invalid_varlena_key2_smol ON t_invalid_varlena_key2 USING smol(k1, k2);
+    RAISE EXCEPTION 'CREATE INDEX with text as second key should have failed';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Test 8 PASS: Variable-length second key rejected: %', SQLERRM;
+END $$;
+
+DROP TABLE t_invalid_varlena_key2 CASCADE;
+
+-- Test 9: Exactly 16 INCLUDE columns (boundary test) - should succeed
+DROP TABLE IF EXISTS t_max_includes CASCADE;
+CREATE UNLOGGED TABLE t_max_includes(
+    k int4,
+    i1 int4, i2 int4, i3 int4, i4 int4,
+    i5 int4, i6 int4, i7 int4, i8 int4,
+    i9 int4, i10 int4, i11 int4, i12 int4,
+    i13 int4, i14 int4, i15 int4, i16 int4
+);
+INSERT INTO t_max_includes SELECT i, i,i,i,i, i,i,i,i, i,i,i,i, i,i,i,i FROM generate_series(1, 100) i;
+
+CREATE INDEX t_max_includes_smol ON t_max_includes USING smol(k)
+    INCLUDE (i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16);
+
+-- Verify it works
+SELECT COUNT(*) FROM t_max_includes WHERE k > 50;
+
+DO $$ BEGIN RAISE NOTICE 'Test 9 PASS: Exactly 16 INCLUDE columns works correctly'; END $$;
+
+DROP TABLE t_max_includes CASCADE;
+
+-- Test 10: 2-column key with many INCLUDEs (stress test)
+DROP TABLE IF EXISTS t_two_key_many_inc CASCADE;
+CREATE UNLOGGED TABLE t_two_key_many_inc(
+    k1 int4, k2 int4,
+    i1 int4, i2 int4, i3 int4, i4 int4
+);
+INSERT INTO t_two_key_many_inc SELECT i, i+1, i,i,i,i FROM generate_series(1, 100) i;
+
+CREATE INDEX t_two_key_many_inc_smol ON t_two_key_many_inc USING smol(k1, k2)
+    INCLUDE (i1, i2, i3, i4);
+
+-- Verify it works
+SELECT COUNT(*) FROM t_two_key_many_inc WHERE k1 > 50;
+
+DO $$ BEGIN RAISE NOTICE 'Test 10 PASS: 2-column key with 4 INCLUDE columns works'; END $$;
+
+DROP TABLE t_two_key_many_inc CASCADE;
+
+-- Summary
+DO $$
+BEGIN
+    RAISE NOTICE '========================================';
+    RAISE NOTICE 'SMOL Error Tests Complete';
+    RAISE NOTICE 'All boundary conditions and error cases validated';
+    RAISE NOTICE '========================================';
+END $$;
+
+-- ============================================================================
+-- smol_validate_catalog
+-- ============================================================================
+-- WARNING: This test directly modifies system catalogs and must restore them
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Helper function to safely test validation by temporarily corrupting catalog
+CREATE OR REPLACE FUNCTION test_smol_validation() RETURNS void AS $$
+DECLARE
+    test_opclass_oid oid;
+    test_opfamily_oid oid;
+    backup_amproc_row pg_amproc;
+    backup_amop_row pg_amop;
+    test_func_oid oid;
+    test_op_oid oid;
+    validation_result boolean;
+BEGIN
+    -- Get a real SMOL operator class to work with
+    SELECT opc.oid, opc.opcfamily INTO test_opclass_oid, test_opfamily_oid
+    FROM pg_opclass opc
+    JOIN pg_am am ON opc.opcmethod = am.oid
+    WHERE am.amname = 'smol' AND opc.opcname = 'int4_ops'
+    LIMIT 1;
+
+    IF test_opclass_oid IS NULL THEN
+        RAISE EXCEPTION 'Could not find smol int4_ops operator class';
+    END IF;
+
+    RAISE NOTICE 'Testing smol_validate() with opclass OID %', test_opclass_oid;
+
+    -- Test 1: Cross-type support procedure (line 2555)
+    -- Add a temporary amproc entry with mismatched left/right types
+    RAISE NOTICE 'Test 1: Cross-type support procedure';
+
+    -- Create a helper comparison function
+    CREATE TEMP TABLE IF NOT EXISTS validation_cleanup (id serial);
+
+    INSERT INTO pg_amproc (oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc)
+    SELECT
+        (SELECT (MAX(oid::int4) + 1)::oid FROM pg_amproc),
+        test_opfamily_oid,
+        'int4'::regtype::oid,
+        'int8'::regtype::oid,  -- Different type - triggers cross-type error
+        1,
+        'btint4cmp'::regproc::oid
+    RETURNING * INTO backup_amproc_row;
+
+    -- Call validate (should report cross-type error as INFO and return false)
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+    -- Clean up
+    DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
+
+    -- Test 2: Invalid support function number (line 2566)
+    RAISE NOTICE 'Test 2: Invalid support function number';
+
+    INSERT INTO pg_amproc (oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc)
+    SELECT
+        (SELECT (MAX(oid::int4) + 1)::oid FROM pg_amproc),
+        test_opfamily_oid,
+        'int4'::regtype::oid,
+        'int4'::regtype::oid,
+        2,  -- Wrong number - should be 1
+        'btint4cmp'::regproc::oid
+    RETURNING * INTO backup_amproc_row;
+
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+    DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
+
+    -- Test 3: Wrong function signature (line 2575)
+    RAISE NOTICE 'Test 3: Wrong function signature';
+
+    -- Temporarily replace the real procedure with one with wrong signature
+    DELETE FROM pg_amproc
+    WHERE amprocfamily = test_opfamily_oid
+      AND amproclefttype = 'int4'::regtype::oid
+      AND amprocrighttype = 'int4'::regtype::oid
+      AND amprocnum = 1
+    RETURNING * INTO backup_amproc_row;
+
+    INSERT INTO pg_amproc (oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc)
+    VALUES (backup_amproc_row.oid, test_opfamily_oid, 'int4'::regtype::oid, 'int4'::regtype::oid, 1, 'texteq'::regproc::oid);
+
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+    -- Restore original
+    DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
+    INSERT INTO pg_amproc SELECT (backup_amproc_row).*;
+
+    -- Test 4: Invalid operator strategy number (line 2592)
+    RAISE NOTICE 'Test 4: Invalid operator strategy number';
+
+    -- Temporarily replace an operator with one with invalid strategy
+    DELETE FROM pg_amop
+    WHERE amopfamily = test_opfamily_oid
+      AND amoplefttype = 'int4'::regtype::oid
+      AND amoprighttype = 'int4'::regtype::oid
+      AND amopstrategy = 2
+    RETURNING * INTO backup_amop_row;
+
+    INSERT INTO pg_amop (oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily)
+    VALUES (backup_amop_row.oid, test_opfamily_oid, 'int4'::regtype::oid, 'int4'::regtype::oid, 6, 's'::"char", backup_amop_row.amopopr, backup_amop_row.amopmethod, 0);
+
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+    -- Restore original
+    DELETE FROM pg_amop WHERE oid = backup_amop_row.oid;
+    INSERT INTO pg_amop SELECT (backup_amop_row).*;
+
+    -- Test 5: Invalid ORDER BY specification (line 2600)
+    RAISE NOTICE 'Test 5: Invalid ORDER BY specification';
+
+    -- Get a sort family OID for the test
+    DECLARE
+        sort_family_oid oid;
+    BEGIN
+        SELECT oid INTO sort_family_oid FROM pg_opfamily WHERE opfname = 'integer_ops' LIMIT 1;
+
+        -- Temporarily replace an operator with one that has ORDER BY
+        DELETE FROM pg_amop
+        WHERE amopfamily = test_opfamily_oid
+          AND amoplefttype = 'int4'::regtype::oid
+          AND amoprighttype = 'int4'::regtype::oid
+          AND amopstrategy = 3
+        RETURNING * INTO backup_amop_row;
+
+        INSERT INTO pg_amop (oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily)
+        VALUES (backup_amop_row.oid, test_opfamily_oid, 'int4'::regtype::oid, 'int4'::regtype::oid, 3, 's'::"char", backup_amop_row.amopopr, backup_amop_row.amopmethod, sort_family_oid);
+
+        SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+        -- Restore original
+        DELETE FROM pg_amop WHERE oid = backup_amop_row.oid;
+        INSERT INTO pg_amop SELECT (backup_amop_row).*;
+    END;
+
+    -- Test 6: Wrong operator signature (line 2608)
+    RAISE NOTICE 'Test 6: Wrong operator signature';
+
+    -- Temporarily replace a real operator with one with wrong signature
+    DELETE FROM pg_amop
+    WHERE amopfamily = test_opfamily_oid
+      AND amoplefttype = 'int4'::regtype::oid
+      AND amoprighttype = 'int4'::regtype::oid
+      AND amopstrategy = 1
+    RETURNING * INTO backup_amop_row;
+
+    INSERT INTO pg_amop (oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily)
+    VALUES (backup_amop_row.oid, test_opfamily_oid, 'int4'::regtype::oid, 'int4'::regtype::oid, 1, 's'::"char", '+(int4,int4)'::regoperator::oid, backup_amop_row.amopmethod, 0);
+
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+    -- Restore original
+    DELETE FROM pg_amop WHERE oid = backup_amop_row.oid;
+    INSERT INTO pg_amop SELECT (backup_amop_row).*;
+
+    -- Test 7: Missing comparator function (line 2631)
+    RAISE NOTICE 'Test 7: Missing comparator function';
+
+    -- Temporarily remove the comparator function
+    DELETE FROM pg_amproc
+    WHERE amprocfamily = test_opfamily_oid
+      AND amproclefttype = 'int4'::regtype::oid
+      AND amprocrighttype = 'int4'::regtype::oid
+      AND amprocnum = 1
+    RETURNING * INTO backup_amproc_row;
+
+    SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
+
+    -- Restore the comparator
+    INSERT INTO pg_amproc SELECT (backup_amproc_row).*;
+
+    RAISE NOTICE 'All validation tests completed successfully';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Run the validation tests
+-- Note: This requires superuser privileges to modify system catalogs
+DO $$
+BEGIN
+    -- Check if we're superuser
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper) THEN
+        RAISE NOTICE 'Skipping catalog manipulation tests (requires superuser)';
+        RAISE NOTICE 'smol_validate() is primarily tested during CREATE OPERATOR CLASS';
+    ELSE
+        PERFORM test_smol_validation();
+    END IF;
+END;
+$$;
+
+-- Cleanup
+DROP FUNCTION IF EXISTS test_smol_validation();
+
+-- ============================================================================
+-- smol_validate_multitype
+-- ============================================================================
+
+-- Create a test operator family with support procedures for multiple types
+CREATE OPERATOR FAMILY smol_multitype_family USING smol;
+
+-- Add support function for int4 (this will be our opclass type)
+CREATE FUNCTION smol_test_int4_cmp(int4, int4) RETURNS int4
+AS 'btint4cmp' LANGUAGE internal IMMUTABLE STRICT;
+
+-- Add support function for int8 (different type - will trigger continue in validation)
+CREATE FUNCTION smol_test_int8_cmp(int8, int8) RETURNS int4
+AS 'btint8cmp' LANGUAGE internal IMMUTABLE STRICT;
+
+-- First add int8 support to the family
+ALTER OPERATOR FAMILY smol_multitype_family USING smol ADD
+    FUNCTION 1 (int8, int8) smol_test_int8_cmp(int8, int8);
+
+-- Create operator class for int4 (the opclass will add int4 support function)
+-- The family now has both int4 (from opclass) and int8 (from ALTER above) support functions
+CREATE OPERATOR CLASS smol_multitype_int4_ops
+    FOR TYPE int4 USING smol FAMILY smol_multitype_family AS
+    OPERATOR 1 <,
+    OPERATOR 2 <=,
+    OPERATOR 3 =,
+    OPERATOR 4 >=,
+    OPERATOR 5 >,
+    FUNCTION 1 smol_test_int4_cmp(int4, int4);
+
+-- Get the OID and validate
+-- This will loop through both int4 and int8 support procs
+-- The int8 proc will have amproclefttype = int8oid != opcintype (int4oid)
+-- This triggers the "continue" at line 388
+SELECT smol_test_validate(oid) FROM pg_opclass WHERE opcname = 'smol_multitype_int4_ops';
+
+-- Cleanup
+DROP OPERATOR CLASS smol_multitype_int4_ops USING smol;
+DROP FUNCTION smol_test_int4_cmp(int4, int4);
+DROP FUNCTION smol_test_int8_cmp(int8, int8);
+DROP OPERATOR FAMILY smol_multitype_family USING smol;
+
+-- ============================================================================
+-- smol_synthetic_tests
+-- ============================================================================
+
+-- Test synthetic copy functions by explicitly calling them from SQL
+-- This ensures _PG_init and smol_run_synthetic_tests get covered by gcov
+
+-- Call the synthetic test function to trigger coverage of:
+-- - _PG_init() code (via explicit call)
+-- - smol_run_synthetic_tests()
+-- - smol_copy2, smol_copy16, smol_copy_small with various sizes
+-- - smol_options() test
+SELECT smol_test_run_synthetic();

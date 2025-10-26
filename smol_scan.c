@@ -1159,7 +1159,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             memcpy(&nitems, base + sizeof(uint16), sizeof(uint16));
             so->cur_page_nitems = nitems;
             if (tag == SMOL_TAG_KEY_RLE)
-                so->cur_page_format = 2; /* GCOV_EXCL_LINE - KEY_RLE v1 format is legacy, v2 is now the default */
+                so->cur_page_format = 2;
             else if (tag == SMOL_TAG_INC_RLE)
                 so->cur_page_format = 3;
             else /* SMOL_TAG_KEY_RLE_V2 */

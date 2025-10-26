@@ -1,0 +1,771 @@
+-- smol_rle.sql: RLE encoding and INCLUDE column tests
+-- Consolidates: rle_edge_cases, rle_include_sizes, include, include_rle_mismatch,
+--               text_include_guc, copy_coverage
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- ============================================================================
+-- smol_rle_edge_cases
+-- ============================================================================
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- ============================================================================
+-- Test 1: int32 (4-byte) key Include-RLE (line 3169: else if key_len == 4)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_int4 CASCADE;
+CREATE UNLOGGED TABLE t_rle_int4 (k int4, v1 int4, v2 int4);
+
+-- Insert repetitive int4 data to trigger RLE
+INSERT INTO t_rle_int4
+SELECT
+    ((i / 100) % 100000)::int4 AS k,
+    ((i / 100))::int4 AS v1,
+    ((i / 100) * 2)::int4 AS v2
+FROM generate_series(1, 10000) i;
+
+CREATE INDEX t_rle_int4_smol ON t_rle_int4 USING smol(k) INCLUDE (v1, v2);
+
+-- Query to access RLE data (triggers smol_leaf_keyptr_ex lines 3560-3575)
+SELECT count(*), sum(v1::int8) FROM t_rle_int4 WHERE k >= 50;
+SELECT k, v1, v2 FROM t_rle_int4 WHERE k = 10 LIMIT 5;
+
+-- ============================================================================
+-- Test 2: int16 (2-byte) key Include-RLE (line 3172: else { int16 v = ... })
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_int2 CASCADE;
+CREATE UNLOGGED TABLE t_rle_int2 (k int2, v int4);
+
+INSERT INTO t_rle_int2
+SELECT
+    ((i / 50) % 30000)::int2 AS k,
+    ((i / 50))::int4 AS v
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_rle_int2_smol ON t_rle_int2 USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_rle_int2 WHERE k >= 100;
+
+-- ============================================================================
+-- Test 3: Page boundary - RLE run doesn't fit (lines 3111, 3322)
+-- Create data that fills page almost exactly to trigger "run doesn't fit" break
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_boundary CASCADE;
+CREATE UNLOGGED TABLE t_rle_boundary (k int8, v1 int4, v2 int4, v3 int4, v4 int4);
+
+-- Insert data sized to fill ~8KB pages
+-- Each row: 8 (key) + 4*4 (includes) = 24 bytes
+-- With RLE overhead: tag(2) + nitems(2) + nruns(2) + per-run(8+2+16) = need ~300 rows
+INSERT INTO t_rle_boundary
+SELECT
+    ((i / 300) % 10000)::int8 AS k,
+    ((i / 300))::int4 AS v1,
+    ((i / 300) * 2)::int4 AS v2,
+    ((i / 300) * 3)::int4 AS v3,
+    ((i / 300) * 4)::int4 AS v4
+FROM generate_series(1, 30000) i;
+
+CREATE INDEX t_rle_boundary_smol ON t_rle_boundary USING smol(k) INCLUDE (v1, v2, v3, v4);
+SELECT count(*) FROM t_rle_boundary WHERE k >= 5;
+
+-- ============================================================================
+-- Test 4: Text key Include-RLE (lines 3345, 3381-3382)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_text_inc CASCADE;
+CREATE UNLOGGED TABLE t_rle_text_inc (k text COLLATE "C", v1 int4, v2 int4);
+
+-- Insert repetitive text keys
+INSERT INTO t_rle_text_inc
+SELECT
+    'textkey' || lpad(((i / 100) % 500)::text, 4, '0') AS k,
+    ((i / 100))::int4 AS v1,
+    ((i / 100) * 2)::int4 AS v2
+FROM generate_series(1, 10000) i;
+
+CREATE INDEX t_rle_text_inc_smol ON t_rle_text_inc USING smol(k) INCLUDE (v1, v2);
+
+-- Query to access text RLE (line 3381: memcpy(p, k0, key_len))
+SELECT count(*), sum(v1::int8) FROM t_rle_text_inc WHERE k >= 'textkey0050';
+SELECT k, v1 FROM t_rle_text_inc WHERE k = 'textkey0010' LIMIT 3;
+
+-- ============================================================================
+-- Test 5: Text RLE fall back to zero-copy (line 3345)
+-- Create text data where RLE doesn't help (all unique keys)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_text_zerocopy CASCADE;
+CREATE UNLOGGED TABLE t_text_zerocopy (k text COLLATE "C", v int4);
+
+-- All unique keys - RLE won't help
+INSERT INTO t_text_zerocopy
+SELECT
+    'unique' || lpad(i::text, 8, '0') AS k,
+    i AS v
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_text_zerocopy_smol ON t_text_zerocopy USING smol(k) INCLUDE (v);
+SELECT count(*) FROM t_text_zerocopy WHERE k >= 'unique00001000';
+
+-- ============================================================================
+-- Test 6: Multi-page text+include build (line 3422 - link previous page)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_text_multipage CASCADE;
+CREATE UNLOGGED TABLE t_text_multipage (k text COLLATE "C", v1 int4, v2 int4);
+
+-- Insert enough text data to span multiple pages (50K rows)
+INSERT INTO t_text_multipage
+SELECT
+    'data' || lpad(i::text, 10, '0') AS k,
+    i AS v1,
+    i * 2 AS v2
+FROM generate_series(1, 50000) i;
+
+CREATE INDEX t_text_multipage_smol ON t_text_multipage USING smol(k) INCLUDE (v1, v2);
+SELECT count(*) FROM t_text_multipage WHERE k >= 'data0000025000';
+
+-- ============================================================================
+-- Test 7: RLE run boundaries and key access (lines 3645-3651, smol_run_index_range)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_runs CASCADE;
+CREATE UNLOGGED TABLE t_rle_runs (k int8, v1 int4, v2 int4);
+
+-- Create distinct runs with varying lengths
+INSERT INTO t_rle_runs
+SELECT
+    CASE
+        WHEN i <= 1000 THEN 100  -- Run 1: 1000 rows
+        WHEN i <= 1500 THEN 200  -- Run 2: 500 rows
+        WHEN i <= 3500 THEN 300  -- Run 3: 2000 rows
+        ELSE 400                 -- Run 4: remaining
+    END::int8 AS k,
+    i AS v1,
+    i * 2 AS v2
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_rle_runs_smol ON t_rle_runs USING smol(k) INCLUDE (v1, v2);
+
+-- Query different runs to trigger run boundary detection
+SELECT k, count(*) FROM t_rle_runs WHERE k = 100 GROUP BY k;  -- First run
+SELECT k, count(*) FROM t_rle_runs WHERE k = 200 GROUP BY k;  -- Middle run
+SELECT k, count(*) FROM t_rle_runs WHERE k = 400 GROUP BY k;  -- Last run
+SELECT k, v1, v2 FROM t_rle_runs WHERE k = 300 LIMIT 100;     -- Access within run
+
+-- ============================================================================
+-- Test 8: Key-only RLE without includes (0x8001 format) (lines 3717-3721)
+-- This requires RLE compression on keys but NO include columns
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_key_rle_only CASCADE;
+CREATE UNLOGGED TABLE t_key_rle_only (k int8);
+
+-- Insert highly repetitive keys (no includes)
+INSERT INTO t_key_rle_only
+SELECT ((i / 1000) % 100)::int8 FROM generate_series(1, 100000) i;
+
+-- Create index WITHOUT include columns to trigger key-only RLE (0x8001)
+CREATE INDEX t_key_rle_only_smol ON t_key_rle_only USING smol(k);
+
+-- Query to access key-only RLE
+SELECT k, count(*) FROM t_key_rle_only WHERE k >= 10 GROUP BY k ORDER BY k LIMIT 10;
+
+-- ============================================================================
+-- Test 9: RLE key pointer navigation (lines 3560-3575)
+-- Access individual keys within RLE runs via scanning
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_rle_keyptr CASCADE;
+CREATE UNLOGGED TABLE t_rle_keyptr (k int8, v int4);
+
+-- Create RLE data with specific run patterns
+INSERT INTO t_rle_keyptr VALUES
+    -- Run 1: key=1000, 500 times
+    (SELECT 1000, generate_series FROM generate_series(1, 500)),
+    -- Run 2: key=2000, 300 times
+    (SELECT 2000, generate_series FROM generate_series(501, 800)),
+    -- Run 3: key=3000, 700 times
+    (SELECT 3000, generate_series FROM generate_series(801, 1500));
+
+CREATE INDEX t_rle_keyptr_smol ON t_rle_keyptr USING smol(k) INCLUDE (v);
+
+-- Scan to trigger key pointer access in different runs
+SELECT k, v FROM t_rle_keyptr WHERE k = 1000 AND v >= 250 AND v < 260;  -- Middle of run 1
+SELECT k, v FROM t_rle_keyptr WHERE k = 2000 AND v >= 700 AND v < 710;  -- Middle of run 2
+SELECT k, v FROM t_rle_keyptr WHERE k = 3000 AND v >= 1400;              -- End of run 3
+
+-- Cleanup
+DROP TABLE t_rle_int4 CASCADE;
+DROP TABLE t_rle_int2 CASCADE;
+DROP TABLE t_rle_boundary CASCADE;
+DROP TABLE t_rle_text_inc CASCADE;
+DROP TABLE t_text_zerocopy CASCADE;
+DROP TABLE t_text_multipage CASCADE;
+DROP TABLE t_rle_runs CASCADE;
+DROP TABLE t_key_rle_only CASCADE;
+DROP TABLE t_rle_keyptr CASCADE;
+
+-- ============================================================================
+-- smol_rle_include_sizes
+-- ============================================================================
+
+-- Test RLE format with INCLUDE columns of various sizes
+-- This test covers lines 2698-2713: size-specific INCLUDE column copying in RLE pages
+--
+-- Target lines:
+-- 2698-2700: plain_inc_cached path for plain pages
+-- 2703: rle_run_inc_cached path for RLE pages
+-- 2709-2713: Size-specific fast-path copies (4B, 8B, 16B, 2B, 1B)
+
+SET client_min_messages = warning;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- Test 1: RLE with 4-byte INCLUDE (int4) - Line 2709
+DROP TABLE IF EXISTS t_rle_inc4 CASCADE;
+CREATE UNLOGGED TABLE t_rle_inc4 (k int4, v int4);
+
+-- Insert with long runs (100 consecutive identical rows) to trigger Include-RLE
+INSERT INTO t_rle_inc4
+SELECT (i / 100), (i / 100) * 100
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_inc4 SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_inc4;
+
+CREATE INDEX t_rle_inc4_smol_idx ON t_rle_inc4 USING smol(k) INCLUDE (v);
+
+-- Verify Include-RLE compression is used (tag 0x8003)
+SELECT inc_rle_pages > 0 AS has_inc_rle FROM smol_inspect('t_rle_inc4_smol_idx');
+
+-- Query to trigger RLE INCLUDE access with 4-byte columns (backward scan)
+SELECT k, v FROM t_rle_inc4 WHERE k >= 90 ORDER BY k DESC LIMIT 5;
+
+-- Test 2: RLE with 8-byte INCLUDE (int8/date) - Line 2710
+DROP TABLE IF EXISTS t_rle_inc8 CASCADE;
+CREATE UNLOGGED TABLE t_rle_inc8 (k int4, v1 int8, v2 date);
+
+-- Insert with long runs
+INSERT INTO t_rle_inc8
+SELECT (i / 100), ((i / 100) * 1000)::int8, ('2024-01-01'::date + (i / 100))
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_inc8 SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_inc8;
+
+CREATE INDEX t_rle_inc8_smol_idx ON t_rle_inc8 USING smol(k) INCLUDE (v1, v2);
+
+-- Verify Include-RLE compression
+SELECT inc_rle_pages > 0 AS has_inc_rle FROM smol_inspect('t_rle_inc8_smol_idx');
+
+-- Query to trigger 8-byte INCLUDE access (backward scan)
+SELECT k, v1, v2 FROM t_rle_inc8 WHERE k >= 90 ORDER BY k DESC LIMIT 5;
+
+-- Test 3: RLE with 16-byte INCLUDE (UUID) - Line 2711
+DROP TABLE IF EXISTS t_rle_inc16 CASCADE;
+CREATE UNLOGGED TABLE t_rle_inc16 (k int4, v uuid);
+
+-- Insert with long runs
+INSERT INTO t_rle_inc16
+SELECT (i / 100), md5((i / 100)::text)::uuid
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_inc16 SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_inc16;
+
+CREATE INDEX t_rle_inc16_smol_idx ON t_rle_inc16 USING smol(k) INCLUDE (v);
+
+-- Verify Include-RLE
+SELECT inc_rle_pages > 0 AS has_inc_rle FROM smol_inspect('t_rle_inc16_smol_idx');
+
+-- Query to trigger 16-byte INCLUDE access (backward scan)
+SELECT k, v FROM t_rle_inc16 WHERE k >= 90 ORDER BY k DESC LIMIT 5;
+
+-- Test 4: RLE with 2-byte INCLUDE (int2) - Line 2712
+DROP TABLE IF EXISTS t_rle_inc2 CASCADE;
+CREATE UNLOGGED TABLE t_rle_inc2 (k int4, v int2);
+
+-- Insert with long runs
+INSERT INTO t_rle_inc2
+SELECT (i / 100), ((i / 100) * 10)::int2
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_inc2 SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_inc2;
+
+CREATE INDEX t_rle_inc2_smol_idx ON t_rle_inc2 USING smol(k) INCLUDE (v);
+
+-- Verify Include-RLE
+SELECT inc_rle_pages > 0 AS has_inc_rle FROM smol_inspect('t_rle_inc2_smol_idx');
+
+-- Query to trigger 2-byte INCLUDE access (backward scan)
+SELECT k, v FROM t_rle_inc2 WHERE k >= 90 ORDER BY k DESC LIMIT 5;
+
+-- Test 5: RLE with 1-byte INCLUDE (bool/char) - Line 2713
+DROP TABLE IF EXISTS t_rle_inc1 CASCADE;
+CREATE UNLOGGED TABLE t_rle_inc1 (k int4, v1 bool, v2 "char");
+
+-- Insert with long runs
+INSERT INTO t_rle_inc1
+SELECT (i / 100), ((i / 100) % 2 = 0), chr(65 + ((i / 100) % 26))::"char"
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_inc1 SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_inc1;
+
+CREATE INDEX t_rle_inc1_smol_idx ON t_rle_inc1 USING smol(k) INCLUDE (v1, v2);
+
+-- Verify Include-RLE
+SELECT inc_rle_pages > 0 AS has_inc_rle FROM smol_inspect('t_rle_inc1_smol_idx');
+
+-- Query to trigger 1-byte INCLUDE access (backward scan)
+SELECT k, v1, v2 FROM t_rle_inc1 WHERE k >= 90 ORDER BY k DESC LIMIT 5;
+
+-- Test 6: Mixed INCLUDE sizes in one index (covers multiple lines)
+DROP TABLE IF EXISTS t_rle_mixed CASCADE;
+CREATE UNLOGGED TABLE t_rle_mixed (
+    k int4,
+    v_1b bool,
+    v_2b int2,
+    v_4b int4,
+    v_8b int8,
+    v_16b uuid
+);
+
+-- Insert with long runs
+INSERT INTO t_rle_mixed
+SELECT
+    (i / 100),
+    ((i / 100) % 2 = 0),
+    ((i / 100) * 10)::int2,
+    (i / 100) * 100,
+    ((i / 100) * 1000)::int8,
+    md5((i / 100)::text)::uuid
+FROM generate_series(0, 9999) i;
+
+ALTER TABLE t_rle_mixed SET (autovacuum_enabled = off);
+VACUUM (FREEZE, ANALYZE) t_rle_mixed;
+
+CREATE INDEX t_rle_mixed_smol_idx ON t_rle_mixed USING smol(k)
+    INCLUDE (v_1b, v_2b, v_4b, v_8b, v_16b);
+
+-- Verify Include-RLE
+SELECT
+    inc_rle_pages > 0 AS has_inc_rle,
+    compression_pct > 50 AS good_compression
+FROM smol_inspect('t_rle_mixed_smol_idx');
+
+-- Query that accesses all INCLUDE column sizes (backward scan)
+SELECT k, v_1b, v_2b, v_4b, v_8b, v_16b
+FROM t_rle_mixed
+WHERE k >= 90
+ORDER BY k DESC
+LIMIT 5;
+
+-- Cleanup
+DROP TABLE t_rle_inc4 CASCADE;
+DROP TABLE t_rle_inc8 CASCADE;
+DROP TABLE t_rle_inc16 CASCADE;
+DROP TABLE t_rle_inc2 CASCADE;
+DROP TABLE t_rle_inc1 CASCADE;
+DROP TABLE t_rle_mixed CASCADE;
+
+-- ============================================================================
+-- smol_include
+-- ============================================================================
+CREATE EXTENSION IF NOT EXISTS smol;
+
+DROP TABLE IF EXISTS inc1 CASCADE;
+CREATE UNLOGGED TABLE inc1(b int4, a1 int4, a2 int4);
+INSERT INTO inc1 SELECT (i % 100000)::int4, (i % 1234)::int4, (i % 4321)::int4 FROM generate_series(1,100000) AS s(i);
+ANALYZE inc1;
+ALTER TABLE inc1 SET (autovacuum_enabled = off);
+
+DROP INDEX IF EXISTS inc1_btree;
+CREATE INDEX inc1_btree ON inc1 USING btree(b) INCLUDE (a1,a2);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc1;
+ANALYZE inc1;
+
+SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on; SET enable_indexscan=on;
+SELECT sum(a1)::bigint AS bt_sum1, sum(a2)::bigint AS bt_sum2, count(*)::bigint AS bt_cnt FROM inc1 WHERE b > 50000; \gset
+
+DROP INDEX inc1_btree;
+CREATE INDEX inc1_smol ON inc1 USING smol(b) INCLUDE (a1,a2);
+ANALYZE inc1;
+SET enable_indexscan=off;  -- SMOL IOS only
+SELECT (SELECT sum(a1)::bigint FROM inc1 WHERE b > 50000) = :'bt_sum1' AS sum1_match,
+       (SELECT sum(a2)::bigint FROM inc1 WHERE b > 50000) = :'bt_sum2' AS sum2_match,
+       (SELECT count(*)::bigint FROM inc1 WHERE b > 50000) = :'bt_cnt'  AS cnt_match;
+
+-- Test bool INCLUDE (1-byte byval) - triggers case 1 at line 4436
+DROP TABLE IF EXISTS inc_bool CASCADE;
+CREATE UNLOGGED TABLE inc_bool(k int4, b bool);
+INSERT INTO inc_bool SELECT i, (i % 2 = 0) FROM generate_series(1, 1000) i;
+ANALYZE inc_bool;
+ALTER TABLE inc_bool SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_bool_smol ON inc_bool USING smol(k) INCLUDE (b);
+ANALYZE inc_bool;
+
+-- Verify bool INCLUDE works
+SELECT count(*) FROM inc_bool WHERE k > 500;
+SELECT count(*) FILTER (WHERE b) AS true_count FROM inc_bool WHERE k > 0;
+
+-- Test int2 INCLUDE (2-byte byval) with TEXT key - triggers line 4364 in smol_emit_single_tuple (RLE path)
+DROP TABLE IF EXISTS inc_int2_text CASCADE;
+CREATE UNLOGGED TABLE inc_int2_text(k text COLLATE "C", v int2);
+-- Create duplicates to trigger RLE encoding
+INSERT INTO inc_int2_text SELECT 'key_' || lpad((i % 100)::text, 3, '0'), (i % 30000)::int2 FROM generate_series(1, 10000) i ORDER BY 1;
+ANALYZE inc_int2_text;
+ALTER TABLE inc_int2_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_int2_text_smol ON inc_int2_text USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int2_text;
+ANALYZE inc_int2_text;
+
+-- Verify int2 INCLUDE works with text key and index-only scan (should use RLE)
+SET enable_seqscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off;
+SELECT count(*) FROM inc_int2_text WHERE k >= 'key_050';
+SELECT sum(v::int8) FROM inc_int2_text WHERE k < 'key_010';
+
+-- Test int8 INCLUDE (8-byte byval) with TEXT key - triggers line 4366 in smol_emit_single_tuple (RLE path)
+DROP TABLE IF EXISTS inc_int8_text CASCADE;
+CREATE UNLOGGED TABLE inc_int8_text(k text COLLATE "C", v int8);
+-- Create duplicates to trigger RLE encoding
+INSERT INTO inc_int8_text SELECT 'key_' || lpad((i % 100)::text, 3, '0'), i::int8 * 1000 FROM generate_series(1, 10000) i ORDER BY 1;
+ANALYZE inc_int8_text;
+ALTER TABLE inc_int8_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_int8_text_smol ON inc_int8_text USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int8_text;
+ANALYZE inc_int8_text;
+
+-- Verify int8 INCLUDE works with text key and index-only scan (should use RLE)
+SELECT count(*) FROM inc_int8_text WHERE k >= 'key_050';
+SELECT sum(v) FROM inc_int8_text WHERE k < 'key_010';
+
+-- ============================================================================
+-- Test text32 non-RLE path (lines 4364-4368 in smol_emit_single_tuple)
+-- Requires UNIQUE text32 keys to avoid RLE encoding
+-- ============================================================================
+DROP TABLE IF EXISTS inc_text32_unique CASCADE;
+CREATE UNLOGGED TABLE inc_text32_unique(k text COLLATE "C", v int4);
+-- Insert unique keys (no duplicates) to prevent RLE
+INSERT INTO inc_text32_unique SELECT 'unique_' || lpad(i::text, 10, '0'), i FROM generate_series(1, 1000) i;
+ANALYZE inc_text32_unique;
+ALTER TABLE inc_text32_unique SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_text32_unique_smol ON inc_text32_unique USING smol(k) INCLUDE (v);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_text32_unique;
+ANALYZE inc_text32_unique;
+
+-- Query with unique text keys (no RLE) - triggers lines 4364-4368
+SELECT count(*), sum(v::int8) FROM inc_text32_unique WHERE k >= 'unique_0000000500';
+
+-- ============================================================================
+-- Test fixed-size key copies in smol_emit_single_tuple (lines 4375-4377)
+-- Need int8/uuid keys with text INCLUDE to trigger varwidth tuple building
+-- ============================================================================
+
+-- Test int8 key + text INCLUDE (line 4375: key_len==8)
+DROP TABLE IF EXISTS inc_int8key_text CASCADE;
+CREATE UNLOGGED TABLE inc_int8key_text(k int8, t text COLLATE "C");
+INSERT INTO inc_int8key_text SELECT i::int8, 'text_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_int8key_text;
+ALTER TABLE inc_int8key_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_int8key_text_smol ON inc_int8key_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_int8key_text;
+ANALYZE inc_int8key_text;
+
+SELECT count(*), sum(k) FROM inc_int8key_text WHERE k >= 500::int8;
+
+-- Test uuid key + text INCLUDE (line 4376: key_len==16)
+DROP TABLE IF EXISTS inc_uuid_text CASCADE;
+CREATE UNLOGGED TABLE inc_uuid_text(k uuid, t text COLLATE "C");
+INSERT INTO inc_uuid_text SELECT md5(i::text)::uuid, 'data_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_uuid_text;
+ALTER TABLE inc_uuid_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_uuid_text_smol ON inc_uuid_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_uuid_text;
+ANALYZE inc_uuid_text;
+
+SELECT count(*) FROM inc_uuid_text WHERE k > '00000000-0000-0000-0000-000000000000'::uuid;
+
+-- Test date key + text INCLUDE (line 4377: uncommon key_len)
+-- Note: Changed from interval to date to avoid non-deterministic behavior
+DROP TABLE IF EXISTS inc_date_text CASCADE;
+CREATE UNLOGGED TABLE inc_date_text(k date, t text COLLATE "C");
+INSERT INTO inc_date_text SELECT '2020-01-01'::date + i, 'info_' || i::text FROM generate_series(1, 1000) i;
+ANALYZE inc_date_text;
+ALTER TABLE inc_date_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_date_text_smol ON inc_date_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_date_text;
+ANALYZE inc_date_text;
+
+SELECT count(*) FROM inc_date_text WHERE k >= '2020-04-10'::date;
+
+-- ============================================================================
+-- Test smol_copy_small uncommon cases (lines 4319-4333)
+-- These are reached via smol_copy_small with specific lengths
+-- ============================================================================
+
+-- Test case 4: 4-byte fixed type (already covered by int4)
+-- Test case 5: 5-byte type - use "char"[5] array
+DROP TABLE IF EXISTS inc_char5_text CASCADE;
+CREATE UNLOGGED TABLE inc_char5_text(k "char", t text COLLATE "C");
+INSERT INTO inc_char5_text SELECT (i % 256)::int::char, 'val_' || i::text FROM generate_series(1, 500) i;
+ANALYZE inc_char5_text;
+ALTER TABLE inc_char5_text SET (autovacuum_enabled = off);
+
+CREATE INDEX inc_char5_text_smol ON inc_char5_text USING smol(k) INCLUDE (t);
+CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
+VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) inc_char5_text;
+ANALYZE inc_char5_text;
+
+SELECT count(*) FROM inc_char5_text WHERE k >= '0'::char;
+
+-- ============================================================================
+-- smol_include_rle_mismatch
+-- ============================================================================
+
+-- Test Include-RLE run comparison mismatch (line 3457)
+
+DROP TABLE IF EXISTS t_rle_mismatch CASCADE;
+CREATE UNLOGGED TABLE t_rle_mismatch (k text, v int4);
+
+-- Insert rows with same key but different include values
+-- This should trigger the include mismatch check in RLE encoding
+INSERT INTO t_rle_mismatch VALUES
+    ('key1', 1),
+    ('key1', 2),  -- Same key, different include
+    ('key1', 3),  -- Same key, different include
+    ('key2', 4),
+    ('key2', 5);  -- Same key, different include
+
+CREATE INDEX idx_rle_mismatch ON t_rle_mismatch USING smol(k) INCLUDE (v);
+
+-- Verify index works
+SELECT * FROM t_rle_mismatch WHERE k = 'key1' ORDER BY v;
+
+DROP TABLE t_rle_mismatch CASCADE;
+
+-- Test multi-column include with RLE run break on second column (line 3457)
+-- This specifically targets the inner loop that checks include value mismatches
+-- Need MANY duplicate keys to trigger Include-RLE format (not RLE format)
+DROP TABLE IF EXISTS t_multi_inc CASCADE;
+CREATE UNLOGGED TABLE t_multi_inc (k text, v1 int4, v2 int4);
+
+-- Insert rows where:
+-- - Key is same (triggers RLE)
+-- - First include column matches
+-- - Second include column differs mid-run (triggers line 3457)
+-- The RLE algorithm compares row 0 with rows 1, 2, 3...
+-- To ensure Include-RLE format is used, need many duplicates
+INSERT INTO t_multi_inc
+SELECT
+    'key' || (i % 10)::text,  -- 10 distinct keys
+    100,                        -- v1 always 100
+    CASE WHEN i % 100 = 50 THEN 999 ELSE i % 10 END  -- v2 differs at position 50, 150, 250...
+FROM generate_series(1, 1000) i
+ORDER BY 1, 2, 3;
+
+CREATE INDEX idx_multi_inc ON t_multi_inc USING smol(k) INCLUDE (v1, v2);
+
+-- Verify index works
+SELECT COUNT(*) FROM t_multi_inc WHERE k = 'key1';
+
+DROP TABLE t_multi_inc CASCADE;
+
+-- ============================================================================
+-- smol_text_include_guc
+-- ============================================================================
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Force small pages to trigger GUC paths
+SET smol.test_max_tuples_per_page = 50;
+
+-- Test 1: Text key with INCLUDE columns
+DROP TABLE IF EXISTS t_text_inc_guc CASCADE;
+CREATE UNLOGGED TABLE t_text_inc_guc (
+    k text COLLATE "C",
+    i1 int4,
+    i2 int4
+);
+
+-- Insert enough data to trigger GUC limiting
+INSERT INTO t_text_inc_guc
+SELECT 'key_' || i, i, i * 2
+FROM generate_series(1, 1000) i;
+
+-- Create index with text key and INCLUDE columns
+-- This should hit line 4489 in smol_build_text_inc_from_sorted
+CREATE INDEX t_text_inc_guc_idx ON t_text_inc_guc USING smol(k) INCLUDE (i1, i2);
+
+-- Verify it created multiple pages
+SELECT total_pages >= 10 AS has_multiple_pages
+FROM smol_inspect('t_text_inc_guc_idx'::regclass);
+
+-- Test 2: Text-only index (no INCLUDE)
+DROP TABLE IF EXISTS t_text_only_guc CASCADE;
+CREATE UNLOGGED TABLE t_text_only_guc (k text COLLATE "C");
+
+INSERT INTO t_text_only_guc
+SELECT 'value_' || lpad(i::text, 6, '0')
+FROM generate_series(1, 1000) i;
+
+-- This should hit line 5159 in smol_build_text_stream_from_tuplesort
+CREATE INDEX t_text_only_guc_idx ON t_text_only_guc USING smol(k);
+
+-- Verify multiple pages created
+SELECT total_pages >= 10 AS has_multiple_pages
+FROM smol_inspect('t_text_only_guc_idx'::regclass);
+
+-- Test a query
+SELECT COUNT(*) FROM t_text_only_guc WHERE k >= 'value_000500' AND k <= 'value_000510';
+
+-- Reset GUC
+RESET smol.test_max_tuples_per_page;
+
+-- Cleanup
+DROP TABLE t_text_inc_guc CASCADE;
+DROP TABLE t_text_only_guc CASCADE;
+
+-- ============================================================================
+-- smol_copy_coverage
+-- ============================================================================
+
+SET smol.key_rle_version = 'v2';
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- ============================================================================
+-- Test 1: char/bool (1-byte byval) types
+-- Targets lines 4149 (byval len1=1) and 4159 (byval len2=1)
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_char_bool CASCADE;
+CREATE UNLOGGED TABLE t_char_bool (k "char", v bool);
+
+INSERT INTO t_char_bool
+SELECT
+    (i % 128)::"char",
+    (i % 2 = 0)::bool
+FROM generate_series(1, 10000) i;
+
+CREATE INDEX t_char_bool_smol ON t_char_bool USING smol(k, v);
+
+SELECT k, v FROM t_char_bool WHERE k = '5'::"char" AND v = true LIMIT 5;
+SELECT count(*) FROM t_char_bool WHERE k >= '0'::"char";
+
+-- ============================================================================
+-- Test 2: Single bool column
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_bool_single CASCADE;
+CREATE UNLOGGED TABLE t_bool_single (k bool, v int4);
+
+INSERT INTO t_bool_single
+SELECT
+    (i % 2 = 0)::bool,
+    i
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_bool_single_smol ON t_bool_single USING smol(k, v);
+
+SELECT k, count(*) FROM t_bool_single GROUP BY k ORDER BY k;
+
+-- ============================================================================
+-- Test 3: Linear growth path for pair builder (line 4137)
+-- Need to trigger growth beyond 8M entries threshold
+-- Use GUC to lower threshold for testing
+-- ============================================================================
+
+-- Lower growth threshold to trigger linear growth path
+SET smol.growth_threshold_test = 1000;
+
+DROP TABLE IF EXISTS t_large_growth CASCADE;
+CREATE UNLOGGED TABLE t_large_growth (k int8, v int8);
+
+-- Insert enough rows to trigger multiple doublings and then linear growth
+-- With threshold=1000, we'll go: 0->1024, 1024->2048, 2048->4096 (linear)
+INSERT INTO t_large_growth
+SELECT i::int8, (i * 2)::int8
+FROM generate_series(1, 5000) i;
+
+CREATE INDEX t_large_growth_smol ON t_large_growth USING smol(k, v);
+
+SELECT count(*) FROM t_large_growth WHERE k >= 2500;
+
+-- Reset threshold
+SET smol.growth_threshold_test = 0;
+
+-- ============================================================================
+-- Test 4: Progress logging (line 4168)
+-- Simplified to avoid non-deterministic OIDs and timing in output
+-- ============================================================================
+
+-- We verify progress logging is triggered but suppress detailed output
+-- by keeping client_min_messages at warning level
+SET smol.debug_log = on;
+SET smol.progress_log_every = 1000;
+SET client_min_messages = warning;  -- Suppress LOG messages with OIDs/timing
+
+DROP TABLE IF EXISTS t_progress CASCADE;
+CREATE UNLOGGED TABLE t_progress (k int8, v int4);
+
+INSERT INTO t_progress
+SELECT i::int8, i::int4
+FROM generate_series(1, 5000) i;
+
+-- This triggers progress logging during build, but we don't display it
+-- to keep the test deterministic (avoids non-deterministic OIDs/timing)
+CREATE INDEX t_progress_smol ON t_progress USING smol(k, v);
+
+-- Verify the index was created successfully
+SELECT count(*) FROM t_progress WHERE k >= 2500;
+
+SET smol.debug_log = off;
+
+-- ============================================================================
+-- Test 5: Mixed 1-byte types
+-- ============================================================================
+
+DROP TABLE IF EXISTS t_mixed_byte CASCADE;
+CREATE UNLOGGED TABLE t_mixed_byte (k "char", v "char");
+
+INSERT INTO t_mixed_byte
+SELECT
+    ((i % 26) + 65)::"char",  -- A-Z
+    ((i % 10) + 48)::"char"   -- 0-9
+FROM generate_series(1, 2000) i;
+
+CREATE INDEX t_mixed_byte_smol ON t_mixed_byte USING smol(k, v);
+
+SELECT k, v FROM t_mixed_byte WHERE k >= 'M'::"char" ORDER BY k, v LIMIT 10;
+
+-- Cleanup
+DROP TABLE t_char_bool CASCADE;
+DROP TABLE t_bool_single CASCADE;
+DROP TABLE t_large_growth CASCADE;
+DROP TABLE t_progress CASCADE;
+DROP TABLE t_mixed_byte CASCADE;
+
