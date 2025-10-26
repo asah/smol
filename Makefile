@@ -20,15 +20,15 @@ PG_CPPFLAGS += -DSMOL_TEST_COVERAGE
 SHLIB_LINK += --coverage
 endif
 
-# pg_regress tests: Base production tests (30 tests)
-# Two tests (smol_100pct_coverage, smol_deep_backward_navigation) require test GUCs
-# and are only included in coverage builds
-REGRESS_BASE = smol_between smol_build_edges smol_copy_coverage smol_coverage_batch_prefetch smol_coverage_complete smol_coverage_direct smol_coverage_gaps smol_duplicates smol_edge_coverage smol_empty_table smol_equality_stop smol_errors smol_growth smol_include smol_include_rle_mismatch smol_int2 smol_multilevel_btree smol_options_coverage smol_parallel smol_parallel_build_test smol_prefetch_boundary smol_rightmost_descend smol_rle_edge_cases smol_rle_include_sizes smol_runtime_keys_coverage smol_synthetic_tests smol_text_include_guc smol_types smol_validate_catalog smol_validate_multitype
+# pg_regress tests: Consolidated tests (4 production tests)
+# Consolidates 30 original production tests into 4 files
+REGRESS_BASE = smol_core smol_build smol_scan smol_rle
 
-# Coverage-only tests that require test GUCs (smol.test_max_tuples_per_page, smol.test_max_internal_fanout) or debug logging
-REGRESS_COVERAGE_ONLY = smol_100pct_coverage smol_deep_backward_navigation smol_final_coverage smol_large_row_warning
+# Coverage-only tests (2 consolidated tests)
+# Consolidates 4 original coverage-only tests into 2 files
+REGRESS_COVERAGE_ONLY = smol_coverage smol_advanced
 
-# Full test list: 33 tests for coverage builds, 30 for production
+# Full test list: 34 tests for coverage builds, 30 for production
 ifeq ($(COVERAGE),1)
 REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
 else

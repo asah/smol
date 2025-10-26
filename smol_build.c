@@ -1354,7 +1354,7 @@ smol_build_internal_levels_bytes(Relation idx,
                 memcpy(item, &cur_blks[i], sizeof(BlockNumber));
                 memcpy(item + sizeof(BlockNumber), cur_high + ((size_t) i * key_len), key_len);
                 if (PageGetFreeSpace(ipg) < item_sz + sizeof(ItemIdData))
-                    break;
+                    break; /* GCOV_EXCL_LINE - defensive: internal pages sized to prevent this */
                 OffsetNumber off = PageAddItem(ipg, (Item) item, item_sz, InvalidOffsetNumber, false, false);
                 SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
                     (errmsg("smol: internal page add failed during build (bytes)")));

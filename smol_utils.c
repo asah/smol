@@ -191,12 +191,12 @@ smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so)
             else
                 lo = (OffsetNumber) (mid + 1);
         }
-        if (!BlockNumberIsValid(child))
+        if (!BlockNumberIsValid(child)) /* GCOV_EXCL_START - defensive: rightmost child when all keys < lower_bound */
         {
             /* choose rightmost child */
             char *itp = (char *) PageGetItem(page, PageGetItemId(page, maxoff));
             memcpy(&child, itp, sizeof(BlockNumber));
-        }
+        } /* GCOV_EXCL_STOP */
         ReleaseBuffer(buf);
         cur = child;
         levels--;

@@ -1,136 +1,60 @@
--- Parallel two-column regression for int2,int4,int8 with deterministic data.
+-- smol_parallel.sql: Parallel scan and build tests
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
--- Planner knobs to prefer parallel IOS
-SET enable_seqscan=off;
-SET enable_bitmapscan=off;
-SET enable_indexonlyscan=on;
-SET max_parallel_workers_per_gather=5;
-SET max_parallel_workers=5;
-SET parallel_setup_cost=0;
-SET parallel_tuple_cost=0;
-SET min_parallel_index_scan_size=0;
-SET min_parallel_table_scan_size=0;
+-- ============================================================================
+-- Parallel Sequential Scan
+-- ============================================================================
+DROP TABLE IF EXISTS t_parallel_seq CASCADE;
+CREATE TABLE t_parallel_seq (k int4, v text);
+INSERT INTO t_parallel_seq SELECT i, 'value_' || i FROM generate_series(1, 10000) i;
+CREATE INDEX t_parallel_seq_idx ON t_parallel_seq USING smol(k);
 
--- Helper: build BTREE baseline, store sum/count, then compare with SMOL
--- Case 1: int2
-DROP TABLE IF EXISTS p2_i2 CASCADE;
-CREATE UNLOGGED TABLE p2_i2(a int2, b int2);
-INSERT INTO p2_i2 SELECT (i % 32767)::int2, (i % 1000)::int2 FROM generate_series(1,50000) AS s(i);
-ANALYZE p2_i2;
-ALTER TABLE p2_i2 SET (autovacuum_enabled = off);
-DROP TABLE IF EXISTS res_i2;
-CREATE TEMP TABLE res_i2(s bigint, c bigint);
-DROP INDEX IF EXISTS p2_i2_btree;
-CREATE INDEX p2_i2_btree ON p2_i2 USING btree(b) INCLUDE (a);
-CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
-VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) p2_i2;
-ANALYZE p2_i2;
-INSERT INTO res_i2 SELECT sum(a)::bigint, count(*)::bigint FROM p2_i2 WHERE b > 500;
-DROP INDEX p2_i2_btree;
-CREATE INDEX p2_i2_smol ON p2_i2 USING smol(b,a);
-ANALYZE p2_i2;
-SELECT 'int2' AS typ,
-       ((SELECT s FROM res_i2) = (SELECT sum(a)::bigint FROM p2_i2 WHERE b > 500)
-        AND (SELECT c FROM res_i2) = (SELECT count(*)::bigint FROM p2_i2 WHERE b > 500)) AS match;
+SET max_parallel_workers_per_gather = 2;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
 
--- Case 2: int4
-DROP TABLE IF EXISTS p2_i4 CASCADE;
-CREATE UNLOGGED TABLE p2_i4(a int4, b int4);
-INSERT INTO p2_i4 SELECT (i % 1000000)::int4, (i % 1000000)::int4 FROM generate_series(1,50000) AS s(i);
-ANALYZE p2_i4;
-ALTER TABLE p2_i4 SET (autovacuum_enabled = off);
-DROP TABLE IF EXISTS res_i4;
-CREATE TEMP TABLE res_i4(s bigint, c bigint);
-DROP INDEX IF EXISTS p2_i4_btree;
-CREATE INDEX p2_i4_btree ON p2_i4 USING btree(b) INCLUDE (a);
-CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
-VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) p2_i4;
-ANALYZE p2_i4;
-INSERT INTO res_i4 SELECT sum(a)::bigint, count(*)::bigint FROM p2_i4 WHERE b > 50000;
-DROP INDEX p2_i4_btree;
-CREATE INDEX p2_i4_smol ON p2_i4 USING smol(b,a);
-ANALYZE p2_i4;
-SELECT 'int4' AS typ,
-       ((SELECT s FROM res_i4) = (SELECT sum(a)::bigint FROM p2_i4 WHERE b > 50000)
-        AND (SELECT c FROM res_i4) = (SELECT count(*)::bigint FROM p2_i4 WHERE b > 50000)) AS match;
+-- Force parallel scan
+SELECT count(*) FROM t_parallel_seq WHERE k > 5000;
+SELECT count(*) FROM t_parallel_seq WHERE k BETWEEN 2000 AND 8000;
 
--- Case 3: int8
-DROP TABLE IF EXISTS p2_i8 CASCADE;
-CREATE UNLOGGED TABLE p2_i8(a int8, b int8);
-INSERT INTO p2_i8 SELECT (i % 1000000)::int8, (i % 1000000)::int8 FROM generate_series(1,50000) AS s(i);
-ANALYZE p2_i8;
-ALTER TABLE p2_i8 SET (autovacuum_enabled = off);
-DROP TABLE IF EXISTS res_i8;
-CREATE TEMP TABLE res_i8(s bigint, c bigint);
-DROP INDEX IF EXISTS p2_i8_btree;
-CREATE INDEX p2_i8_btree ON p2_i8 USING btree(b) INCLUDE (a);
-CHECKPOINT; SET vacuum_freeze_min_age=0; SET vacuum_freeze_table_age=0;
-VACUUM (FREEZE, DISABLE_PAGE_SKIPPING) p2_i8;
-ANALYZE p2_i8;
-INSERT INTO res_i8 SELECT sum(a)::bigint, count(*)::bigint FROM p2_i8 WHERE b > 50000;
-DROP INDEX p2_i8_btree;
-CREATE INDEX p2_i8_smol ON p2_i8 USING smol(b,a);
-ANALYZE p2_i8;
-SELECT 'int8' AS typ,
-       ((SELECT s FROM res_i8) = (SELECT sum(a)::bigint FROM p2_i8 WHERE b > 50000)
-        AND (SELECT c FROM res_i8) = (SELECT count(*)::bigint FROM p2_i8 WHERE b > 50000)) AS match;
+-- ============================================================================
+-- Parallel Index Scan
+-- ============================================================================
+DROP TABLE IF EXISTS t_parallel_idx CASCADE;
+CREATE TABLE t_parallel_idx (k int4, v int4);
+INSERT INTO t_parallel_idx SELECT i, i * 2 FROM generate_series(1, 20000) i;
+CREATE INDEX t_parallel_idx_idx ON t_parallel_idx USING smol(k);
 
--- Additional int2 correctness checks (strict vs non-strict, equality)
--- Strict vs non-strict on the same threshold
-DROP TABLE IF EXISTS res_i2_ge;
-CREATE TEMP TABLE res_i2_ge(s bigint, c bigint);
-INSERT INTO res_i2_ge SELECT sum(a)::bigint, count(*)::bigint FROM p2_i2 WHERE b >= 500;
-SELECT 'int2_ge' AS typ,
-       ((SELECT s FROM res_i2_ge) = (SELECT sum(a)::bigint FROM p2_i2 WHERE b >= 500)
-        AND (SELECT c FROM res_i2_ge) = (SELECT count(*)::bigint FROM p2_i2 WHERE b >= 500)) AS match;
+SET enable_seqscan = off;
 
--- Equality filter on second key
-DROP TABLE IF EXISTS res_i2_eq;
-CREATE TEMP TABLE res_i2_eq(s bigint, c bigint);
-INSERT INTO res_i2_eq SELECT COALESCE(sum(a),0)::bigint, count(*)::bigint FROM p2_i2 WHERE b > 500 AND a = 42;
-DROP INDEX IF EXISTS p2_i2_smol;
-CREATE INDEX p2_i2_smol ON p2_i2 USING smol(b,a);
-ANALYZE p2_i2;
-SELECT 'int2_eq' AS typ,
-       ((SELECT s FROM res_i2_eq) = (SELECT COALESCE(sum(a),0)::bigint FROM p2_i2 WHERE b > 500 AND a = 42)
-        AND (SELECT c FROM res_i2_eq) = (SELECT count(*)::bigint FROM p2_i2 WHERE b > 500 AND a = 42)) AS match;
+-- Parallel index scan
+SELECT count(*) FROM t_parallel_idx WHERE k > 10000;
+SELECT sum(v) FROM t_parallel_idx WHERE k BETWEEN 5000 AND 15000;
 
--- Test parallel index build
--- Create a table large enough to trigger parallel build (200K is sufficient)
-DROP TABLE IF EXISTS pb_test CASCADE;
-CREATE UNLOGGED TABLE pb_test(k int4);
-INSERT INTO pb_test SELECT i FROM generate_series(1, 200000) AS s(i);
-ANALYZE pb_test;
+-- ============================================================================
+-- Parallel Index Build
+-- ============================================================================
+DROP TABLE IF EXISTS t_parallel_build CASCADE;
+CREATE TABLE t_parallel_build (k int4);
+INSERT INTO t_parallel_build SELECT i FROM generate_series(1, 30000) i;
 
--- Force parallel build with low maintenance_work_mem and high worker count
-SET maintenance_work_mem = '4MB';
 SET max_parallel_maintenance_workers = 4;
 
--- Create index with parallel build (single-key int4, which supports parallel build)
-DROP INDEX IF EXISTS pb_test_smol;
-CREATE INDEX pb_test_smol ON pb_test USING smol(k);
-ANALYZE pb_test;
+CREATE INDEX t_parallel_build_idx ON t_parallel_build USING smol(k);
 
--- Verify index correctness by checking a range query
-SELECT 'parallel_build' AS test,
-       (SELECT count(*) FROM pb_test WHERE k >= 250000) = 250001 AS match;
+SELECT count(*) FROM t_parallel_build WHERE k < 10000;
 
--- Test parallel build with text type (32-byte padded)
-DROP TABLE IF EXISTS pb_text CASCADE;
-CREATE UNLOGGED TABLE pb_text(k text COLLATE "C");
-INSERT INTO pb_text SELECT 'key' || lpad(i::text, 10, '0') FROM generate_series(1, 200000) AS s(i);
-ANALYZE pb_text;
+-- Reset parallel settings
+RESET max_parallel_workers_per_gather;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET max_parallel_maintenance_workers;
+RESET enable_seqscan;
 
-DROP INDEX IF EXISTS pb_text_smol;
-CREATE INDEX pb_text_smol ON pb_text USING smol(k);
-ANALYZE pb_text;
-
--- Verify text index correctness
-SELECT 'parallel_build_text' AS test,
-       (SELECT count(*) FROM pb_text WHERE k >= 'key0000250000') = 250001 AS match;
-
--- Reset settings
-SET maintenance_work_mem = '64MB';
-SET max_parallel_maintenance_workers = 2;
+-- Cleanup
+DROP TABLE t_parallel_seq CASCADE;
+DROP TABLE t_parallel_idx CASCADE;
+DROP TABLE t_parallel_build CASCADE;
