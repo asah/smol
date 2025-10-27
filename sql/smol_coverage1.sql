@@ -50,7 +50,7 @@ SET min_parallel_index_scan_size = 0;
 
 -- This should trigger parallel index scan paths
 -- (Just check that parallel scan plan is used)
-EXPLAIN SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
+EXPLAIN (COSTS OFF) SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
 
 -- Actually run it to ensure parallel code executes
 SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;

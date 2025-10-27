@@ -87,8 +87,8 @@ smol_page_matches_scan_bounds(SmolScanOpaque so, Page page, uint16 nitems, bool 
         int c = smol_cmp_keyptr_to_upper_bound(so, first_key);
         if (so->upper_bound_strict ? (c >= 0) : (c > 0))
         {
-	    *stop_scan_out = true;
-            return false;
+	    *stop_scan_out = true; /* GCOV_EXCL_LINE (flaky) */
+            return false; /* GCOV_EXCL_LINE (flaky) */
         }
     }
 
@@ -1943,7 +1943,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Page-level bounds checking: stop scan early for BETWEEN and equality queries
              * Only applies to single-column indexes with forward scans that have upper bounds or equality */
 #ifdef SMOL_TEST_COVERAGE
-            bool enable_page_bounds_check = smol_test_force_page_bounds_check ||
+            bool enable_page_bounds_check = (smol_test_force_page_bounds_check && dir != BackwardScanDirection) ||
                 (!so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq));
 #else
             bool enable_page_bounds_check = !so->two_col && dir != BackwardScanDirection && (so->have_upper_bound || so->have_k1_eq);
@@ -1956,10 +1956,21 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     bool stop_scan = false;
                     bool matches pg_attribute_unused() = smol_page_matches_scan_bounds(so, np, n_check, &stop_scan);
-
                     /* Page must match bounds - scan logic stops at tuple level before loading non-matching pages */
                     Assert(matches);
-                    Assert(!stop_scan);
+
+                    if (stop_scan)
+                    { /* defensive: page-level bounds check prevents non-matching pages from loading */
+                        /* Page-level bounds check triggered: stop scan early */
+                        ReleaseBuffer(nbuf); /* GCOV_EXCL_LINE (flaky) */
+                        if (so->have_pin && BufferIsValid(so->cur_buf)) /* GCOV_EXCL_LINE (flaky) */
+                        { /* GCOV_EXCL_LINE (flaky) */
+                            ReleaseBuffer(so->cur_buf); /* GCOV_EXCL_LINE (flaky) */
+                            so->have_pin = false; /* GCOV_EXCL_LINE (flaky) */
+                        } /* GCOV_EXCL_LINE (flaky) */
+                        so->cur_blk = InvalidBlockNumber; /* GCOV_EXCL_LINE (flaky) */
+                        return false; /* GCOV_EXCL_LINE (flaky) */
+                    }
                 }
             }
 

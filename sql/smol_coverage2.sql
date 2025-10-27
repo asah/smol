@@ -527,12 +527,12 @@ CREATE INDEX t_cost_idx ON t_cost USING smol(k);
 
 -- Trigger cost calculation with smol.cost_page != 1.0
 SET smol.cost_page = 1.5;
-EXPLAIN SELECT * FROM t_cost WHERE k > 500;
+EXPLAIN (COSTS OFF) SELECT * FROM t_cost WHERE k > 500;
 
 -- Trigger cost calculation with smol.cost_tup != 1.0
 SET smol.cost_page = 1.0;
 SET smol.cost_tup = 0.8;
-EXPLAIN SELECT * FROM t_cost WHERE k > 500;
+EXPLAIN (COSTS OFF) SELECT * FROM t_cost WHERE k > 500;
 
 -- Reset
 SET smol.cost_page = 1.0;

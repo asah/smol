@@ -1,5 +1,7 @@
 # smol — Simple Memory-Only Lightweight index
 
+[![CI](https://github.com/asah/smol/actions/workflows/ci.yml/badge.svg)](https://github.com/asah/smol/actions/workflows/ci.yml)
+
 SMOL is a read‑only, space‑efficient PostgreSQL index access method optimized for reporting queries on fixed-width columns. Think of SMOL as a space-optimized, read-only variant of BTREE for analytical workloads.
 
 **Disclaimer**: While generally safe (read only!) and has an extensive test suite with 100% code coverage, please consider SMOL as an unsupported research prototype with highly variable performance characteristics, limited observability and other issues that limit its applicability for production use. For the foreseeable future, only self-hosted PostgreSQL deployments only (not AWS RDS/Aurora). The author is very experienced and open to commercialization on very generous terms, please contact to discuss.

@@ -33,7 +33,7 @@ RUN apt update && apt install curl nodejs npm -y \
 RUN npm install -g @anthropic-ai/claude-code
 
 # setup postgres user
-RUN useradd -m -s /bin/bash -d /home/postgres postgres \
+RUN useradd --uid 1001 -m -s /bin/bash -d /home/postgres postgres \
   && mkdir -p /home/postgres/pgdata /var/run/postgresql /usr/local/pgsql \
   && chown -R postgres:postgres /var/run/postgresql /usr/local/pgsql \
   && echo "PATH=$PATH:/usr/local/pgsql/bin" >> /home/postgres/.bashrc \

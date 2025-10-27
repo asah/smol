@@ -44,9 +44,23 @@ REGRESS_OPTS = --load-extension=smol
 EXTRA_CLEAN = *.gcov *.gcda *.gcno *.gcov.* coverage.info coverage_html results/
 
 # Use explicit path inside the Docker image; tests/builds run in Docker
-PG_CONFIG = /usr/local/pgsql/bin/pg_config
+# Allow override via environment variable for CI
+PG_CONFIG ?= /usr/local/pgsql/bin/pg_config
 PGXS := $(shell if [ -x $(PG_CONFIG) ]; then $(PG_CONFIG) --pgxs; fi)
 include $(PGXS)
+
+# Override installcheck to optionally show regression.diffs on failure
+# Set SHOW_DIFFS=1 to enable (useful for CI)
+installcheck-with-diffs:
+	@$(MAKE) installcheck || (exitcode=$$?; \
+		if [ "$(SHOW_DIFFS)" = "1" ] && [ -f regression.diffs ]; then \
+			echo ""; \
+			echo "=================================================="; \
+			echo "  Test failures detected - showing regression.diffs"; \
+			echo "=================================================="; \
+			cat regression.diffs; \
+		fi; \
+		exit $$exitcode)
 
 # Common Docker utilities for building/testing in a clean PG18 toolchain
 .PHONY: dbuild drestart dexec dpsql dcodex psql
@@ -60,6 +74,7 @@ dstart:
 	if docker ps -a | grep smol; then echo "[docker] Killing old instance 'smol'"; docker rm -f smol; fi
 	echo "[docker] Creating docker instance 'smol' from image 'smol'"
 	docker run --init -m 4GB -d -u root --name smol -v "$$PWD":/home/postgres smol sleep infinity
+	docker exec -u root smol chown -R postgres /home/postgres
 	echo "[docker] Container 'smol' is ready. building..."
 	docker exec -u postgres -w /home/postgres smol make build
 	echo "[docker] starting postgresql..."

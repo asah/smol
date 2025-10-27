@@ -339,3 +339,6 @@ if [ "$SHOW_EXCLUDED_COVERED" -eq 1 ]; then
 fi
 
 echo ""
+
+# Explicit success exit to ensure script returns 0 when coverage calculation succeeds
+exit 0

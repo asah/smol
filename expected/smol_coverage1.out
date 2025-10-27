@@ -51,14 +51,14 @@ SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 -- This should trigger parallel index scan paths
 -- (Just check that parallel scan plan is used)
-EXPLAIN SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
-                                                           QUERY PLAN                                                            
----------------------------------------------------------------------------------------------------------------------------------
- Finalize Aggregate  (cost=1633.42..1633.43 rows=1 width=8)
-   ->  Gather  (cost=1633.40..1633.41 rows=4 width=8)
+EXPLAIN (COSTS OFF) SELECT COUNT(*) FROM t_cov_parallel WHERE k > 0;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
          Workers Planned: 4
-         ->  Partial Aggregate  (cost=1633.40..1633.41 rows=1 width=8)
-               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel  (cost=0.00..1570.90 rows=25000 width=0)
+         ->  Partial Aggregate
+               ->  Parallel Index Only Scan using t_cov_parallel_smol on t_cov_parallel
                      Index Cond: (k > 0)
 (6 rows)
 

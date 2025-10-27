@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    name: Tests & Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image with caching
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: smol:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start PostgreSQL container
+        run: make dstart
+
+      - name: Build and test (production)
+        run: |
+          docker exec -u postgres -w /home/postgres smol bash -c "make production"
+
+      - name: Build and test (coverage)
+        run: |
+          docker exec -u postgres -w /home/postgres smol bash -c "make coverage"
+
+      - name: show errors if any
+        run: |
+          docker exec -u postgres -w /home/postgres smol bash -c "./scripts/calc_cov.sh -e -v"
+
