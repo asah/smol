@@ -991,6 +991,24 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         page = BufferGetPage(buf);
                         so->cur_buf = buf; so->have_pin = true;
                     }
+
+                    /* Position-based scan optimization: Find end position */
+                    if (smol_use_position_scan && !so->two_col && !so->need_runtime_key_test &&
+                        dir == ForwardScanDirection && !scan->parallel_scan)
+                    {
+                        smol_find_end_position(idx, so, &so->end_blk, &so->end_off);
+                        so->use_position_scan = BlockNumberIsValid(so->end_blk) ||
+                                                (!so->have_upper_bound);
+                        if (so->use_position_scan)
+                        {
+                            SMOL_LOGF("position scan: start=(%u,%u) end=(%u,%u)",
+                                     so->cur_blk, so->cur_off, so->end_blk, so->end_off);
+                        }
+                    }
+                    else
+                    {
+                        so->use_position_scan = false;
+                    }
                 }
             }
             else
@@ -1507,9 +1525,22 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
 
                 while (so->cur_off <= n)
                 {
+                    /* Position-based scan: check if we've reached end position */
+                    if (so->use_position_scan && BlockNumberIsValid(so->end_blk))
+                    {
+                        if (so->cur_blk > so->end_blk ||
+                            (so->cur_blk == so->end_blk && so->cur_off >= so->end_off))
+                        {
+                            /* Reached end position, stop scan */
+                            if (so->have_pin && BufferIsValid(so->cur_buf)) { ReleaseBuffer(so->cur_buf); so->have_pin=false; }
+                            so->cur_blk = InvalidBlockNumber;
+                            return false;
+                        }
+                    }
+
                     char *keyp = smol_leaf_keyptr_cached(so, page, so->cur_off, so->key_len, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                     /* Check upper bound (for BETWEEN queries) */
-                    if (so->have_upper_bound)
+                    if (so->have_upper_bound && !so->use_position_scan)
                     {
                         int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
                         if (so->upper_bound_strict ? (c >= 0) : (c > 0))

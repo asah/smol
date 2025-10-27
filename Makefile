@@ -22,6 +22,7 @@ endif
 
 # pg_regress tests: Consolidated tests (3 production tests)
 # Consolidates 30 original production tests into 3 files (smol_build merged into smol_core)
+# smol_scan now includes position-based scan optimization tests
 REGRESS_BASE = smol_core smol_scan smol_rle
 
 # Coverage-only tests (3 consolidated tests)

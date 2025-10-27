@@ -1,6 +1,6 @@
 -- smol_scan.sql: Scanning and navigation tests
 -- Consolidates: runtime_keys_coverage, prefetch_boundary, rightmost_descend,
---               parallel, deep_backward_navigation, options_coverage
+--               parallel, deep_backward_navigation, options_coverage, position_scan
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
@@ -219,4 +219,66 @@ CREATE INDEX t_opt_idx ON t_opt USING smol(k) WITH (fillfactor=90);
 \d t_opt
 -- Cleanup
 DROP TABLE t_opt CASCADE;
+
+-- ============================================================================
+-- Position-based scan optimization tests
+-- ============================================================================
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 0;  -- Force single-threaded for position scan
+
+-- Test 1: Position scan with upper bound (activate position scan)
+DROP TABLE IF EXISTS pos_test CASCADE;
+CREATE TABLE pos_test(a int4);
+INSERT INTO pos_test SELECT i FROM generate_series(1, 10000) i;
+CREATE INDEX pos_test_smol ON pos_test USING smol(a);
+ANALYZE pos_test;
+
+SET smol.use_position_scan = on;
+SELECT count(*) FROM pos_test WHERE a BETWEEN 1000 AND 2000;
+
+-- Test 2: Position scan disabled
+SET smol.use_position_scan = off;
+SELECT count(*) FROM pos_test WHERE a BETWEEN 1000 AND 2000;
+
+-- Test 3: Upper bound that spans to next leaf
+DROP TABLE IF EXISTS pos_test_multi CASCADE;
+CREATE TABLE pos_test_multi(a int4);
+INSERT INTO pos_test_multi SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX pos_test_multi_smol ON pos_test_multi USING smol(a);
+ANALYZE pos_test_multi;
+
+SET smol.use_position_scan = on;
+SELECT count(*) FROM pos_test_multi WHERE a >= 50000 AND a < 50100;
+
+-- Test edge case: upper bound at end of leaf
+SELECT count(*) FROM pos_test_multi WHERE a >= 1 AND a <= 99999;
+
+-- Test edge case: scan to very end
+SELECT count(*) FROM pos_test_multi WHERE a >= 99900;
+
+-- Test 4: Position scan with data gaps
+DROP TABLE IF EXISTS pos_test_gap CASCADE;
+CREATE TABLE pos_test_gap(a int4);
+INSERT INTO pos_test_gap SELECT i FROM generate_series(1, 25000) i;
+INSERT INTO pos_test_gap SELECT i FROM generate_series(40000, 65000) i;
+INSERT INTO pos_test_gap SELECT i FROM generate_series(80000, 100000) i;
+CREATE INDEX pos_test_gap_smol ON pos_test_gap USING smol(a);
+ANALYZE pos_test_gap;
+
+SELECT count(*) FROM pos_test_gap WHERE a >= 1 AND a < 26000;
+SELECT count(*) FROM pos_test_gap WHERE a >= 1 AND a < 40000;
+SELECT count(*) FROM pos_test_gap WHERE a >= 40000 AND a < 66000;
+
+-- Cleanup
+DROP TABLE pos_test CASCADE;
+DROP TABLE pos_test_multi CASCADE;
+DROP TABLE pos_test_gap CASCADE;
+
+-- Reset settings
+RESET smol.use_position_scan;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET max_parallel_workers_per_gather;
 

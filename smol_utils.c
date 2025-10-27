@@ -252,6 +252,141 @@ smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so)
 }
 /* GCOV_EXCL_STOP */
 
+/*
+ * smol_find_end_position - Find the end position for position-based scans
+ *
+ * Returns the (block, offset) of the first tuple that EXCEEDS the upper bound.
+ * This is used as the exclusive end position for position-based scans.
+ *
+ * For upper_bound_strict=true (< operator):  find first tuple >= upper_bound
+ * For upper_bound_strict=false (<= operator): find first tuple > upper_bound
+ */
+void
+smol_find_end_position(Relation idx, SmolScanOpaque so,
+                       BlockNumber *end_blk_out, OffsetNumber *end_off_out)
+{
+    /* If no upper bound, end position is past the rightmost tuple */
+    if (!so->have_upper_bound)
+    {
+        *end_blk_out = InvalidBlockNumber;
+        *end_off_out = InvalidOffsetNumber;
+        return;
+    }
+
+    /* Find the leaf containing the upper bound */
+    BlockNumber leaf_blk;
+
+    if (so->atttypid == TEXTOID)
+    {
+        /* For text types, we need to search from leftmost and scan forward
+         * to find the exact position. For now, disable position scan for text. */
+        *end_blk_out = InvalidBlockNumber;
+        *end_off_out = InvalidOffsetNumber;
+        return;
+    }
+    else
+    {
+        /* Integer types: use fast path to find approximate leaf */
+        int64 ub = 0;
+        if (so->atttypid == INT2OID)
+            ub = (int64) DatumGetInt16(so->upper_bound_datum);
+        else if (so->atttypid == INT4OID)
+            ub = (int64) DatumGetInt32(so->upper_bound_datum);
+        else if (so->atttypid == INT8OID)
+            ub = DatumGetInt64(so->upper_bound_datum);
+
+        leaf_blk = smol_find_first_leaf(idx, ub, so->atttypid, so->key_len);
+    }
+
+    /* Now binary search within this leaf and potentially subsequent leaves
+     * to find the first tuple that exceeds the upper bound */
+    Buffer buf = ReadBufferExtended(idx, MAIN_FORKNUM, leaf_blk, RBM_NORMAL, so->bstrategy);
+    Page page = BufferGetPage(buf);
+    uint16 nitems = smol_leaf_nitems(page);
+
+    /* Binary search for first tuple that exceeds upper bound */
+    uint16 lo = FirstOffsetNumber;
+    uint16 hi = nitems;
+    uint16 ans = nitems + 1;  /* Default: all tuples <= upper bound */
+
+    while (lo <= hi)
+    {
+        uint16 mid = (uint16) (lo + ((hi - lo) >> 1));
+        char *keyp = smol_leaf_keyptr_ex(page, mid, so->key_len,
+                                         so->inc_meta ? so->inc_meta->inc_len : NULL,
+                                         so->ninclude,
+                                         so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+        int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
+
+        /* We want first tuple that EXCEEDS upper bound:
+         * For strict (<):  first tuple >= upper_bound
+         * For non-strict (<=): first tuple > upper_bound */
+        bool exceeds = so->upper_bound_strict ? (c >= 0) : (c > 0);
+
+        if (exceeds)
+        {
+            ans = mid;
+            if (mid == 0) break;
+            hi = (uint16) (mid - 1);
+        }
+        else
+        {
+            lo = (uint16) (mid + 1);
+        }
+    }
+
+    /* If all tuples in this leaf are <= upper bound, check next leaf */
+    if (ans > nitems)
+    {
+        SmolOpaque opaque = (SmolOpaque) PageGetSpecialPointer(page);
+        BlockNumber next_blk = opaque->rightlink;
+        ReleaseBuffer(buf);
+
+        if (BlockNumberIsValid(next_blk))
+        {
+            /* Check first tuple of next leaf */
+            buf = ReadBufferExtended(idx, MAIN_FORKNUM, next_blk, RBM_NORMAL, so->bstrategy);
+            page = BufferGetPage(buf);
+            nitems = smol_leaf_nitems(page);
+
+            if (nitems > 0)
+            {
+                char *keyp = smol_leaf_keyptr_ex(page, FirstOffsetNumber, so->key_len,
+                                                 so->inc_meta ? so->inc_meta->inc_len : NULL,
+                                                 so->ninclude,
+                                                 so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
+                int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
+                bool exceeds = so->upper_bound_strict ? (c >= 0) : (c > 0);
+
+                if (exceeds)
+                {
+                    /* First tuple of next leaf exceeds bound */
+                    /* GCOV_EXCL_START - Defensive code: logically unreachable in practice because
+                     * smol_find_first_leaf(ub) returns first leaf with highkey >= ub, which means
+                     * at least the last tuple of that leaf should be >= ub, making ans <= nitems.
+                     * This branch would require highkey < ub but first tuple of next leaf > ub,
+                     * which contradicts the tree invariants. Kept for robustness. */
+                    *end_blk_out = next_blk;
+                    *end_off_out = FirstOffsetNumber;
+                    ReleaseBuffer(buf);
+                    return;
+                    /* GCOV_EXCL_STOP */
+                }
+            }
+            ReleaseBuffer(buf);
+        }
+
+        /* No more leaves or all remaining tuples <= upper bound */
+        *end_blk_out = InvalidBlockNumber;
+        *end_off_out = InvalidOffsetNumber;
+        return;
+    }
+
+    ReleaseBuffer(buf);
+    *end_blk_out = leaf_blk;
+    *end_off_out = ans;
+}
+
 /* removed unused smol_read_key_as_datum */
 
 

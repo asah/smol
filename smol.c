@@ -12,6 +12,7 @@ int smol_parallel_claim_batch = 16;
 int smol_prefetch_depth = 0;
 double smol_rle_uniqueness_threshold = 0.95;
 int smol_key_rle_version = KEY_RLE_AUTO;
+bool smol_use_position_scan = true;
 
 #ifdef SMOL_TEST_COVERAGE
 int smol_test_keylen_inflate = 0;
@@ -60,6 +61,15 @@ _PG_init(void)
                              &smol_profile_log,
                              false,
                              PGC_SUSET,
+                             0,
+                            NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.use_position_scan",
+                             "Use position-based scan optimization",
+                             "When on, SMOL uses two tree searches to find start/end positions and eliminates per-tuple comparisons.",
+                             &smol_use_position_scan,
+                             true,
+                             PGC_USERSET,
                              0,
                             NULL, NULL, NULL);
 

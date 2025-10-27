@@ -103,6 +103,7 @@ extern int smol_parallel_claim_batch;
 extern int smol_prefetch_depth;
 extern double smol_rle_uniqueness_threshold;
 extern int smol_key_rle_version;
+extern bool smol_use_position_scan;
 
 #ifdef SMOL_TEST_COVERAGE
 extern int smol_test_keylen_inflate;
@@ -361,6 +362,10 @@ typedef struct SmolScanOpaqueData
     bool        prev_page_last_run_active;     /* true if previous page's last run continues */
     char        prev_page_last_run_key[16];    /* key from previous page's last run */
     int16       prev_page_last_run_text_klen;  /* text length from previous page's last run */
+    /* Position-based scan optimization (two-search approach) */
+    bool        use_position_scan;      /* true when position-based scan is active */
+    BlockNumber end_blk;                /* end position block number */
+    OffsetNumber end_off;               /* end position offset (exclusive) */
     /* key type flags */
     bool        key_is_text32;  /* true when key type is text/varchar packed to 32B */
     bool        has_varwidth;   /* any varlena field present in tuple (key or includes) */
@@ -697,6 +702,7 @@ extern void smol_link_siblings(Relation idx, BlockNumber prev, BlockNumber cur);
 extern BlockNumber smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_len);
 extern BlockNumber smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so);
 extern BlockNumber smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so);
+extern void smol_find_end_position(Relation idx, SmolScanOpaque so, BlockNumber *end_blk_out, OffsetNumber *end_off_out);
 extern int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, uint16 key_len, bool key_byval, Datum bound);
 extern int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
 extern uint16 smol_leaf_nitems(Page page);
