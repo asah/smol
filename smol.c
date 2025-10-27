@@ -28,6 +28,7 @@ bool smol_test_force_page_bounds_check = false;
 int smol_test_force_parallel_workers = 0;
 int smol_test_max_internal_fanout = 0;
 int smol_test_max_tuples_per_page = 0;
+int smol_test_leaf_offset = 0;
 #endif
 
 /* Sorting globals (used by smol_build.c) */
@@ -137,6 +138,17 @@ _PG_init(void)
                             0, /* default: unlimited */
                             0, /* min */
                             10000, /* max */
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.test_leaf_offset",
+                            "TEST ONLY: Force find_first_leaf to return N blocks earlier",
+                            "For coverage testing: forces scan through multiple leaves (0=disabled)",
+                            &smol_test_leaf_offset,
+                            0, /* default: disabled */
+                            0, /* min */
+                            1000, /* max */
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);

@@ -124,10 +124,16 @@ extern int smol_test_force_parallel_workers;
  */
 extern int smol_test_max_internal_fanout;
 extern int smol_test_max_tuples_per_page;
+/*
+ * Test-only GUC for coverage: force smol_find_first_leaf() to return a leaf
+ * N blocks earlier than optimal. Used to test binary search in subsequent leaves.
+ */
+extern int smol_test_leaf_offset;
 #else
 /* Production builds: test GUCs are constant 0 (dead code elimination) */
 #define smol_test_max_internal_fanout 0
 #define smol_test_max_tuples_per_page 0
+#define smol_test_leaf_offset 0
 #endif
 
 /* ---- Sorting Globals (for build functions) ---- */

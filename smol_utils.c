@@ -152,6 +152,16 @@ smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_l
         levels--;
     }
     SMOL_LOGF("find_first_leaf: leaf=%u for bound=%ld height=%u", cur, (long) lower_bound, meta.height);
+
+#ifdef SMOL_TEST_COVERAGE
+    /* TEST ONLY: Offset the result backwards to force scanning through multiple leaves */
+    if (smol_test_leaf_offset > 0 && cur > (BlockNumber) smol_test_leaf_offset)
+    {
+        cur = cur - (BlockNumber) smol_test_leaf_offset;
+        SMOL_LOGF("TEST: find_first_leaf adjusted by -%d, returning leaf=%u", smol_test_leaf_offset, cur);
+    }
+#endif
+
     return cur;
 }
 

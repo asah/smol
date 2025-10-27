@@ -464,3 +464,33 @@ SET enable_mergejoin = on;
 DROP TABLE t_rescan_inner CASCADE;
 DROP TABLE t_rescan_outer CASCADE;
 
+
+-- ============================================================================
+-- Coverage: smol_scan.c:2041 - binary search "else" branch in new leaf
+-- ============================================================================
+-- This test triggers the previously uncovered line 2041 in smol_scan.c
+-- The line executes during binary search in new leaf pages when keys < bound
+
+-- Create table with enough data for multiple leaf pages
+DROP TABLE IF EXISTS t_line2041 CASCADE;
+CREATE UNLOGGED TABLE t_line2041 AS
+SELECT i AS id, i * 2 AS value
+FROM generate_series(1, 100000) i;
+
+-- Create index with INCLUDE to enable index-only scans
+CREATE INDEX t_line2041_idx ON t_line2041 USING smol(id) INCLUDE (value);
+
+-- Use test GUC to force find_first_leaf to return a leaf 20 blocks earlier
+-- This makes the scan traverse leaves containing keys < 50000
+-- During binary search in those leaves, we probe keys < bound, triggering line 2041
+SET smol.test_leaf_offset = 20;
+SET enable_seqscan = off;
+SET max_parallel_workers_per_gather = 0;
+
+-- Query with bound in the middle - scan will start early and advance through
+-- multiple leaves, binary searching and hitting the "else lo2 = mid2 + 1" branch
+SELECT count(*), sum(value) FROM t_line2041 WHERE id >= 50000;
+
+-- Clean up
+RESET smol.test_leaf_offset;
+DROP TABLE t_line2041;

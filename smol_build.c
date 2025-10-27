@@ -829,6 +829,12 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
 
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
     Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
+
+    /* Track leaf pages for building internal levels */
+    Size nleaves = 0, aleaves = 0;
+    BlockNumber *leaves = NULL;
+    int64 *leaf_highkeys = NULL;
+
     while (i < nkeys)
     {
         Buffer buf = smol_extend(idx);
@@ -994,17 +1000,67 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         UnlockReleaseBuffer(buf);
         smol_link_siblings(idx, prev, cur);
         prev = cur;
+
+        /* Track this leaf and its highkey */
+        if (nleaves == aleaves)
+        {
+            aleaves = (aleaves == 0 ? 64 : aleaves * 2);
+            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber))
+                                      : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
+            leaf_highkeys = (leaf_highkeys == NULL) ? (int64 *) palloc(aleaves * sizeof(int64))
+                                                    : (int64 *) repalloc(leaf_highkeys, aleaves * sizeof(int64));
+        }
+        leaves[nleaves] = cur;
+        leaf_highkeys[nleaves] = keys[i + n_this - 1]; /* Last key on this leaf */
+        nleaves++;
+
         i += n_this;
     }
-    /* set root on meta */
-    mbuf = ReadBuffer(idx, 0);
-    LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
-    mpage = BufferGetPage(mbuf);
-    meta = smol_meta_ptr(mpage);
-    meta->root_blkno = 1; /* leftmost leaf */
-    meta->height = 1;
-    MarkBufferDirty(mbuf);
-    UnlockReleaseBuffer(mbuf);
+
+    /* Build internal levels if we have multiple leaves */
+    if (nleaves == 1)
+    {
+        /* Single leaf: set it as root */
+        mbuf = ReadBuffer(idx, 0);
+        LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+        mpage = BufferGetPage(mbuf);
+        meta = smol_meta_ptr(mpage);
+        meta->root_blkno = 1;
+        meta->height = 1;
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+    }
+    else
+    {
+        /* Multiple leaves: build internal levels */
+        BlockNumber rootblk = InvalidBlockNumber;
+        uint16 levels = 0;
+
+        /* Convert int64 highkeys to bytes for smol_build_internal_levels_bytes */
+        char *highkey_bytes = (char *) palloc(nleaves * key_len);
+        for (Size j = 0; j < nleaves; j++)
+        {
+            if (key_len == 8)
+                memcpy(highkey_bytes + j * 8, &leaf_highkeys[j], 8);
+            else if (key_len == 4)
+            {
+                int32 v = (int32) leaf_highkeys[j];
+                memcpy(highkey_bytes + j * 4, &v, 4);
+            }
+            else
+            {
+                int16 v = (int16) leaf_highkeys[j];
+                memcpy(highkey_bytes + j * 2, &v, 2);
+            }
+        }
+
+        smol_build_internal_levels_bytes(idx, leaves, highkey_bytes, nleaves, key_len, &rootblk, &levels);
+
+        pfree(leaves);
+        pfree(leaf_highkeys);
+        pfree(highkey_bytes);
+    }
+
     pfree(scratch);
 }
 
@@ -1036,6 +1092,12 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
     if (nkeys == 0) return;
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
     Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
+
+    /* Track leaf pages for building internal levels */
+    Size nleaves = 0, aleaves = 0;
+    BlockNumber *leaves = NULL;
+    char *leaf_highkeys = NULL;  /* Text keys stored as raw bytes */
+
     while (i < nkeys)
     {
         Buffer buf = smol_extend(idx);
@@ -1196,17 +1258,49 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         UnlockReleaseBuffer(buf);
         smol_link_siblings(idx, prev, cur);
         prev = cur;
+
+        /* Track this leaf and its highkey */
+        if (nleaves == aleaves)
+        {
+            aleaves = (aleaves == 0 ? 64 : aleaves * 2);
+            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber))
+                                      : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
+            leaf_highkeys = (leaf_highkeys == NULL) ? (char *) palloc(aleaves * key_len)
+                                                    : (char *) repalloc(leaf_highkeys, aleaves * key_len);
+        }
+        leaves[nleaves] = cur;
+        /* Last key on this leaf (text keys are stored as raw bytes) */
+        memcpy(leaf_highkeys + nleaves * key_len, keys32 + (i + n_this - 1) * key_len, key_len);
+        nleaves++;
+
         i += n_this;
     }
-    /* set root on meta */
-    mbuf = ReadBuffer(idx, 0);
-    LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
-    mpage = BufferGetPage(mbuf);
-    meta = smol_meta_ptr(mpage);
-    meta->root_blkno = 1; /* leftmost leaf */
-    meta->height = 1;
-    MarkBufferDirty(mbuf);
-    UnlockReleaseBuffer(mbuf);
+
+    /* Build internal levels if we have multiple leaves */
+    if (nleaves == 1)
+    {
+        /* Single leaf: set it as root */
+        mbuf = ReadBuffer(idx, 0);
+        LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+        mpage = BufferGetPage(mbuf);
+        meta = smol_meta_ptr(mpage);
+        meta->root_blkno = 1;
+        meta->height = 1;
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+    }
+    else
+    {
+        /* Multiple leaves: build internal levels */
+        BlockNumber rootblk = InvalidBlockNumber;
+        uint16 levels = 0;
+
+        smol_build_internal_levels_bytes(idx, leaves, leaf_highkeys, nleaves, key_len, &rootblk, &levels);
+
+        pfree(leaves);
+        pfree(leaf_highkeys);
+    }
+
     pfree(scratch);
 }
 
@@ -1354,7 +1448,7 @@ smol_build_internal_levels_bytes(Relation idx,
                 memcpy(item, &cur_blks[i], sizeof(BlockNumber));
                 memcpy(item + sizeof(BlockNumber), cur_high + ((size_t) i * key_len), key_len);
                 if (PageGetFreeSpace(ipg) < item_sz + sizeof(ItemIdData))
-                    break; /* GCOV_EXCL_LINE - defensive: internal pages sized to prevent this */
+                    break;
                 OffsetNumber off = PageAddItem(ipg, (Item) item, item_sz, InvalidOffsetNumber, false, false);
                 SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
                     (errmsg("smol: internal page add failed during build (bytes)")));
