@@ -60,7 +60,7 @@ FROM smol_inspect('test_uuid_rle_idx');
 -- Query to ensure index works
 SELECT k, count(*) FROM test_uuid_rle WHERE k >= '00000000-0000-0000-0000-000000000005'::uuid GROUP BY k ORDER BY k;
 
--- Test 3: RLE INCLUDE caching - forward scan with INCLUDE (covers line 2764 via forward scan)
+-- Test 3: RLE INCLUDE caching - forward scan with INCLUDE (covers rle_run_inc_cached in INCLUDE scan via forward scan)
 CREATE UNLOGGED TABLE test_rle_inc_cache(k int4, inc1 int4, inc2 int4);
 -- Heavy duplicates to trigger RLE
 INSERT INTO test_rle_inc_cache
@@ -77,7 +77,7 @@ FROM smol_inspect('test_rle_inc_cache_idx');
 -- Large scan to trigger RLE INCLUDE caching
 SELECT k, inc1, inc2, count(*) FROM test_rle_inc_cache WHERE k <= 5 GROUP BY k, inc1, inc2 ORDER BY k, inc1, inc2 LIMIT 20;
 
--- Test 4: Backward scan with INCLUDE to cover line 2764 (rle_run_inc_cached in backward path)
+-- Test 4: Backward scan with INCLUDE to cover rle_run_inc_cached in INCLUDE scan (rle_run_inc_cached in backward path)
 -- Note: Backward scans are rare, but cursors can trigger them
 BEGIN;
 DECLARE c_back_inc SCROLL CURSOR FOR SELECT k, inc1, inc2 FROM test_rle_inc_cache WHERE k <= 3 ORDER BY k;
@@ -100,7 +100,7 @@ SELECT k, inc FROM test_text32_back WHERE k >= 'key010' AND k < 'key050' ORDER B
 SET enable_seqscan = true;
 SET smol.debug_log = false;
 
--- Test 6: Prefetch depth > 1 with break (covers line 3127)
+-- Test 6: Prefetch depth > 1 with break (covers prefetch depth > 1 with break)
 -- Create small index and set prefetch_depth to trigger break when reaching end
 SET smol.prefetch_depth = 3;
 CREATE UNLOGGED TABLE test_prefetch_small(k int4);
@@ -120,17 +120,17 @@ RESET min_parallel_table_scan_size;
 RESET min_parallel_index_scan_size;
 RESET smol.prefetch_depth;
 
--- Test 7: Use v1 RLE format to cover line 2795 (cur_page_format = 2 for SMOL_TAG_KEY_RLE)
+-- Test 7: Use v1 RLE format to cover v1 RLE format detection (cur_page_format=2) (cur_page_format = 2 for SMOL_TAG_KEY_RLE)
 SET smol.key_rle_version = 'v1';
 CREATE UNLOGGED TABLE test_v1_rle(k int4);
 -- Insert duplicates to trigger RLE
 INSERT INTO test_v1_rle SELECT (i % 50)::int4 FROM generate_series(1, 5000) i ORDER BY 1;
 CREATE INDEX test_v1_rle_idx ON test_v1_rle USING smol(k);
--- Scan to trigger format detection at line 2795
+-- Scan to trigger format detection at v1 RLE format detection (cur_page_format=2)
 SELECT count(*) FROM test_v1_rle WHERE k >= 10;
 SET smol.key_rle_version = 'v2';
 
--- Test 8: Trigger smol_leaf_run_bounds_rle_ex with v2 format to cover line 5258
+-- Test 8: Trigger smol_leaf_run_bounds_rle_ex with v2 format to cover smol_leaf_run_bounds_rle_ex with v2 format
 -- Need backward scan on RLE v2 page with cache miss
 -- Force cache invalidation by having multiple runs and scanning in a pattern that causes cache misses
 CREATE UNLOGGED TABLE test_v2_run_bounds(k int4);
@@ -278,7 +278,7 @@ DROP TABLE t_uuid_upper;
 
 -- ============================================================================
 -- PART 4: Bool Type (key_len=1) in RLE Path
--- Tests line 3057 - bool type backward scan in RLE path
+-- Tests bool type backward scan in RLE path - bool type backward scan in RLE path
 -- ============================================================================
 
 -- Bool type in RLE format (many duplicates)
@@ -332,7 +332,7 @@ CLOSE c1;
 COMMIT;
 
 -- ============================================================================
--- PART 2: Defensive Rescan Call (line 1327)
+-- PART 2: Defensive Rescan Call (defensive rescan call)
 -- ============================================================================
 
 -- This should be very hard to trigger naturally, but we can try
@@ -340,7 +340,7 @@ COMMIT;
 -- Typically covered by PostgreSQL's executor, but edge case exists
 
 -- ============================================================================
--- PART 3: Parallel Scan with Different Lower Bound Types (line 1531, 2075, 2077)
+-- PART 3: Parallel Scan with Different Lower Bound Types (parallel scan with different lower bound types)
 -- ============================================================================
 
 SET max_parallel_workers_per_gather = 2;
@@ -381,7 +381,7 @@ CREATE INDEX idx_multipage ON t_multipage USING smol(a);
 SELECT CASE WHEN count(*) BETWEEN 48000 AND 50100 THEN 49000 ELSE count(*) END as count_approx FROM t_multipage WHERE a > 50000;
 
 -- ============================================================================
--- PART 5: Run Boundary Scanning Edge Case (line 1790)
+-- PART 5: Run Boundary Scanning Edge Case (run boundary scanning edge case)
 -- ============================================================================
 
 -- This is the inner loop of run detection that scans backward
@@ -422,7 +422,7 @@ SELECT u FROM t_uuid_back_real ORDER BY u DESC LIMIT 5;
 SELECT u FROM t_uuid_back_real WHERE u > '50000000-0000-0000-0000-000000000000'::uuid ORDER BY u DESC LIMIT 10;
 
 -- ============================================================================
--- PART 7: Text Backward Scan (line 1802 - varlena emission)
+-- PART 7: Text Backward Scan (text backward scan varlena emission)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_text_back_real CASCADE;
@@ -465,7 +465,7 @@ CREATE INDEX idx_upper_back ON t_upper_back USING smol(a);
 SELECT a FROM t_upper_back WHERE a BETWEEN 5000 AND 7000 ORDER BY a DESC LIMIT 10;
 
 -- ============================================================================
--- PART 10: INCLUDE Column Edge Cases (line 1959)
+-- PART 10: INCLUDE Column Edge Cases (INCLUDE column edge cases)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_inc_edge CASCADE;
@@ -477,7 +477,7 @@ CREATE INDEX idx_inc_edge ON t_inc_edge USING smol(a) INCLUDE (b, c);
 SELECT count(*), min(a), max(a), min(b), max(b) FROM t_inc_edge WHERE a BETWEEN 100 AND 200;
 
 -- ============================================================================
--- PART 11: Generic Upper Bound Comparator (line 597)
+-- PART 11: Generic Upper Bound Comparator (generic upper bound comparator)
 -- ============================================================================
 
 -- This is used for non-INT types with upper bounds
@@ -659,7 +659,7 @@ CREATE INDEX t_empty_inspect_idx ON t_empty_inspect USING smol(k);
 -- Empty index should have height=0, triggering lines 6423-6424
 SELECT total_pages, compression_pct FROM smol_inspect('t_empty_inspect_idx');
 
--- Test 7: Parallel build with max_parallel_maintenance_workers=0 (line 6578)
+-- Test 7: Parallel build with max_parallel_maintenance_workers=0 (parallel build with max_parallel_maintenance_workers=0)
 -- Setting to 0 should trigger early return
 SET max_parallel_maintenance_workers = 0;
 DROP TABLE IF EXISTS t_no_parallel CASCADE;
@@ -791,7 +791,7 @@ RESET smol.test_force_parallel_workers;
 -- Verify the index works
 SELECT COUNT(*) FROM t_parallel_build WHERE k BETWEEN 1000 AND 2000;
 
--- Test: request < 1 should be no-op (covers line 6448)
+-- Test: request < 1 should be no-op (index build request < 1 no-op)
 DROP INDEX t_parallel_build_idx;
 SET smol.test_force_parallel_workers = 0;
 CREATE INDEX t_parallel_build_idx ON t_parallel_build USING smol(k);
@@ -994,7 +994,7 @@ SELECT 'key_' || i, i, i * 2
 FROM generate_series(1, 1000) i;
 
 -- Create index with text key and INCLUDE columns
--- This should hit line 4489 in smol_build_text_inc_from_sorted
+-- This should hit text INCLUDE build in smol_build_text_inc_from_sorted in smol_build_text_inc_from_sorted
 CREATE INDEX t_text_inc_guc_idx ON t_text_inc_guc USING smol(k) INCLUDE (i1, i2);
 
 -- Verify it created multiple pages
@@ -1009,7 +1009,7 @@ INSERT INTO t_text_only_guc
 SELECT 'value_' || lpad(i::text, 6, '0')
 FROM generate_series(1, 1000) i;
 
--- This should hit line 5159 in smol_build_text_stream_from_tuplesort
+-- This should hit text stream build in smol_build_text_stream_from_tuplesort in smol_build_text_stream_from_tuplesort
 CREATE INDEX t_text_only_guc_idx ON t_text_only_guc USING smol(k);
 
 -- Verify multiple pages created

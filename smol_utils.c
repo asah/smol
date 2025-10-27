@@ -409,7 +409,7 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
         SMOL_ASSERT_BYVAL_LEN(key_len);
         if (key_len == 1)
         { char v; memcpy(&v, keyp, 1); kd = CharGetDatum(v); }
-        /* key_len == 2 (int2) always uses fast path at line 703-707, never reaches generic comparison */
+        /* key_len == 2 (int2) always uses int2 comparison fast path, never reaches generic comparison */
         else if (key_len == 4)
         { int32 v; memcpy(&v, keyp, 4); kd = Int32GetDatum(v); }
         else if (key_len == 8)

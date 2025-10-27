@@ -15,7 +15,7 @@ DROP TABLE IF EXISTS t_debug CASCADE;
 CREATE UNLOGGED TABLE t_debug (k int4);
 INSERT INTO t_debug SELECT i FROM generate_series(1, 10) i;
 CREATE INDEX t_debug_idx ON t_debug USING smol(k);
--- Test 2: Trigger smol_cmp_keyptr_to_bound with int2 (fast path line 702-705)
+-- Test 2: Trigger smol_cmp_keyptr_to_bound with int2 (fast path varlena key2 validation in smol_build-705)
 DROP TABLE IF EXISTS t_int2_bound CASCADE;
 CREATE UNLOGGED TABLE t_int2_bound (k int2);
 INSERT INTO t_int2_bound SELECT i::int2 FROM generate_series(1, 100) i;
@@ -27,7 +27,7 @@ SELECT count(*) FROM t_int2_bound WHERE k > 50::int2;
     50
 (1 row)
 
--- Test 3: Trigger smol_cmp_keyptr_to_bound generic fallback (line 721)
+-- Test 3: Trigger smol_cmp_keyptr_to_bound generic fallback (generic fallback in bound comparison)
 -- Need a type that isn't int2/int4/int8/text - use "char"
 DROP TABLE IF EXISTS t_char_bound CASCADE;
 CREATE UNLOGGED TABLE t_char_bound (k "char");
@@ -72,7 +72,7 @@ CREATE UNLOGGED TABLE t_multilevel_debug (k int4);
 -- Insert enough data to create multi-level tree
 INSERT INTO t_multilevel_debug SELECT i FROM generate_series(1, 100000) i;
 CREATE INDEX t_multilevel_debug_idx ON t_multilevel_debug USING smol(k);
--- This should trigger smol_log_page_summary at line 1228
+-- This should trigger smol_log_page_summary in smol_log_page_summary
 -- Disable debug log
 SET smol.debug_log = off;
 -- Test 6: Trigger smol_scan.c:90-91 upper bound stop scan path
@@ -172,7 +172,7 @@ SELECT k FROM t_backward_upper WHERE k BETWEEN 100 AND 500 ORDER BY k DESC LIMIT
 
 DROP TABLE t_backward_upper CASCADE;
 -- ============================================================================
--- Test 2: Query with no upper bound and no equality (line 943)
+-- Test 2: Query with no upper bound and no equality (query with no upper bound, no equality)
 -- Need query with ONLY lower bound: k >= N (no upper, no equality)
 -- ============================================================================
 DROP TABLE IF EXISTS t_only_lower CASCADE;
@@ -204,13 +204,13 @@ SELECT k FROM t_only_lower WHERE k > 900 ORDER BY k LIMIT 10;
 
 DROP TABLE t_only_lower CASCADE;
 -- ============================================================================
--- Test 3: Empty page detection (line 947)
+-- Test 3: Empty page detection (empty page detection)
 -- Create scenario where a page might be empty after filtering
 -- This is actually impossible after build, but let's try DELETE
 -- Actually, SMOL is read-only so this can't happen. Mark as defensive.
 -- ============================================================================
 -- ============================================================================
--- Test 4: Zero-copy first key adjustment (line 955)
+-- Test 4: Zero-copy first key adjustment (zero-copy first key adjustment)
 -- Happens when page is zero-copy format and we need first key for bounds check
 -- ============================================================================
 DROP TABLE IF EXISTS t_zerocopy_bounds CASCADE;
@@ -271,7 +271,7 @@ SELECT * FROM t_eq_stop WHERE k = 50001;
 
 DROP TABLE t_eq_stop CASCADE;
 -- ============================================================================
--- Test 6: Two-column attribute 2 equality handling (line 2056)
+-- Test 6: Two-column attribute 2 equality handling (two-column attribute 2 equality handling)
 -- Query with k1 range and k2 = specific value
 -- ============================================================================
 DROP TABLE IF EXISTS t_twocol_attr2_eq CASCADE;
@@ -279,7 +279,7 @@ CREATE UNLOGGED TABLE t_twocol_attr2_eq (k1 int4, k2 int4, v int4);
 INSERT INTO t_twocol_attr2_eq SELECT i, i % 1000, i*10 FROM generate_series(1, 10000) i;
 CREATE INDEX t_twocol_attr2_eq_idx ON t_twocol_attr2_eq USING smol(k1, k2) INCLUDE (v);
 ANALYZE t_twocol_attr2_eq;
--- Query with k1 range and k2 equality (should trigger line 2056)
+-- Query with k1 range and k2 equality (should trigger two-column k2 equality handling)
 SELECT count(*) FROM t_twocol_attr2_eq WHERE k1 >= 1000 AND k2 = 500;
  count 
 -------
@@ -351,7 +351,7 @@ SELECT * FROM t_null_key WHERE k IN (1, NULL, 3);  -- NULL ignored by planner
 
 DROP TABLE t_null_key CASCADE;
 -- ============================================================================
--- Test 9: Zero-copy backward scan keyp adjustment (line 2590)
+-- Test 9: Zero-copy backward scan keyp adjustment (zero-copy backward keyp adjustment)
 -- Backward scan on zero-copy pages
 -- ============================================================================
 DROP TABLE IF EXISTS t_zerocopy_backward CASCADE;
@@ -399,11 +399,11 @@ DROP TABLE t_zerocopy_backward CASCADE;
 DROP TABLE IF EXISTS t_rle_inc_all_sizes CASCADE;
 CREATE UNLOGGED TABLE t_rle_inc_all_sizes (
     k int4,
-    inc1 int2,      -- 2 bytes (line 2701)
-    inc2 int4,      -- 4 bytes (line 2698, already covered)
-    inc3 int8,      -- 8 bytes (line 2699)
-    inc4 uuid,      -- 16 bytes (line 2700)
-    inc5 bool       -- 1 byte (line 2702)
+    inc1 int2,      -- 2 bytes (smol_copy_small for 2-byte INCLUDE)
+    inc2 int4,      -- 4 bytes (smol_copy4 for 4-byte INCLUDE)
+    inc3 int8,      -- 8 bytes (smol_copy8 for 8-byte INCLUDE)
+    inc4 uuid,      -- 16 bytes (smol_copy16 for 16-byte INCLUDE)
+    inc5 bool       -- 1 byte (smol_copy_small for 1-byte INCLUDE)
 );
 -- Insert duplicates to trigger RLE
 INSERT INTO t_rle_inc_all_sizes
@@ -2665,7 +2665,7 @@ EXECUTE runtime_stmt(3000, 4000);
 DEALLOCATE runtime_stmt;
 DROP TABLE t_runtime_filter CASCADE;
 -- ============================================================================
--- Test 14: Parallel scan with controlled fanout (line 3050-3084, 3255-3256)
+-- Test 14: Parallel scan with controlled fanout (parallel scan controlled fanout)
 -- Force parallel scan and ensure it exhausts all pages
 -- ============================================================================
 DROP TABLE IF EXISTS t_parallel_complete CASCADE;
@@ -2690,7 +2690,7 @@ SELECT count(*) FROM t_parallel_complete WHERE k >= 1;
 SET max_parallel_workers_per_gather = 0;
 DROP TABLE t_parallel_complete CASCADE;
 -- ============================================================================
--- Test 15: Parallel two-column scan with zero-copy (line 2303)
+-- Test 15: Parallel two-column scan with zero-copy (parallel two-column zero-copy scan)
 -- Parallel scan on two-column index triggers different code paths
 -- ============================================================================
 DROP TABLE IF EXISTS t_parallel_twocol CASCADE;
@@ -2800,10 +2800,11 @@ SET enable_mergejoin = on;
 DROP TABLE t_rescan_inner CASCADE;
 DROP TABLE t_rescan_outer CASCADE;
 -- ============================================================================
--- Coverage: smol_scan.c:2041 - binary search "else" branch in new leaf
+-- Coverage: Binary search upper-half branch in new leaf navigation
 -- ============================================================================
--- This test triggers the previously uncovered line 2041 in smol_scan.c
--- The line executes during binary search in new leaf pages when keys < bound
+-- This test triggers the "search upper half" path (lo2 = mid2 + 1) in
+-- smol_gettuple's forward scan when binary searching within newly loaded leaves
+-- to find the starting position for keys >= bound
 -- Create table with enough data for multiple leaf pages
 DROP TABLE IF EXISTS t_line2041 CASCADE;
 CREATE UNLOGGED TABLE t_line2041 AS
@@ -2813,7 +2814,7 @@ FROM generate_series(1, 100000) i;
 CREATE INDEX t_line2041_idx ON t_line2041 USING smol(id) INCLUDE (value);
 -- Use test GUC to force find_first_leaf to return a leaf 20 blocks earlier
 -- This makes the scan traverse leaves containing keys < 50000
--- During binary search in those leaves, we probe keys < bound, triggering line 2041
+-- During binary search in those leaves, we probe keys < bound, triggering the upper-half search
 SET smol.test_leaf_offset = 20;
 SET enable_seqscan = off;
 SET max_parallel_workers_per_gather = 0;

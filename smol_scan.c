@@ -1329,8 +1329,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             if (dir == BackwardScanDirection)
             {
                 /* For single-column backward scans:
-                 * - Initial page: cur_off is set at line 2393
-                 * - Subsequent pages: cur_off is set at line 3520 when advancing
+                 * - Initial page: cur_off is set in smol_gettuple backward init
+                 * - Subsequent pages: cur_off is set when advancing to previous leaf
                  * - After processing all items: cur_off becomes 0, which exits the while loop below
                  * DO NOT reset cur_off here, as cur_off=0 is a valid state meaning "finished this page" */
 

@@ -205,6 +205,57 @@ On-disk tuple and (de)serialization
 - Fixed unused function warning for `smol_parallel_sort_worker` (smol_build.c:193-196)
 - Fixed missing function error for `smol_test_run_synthetic` by moving outside `#ifdef` (smol.c:606-623)
 
+## Documentation and Comment Style - CRITICAL ⚠️
+
+**CRITICAL REQUIREMENT**: Comments and identifiers MUST NOT reference things that change under maintenance.
+
+### What to AVOID
+- ❌ Line number references: "see line 1234", "triggers path at line 2041"
+- ❌ File:line references: "smol_scan.c:2041", "smol_build.c:678"
+- ❌ Position-based references that become stale when code changes
+
+### What to USE
+- ✅ Algorithm names: "binary search for first key >= bound", "RLE decompression"
+- ✅ Function names: "smol_gettuple backward init", "smol_find_first_leaf"
+- ✅ Code block purposes: "upper bound early termination", "parallel batch claiming"
+- ✅ Data structure elements: "SmolMeta.height field", "SmolParallelScan.curr"
+- ✅ Code path descriptions: "int2 comparison fast path", "non-index-only scan error"
+
+### Examples
+
+**Bad:**
+```c
+/* See line 2041 for upper half search */
+/* Triggers path at line 1286 (non-IOS error) */
+```
+
+**Good:**
+```c
+/* Binary search upper-half branch in new leaf navigation */
+/* Triggers non-index-only scan error in smol_gettuple */
+```
+
+**Bad (in tests):**
+```sql
+-- Test 5: Trigger line 703-707 (int2 fast path)
+```
+
+**Good (in tests):**
+```sql
+-- Test 5: Trigger int2 comparison fast path in smol_cmp_keyptr_to_bound
+```
+
+### Rationale
+- Line numbers change frequently with refactoring, adding features, or fixing bugs
+- Stale line references create confusion and maintenance burden
+- Descriptive names remain valid regardless of code position
+- Makes code reviews and debugging easier by providing semantic context
+
+### Enforcement
+- All new comments and test descriptions must follow this rule
+- Existing line number references have been refactored (2025-10-27)
+- Code reviews should reject PRs with line number references
+
 Practical guidance
 - If Codex is restarted, this section is the authoritative state snapshot. Read AGENT_PGIDXAM_NOTES.md carefully and confirm what files you have read.
 - Comments were added throughout tricky code paths (compression layout, SIMD prefilter, suite runner, and Makefile targets) to explain intent, invariants, and safety. Keep comments in sync with code as you iterate; avoid change logs in comments (git tracks history).

@@ -228,7 +228,7 @@ CREATE TABLE t_empty_int (k int4);
 CREATE INDEX t_empty_int_idx ON t_empty_int USING smol(k);
 SELECT count(*) FROM t_empty_int;
 
--- Test 2: Empty text table (covers line 3101 in text build path)
+-- Test 2: Empty text table (covers empty table early return in text build in text build path)
 DROP TABLE IF EXISTS t_empty_text CASCADE;
 CREATE TABLE t_empty_text (k text COLLATE "C");
 CREATE INDEX t_empty_text_idx ON t_empty_text USING smol(k);
@@ -240,7 +240,7 @@ CREATE TABLE t_empty_pair (k int4, v int4);
 CREATE INDEX t_empty_pair_idx ON t_empty_pair USING smol(k, v);
 SELECT count(*) FROM t_empty_pair;
 
--- Test 4: Empty table with INCLUDE columns (should cover line 3101)
+-- Test 4: Empty table with INCLUDE columns (should cover empty table early return in text build)
 DROP TABLE IF EXISTS t_empty_inc CASCADE;
 CREATE TABLE t_empty_inc (k int4, v1 int4, v2 text);
 CREATE INDEX t_empty_inc_idx ON t_empty_inc USING smol(k) INCLUDE (v1, v2);
@@ -455,7 +455,7 @@ BEGIN
 
     RAISE NOTICE 'Testing smol_validate() with opclass OID %', test_opclass_oid;
 
-    -- Test 1: Cross-type support procedure (line 2555)
+    -- Test 1: Cross-type support procedure (cross-type support in amcanreturn)
     -- Add a temporary amproc entry with mismatched left/right types
     RAISE NOTICE 'Test 1: Cross-type support procedure';
 
@@ -478,7 +478,7 @@ BEGIN
     -- Clean up
     DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
 
-    -- Test 2: Invalid support function number (line 2566)
+    -- Test 2: Invalid support function number (invalid support function number check)
     RAISE NOTICE 'Test 2: Invalid support function number';
 
     INSERT INTO pg_amproc (oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc)
@@ -494,7 +494,7 @@ BEGIN
     SELECT smol_test_validate(test_opclass_oid) INTO validation_result;
     DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
 
-    -- Test 3: Wrong function signature (line 2575)
+    -- Test 3: Wrong function signature (wrong function signature validation)
     RAISE NOTICE 'Test 3: Wrong function signature';
 
     -- Temporarily replace the real procedure with one with wrong signature
@@ -514,7 +514,7 @@ BEGIN
     DELETE FROM pg_amproc WHERE oid = backup_amproc_row.oid;
     INSERT INTO pg_amproc SELECT (backup_amproc_row).*;
 
-    -- Test 4: Invalid operator strategy number (line 2592)
+    -- Test 4: Invalid operator strategy number (invalid operator strategy check)
     RAISE NOTICE 'Test 4: Invalid operator strategy number';
 
     -- Temporarily replace an operator with one with invalid strategy
@@ -534,7 +534,7 @@ BEGIN
     DELETE FROM pg_amop WHERE oid = backup_amop_row.oid;
     INSERT INTO pg_amop SELECT (backup_amop_row).*;
 
-    -- Test 5: Invalid ORDER BY specification (line 2600)
+    -- Test 5: Invalid ORDER BY specification (invalid ORDER BY spec check)
     RAISE NOTICE 'Test 5: Invalid ORDER BY specification';
 
     -- Get a sort family OID for the test
@@ -561,7 +561,7 @@ BEGIN
         INSERT INTO pg_amop SELECT (backup_amop_row).*;
     END;
 
-    -- Test 6: Wrong operator signature (line 2608)
+    -- Test 6: Wrong operator signature (wrong operator signature check)
     RAISE NOTICE 'Test 6: Wrong operator signature';
 
     -- Temporarily replace a real operator with one with wrong signature
@@ -581,7 +581,7 @@ BEGIN
     DELETE FROM pg_amop WHERE oid = backup_amop_row.oid;
     INSERT INTO pg_amop SELECT (backup_amop_row).*;
 
-    -- Test 7: Missing comparator function (line 2631)
+    -- Test 7: Missing comparator function (missing comparator function check)
     RAISE NOTICE 'Test 7: Missing comparator function';
 
     -- Temporarily remove the comparator function
@@ -651,7 +651,7 @@ CREATE OPERATOR CLASS smol_multitype_int4_ops
 -- Get the OID and validate
 -- This will loop through both int4 and int8 support procs
 -- The int8 proc will have amproclefttype = int8oid != opcintype (int4oid)
--- This triggers the "continue" at line 388
+-- This triggers the "continue" at continue on unsupported INCLUDE type
 SELECT smol_test_validate(oid) FROM pg_opclass WHERE opcname = 'smol_multitype_int4_ops';
 
 -- Cleanup
@@ -690,9 +690,9 @@ CREATE EXTENSION IF NOT EXISTS smol;
 -- Test build path edge cases
 
 -- ============================================================================
--- Test 1: Empty index (line 3099: nkeys == 0 early return)
+-- Test 1: Empty index (empty index nkeys==0 early return)
 -- Create empty index with INCLUDE columns to trigger smol_build_tree1_inc_from_sorted
--- Also test text variant for line 3310
+-- Also test text variant for text variant empty check
 -- ============================================================================
 DROP TABLE IF EXISTS t_empty_build CASCADE;
 CREATE UNLOGGED TABLE t_empty_build (k int4, v int4, t text);
@@ -746,7 +746,7 @@ DROP TABLE t_wide_tree CASCADE;
 -- smol_growth
 -- ============================================================================
 
--- Test growth beyond threshold (line 4397 - linear growth path)
+-- Test growth beyond threshold (linear growth beyond threshold in amcostestimate)
 -- Uses smol.growth_threshold_test to reduce the threshold for testing
 
 -- Set threshold to 16384 (16K) instead of 8M for testing
@@ -758,7 +758,7 @@ DROP TABLE IF EXISTS t_growth CASCADE;
 CREATE UNLOGGED TABLE t_growth (k int4, v int4);
 INSERT INTO t_growth SELECT i, i*2 FROM generate_series(1, 20000) i;
 
--- Create SMOL index (should trigger line 4397 during collection/growth)
+-- Create SMOL index (should trigger linear growth in cost estimate during collection/growth)
 CREATE INDEX idx_growth ON t_growth USING smol(k) INCLUDE (v);
 
 -- Verify index works

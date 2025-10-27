@@ -96,8 +96,8 @@ SET enable_indexonlyscan = on;
 -- Set prefetch depth high to ensure we try to prefetch beyond end
 SET smol.prefetch_depth = 8;
 -- Do an unbounded forward scan that will trigger aggressive prefetching
--- The prefetch logic at line 3601-3608 will try to prefetch beyond the index boundary
--- This should hit the break at line 3607 when pb >= nblocks
+-- The prefetch logic at prefetch logic near index boundary will try to prefetch beyond the index boundary
+-- This should hit the break at prefetch break when pb >= nblocks when pb >= nblocks
 SELECT count(*) FROM t_prefetch_boundary WHERE k >= 1;
  count 
 -------

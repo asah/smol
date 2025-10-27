@@ -12,7 +12,7 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS smol;
 
 -- ============================================================================
--- Test 1: int32 (4-byte) key Include-RLE (line 3169: else if key_len == 4)
+-- Test 1: int32 (4-byte) key Include-RLE (int32 4-byte key serialization in Include-RLE)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_rle_int4 CASCADE;
@@ -33,7 +33,7 @@ SELECT count(*), sum(v1::int8) FROM t_rle_int4 WHERE k >= 50;
 SELECT k, v1, v2 FROM t_rle_int4 WHERE k = 10 LIMIT 5;
 
 -- ============================================================================
--- Test 2: int16 (2-byte) key Include-RLE (line 3172: else { int16 v = ... })
+-- Test 2: int16 (2-byte) key Include-RLE (int16 2-byte key serialization in Include-RLE)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_rle_int2 CASCADE;
@@ -88,12 +88,12 @@ FROM generate_series(1, 10000) i;
 
 CREATE INDEX t_rle_text_inc_smol ON t_rle_text_inc USING smol(k) INCLUDE (v1, v2);
 
--- Query to access text RLE (line 3381: memcpy(p, k0, key_len))
+-- Query to access text RLE (text RLE key copy in build)
 SELECT count(*), sum(v1::int8) FROM t_rle_text_inc WHERE k >= 'textkey0050';
 SELECT k, v1 FROM t_rle_text_inc WHERE k = 'textkey0010' LIMIT 3;
 
 -- ============================================================================
--- Test 5: Text RLE fall back to zero-copy (line 3345)
+-- Test 5: Text RLE fall back to zero-copy (text RLE fallback to zero-copy)
 -- Create text data where RLE doesn't help (all unique keys)
 -- ============================================================================
 
@@ -111,7 +111,7 @@ CREATE INDEX t_text_zerocopy_smol ON t_text_zerocopy USING smol(k) INCLUDE (v);
 SELECT count(*) FROM t_text_zerocopy WHERE k >= 'unique00001000';
 
 -- ============================================================================
--- Test 6: Multi-page text+include build (line 3422 - link previous page)
+-- Test 6: Multi-page text+include build (multi-page text+include rightlink)
 -- ============================================================================
 
 DROP TABLE IF EXISTS t_text_multipage CASCADE;
@@ -405,7 +405,7 @@ SELECT (SELECT sum(a1)::bigint FROM inc1 WHERE b > 50000) = :'bt_sum1' AS sum1_m
        (SELECT sum(a2)::bigint FROM inc1 WHERE b > 50000) = :'bt_sum2' AS sum2_match,
        (SELECT count(*)::bigint FROM inc1 WHERE b > 50000) = :'bt_cnt'  AS cnt_match;
 
--- Test bool INCLUDE (1-byte byval) - triggers case 1 at line 4436
+-- Test bool INCLUDE (1-byte byval) - triggers case 1 at bool 1-byte INCLUDE in smol_emit_single_tuple
 DROP TABLE IF EXISTS inc_bool CASCADE;
 CREATE UNLOGGED TABLE inc_bool(k int4, b bool);
 INSERT INTO inc_bool SELECT i, (i % 2 = 0) FROM generate_series(1, 1000) i;
@@ -419,7 +419,7 @@ ANALYZE inc_bool;
 SELECT count(*) FROM inc_bool WHERE k > 500;
 SELECT count(*) FILTER (WHERE b) AS true_count FROM inc_bool WHERE k > 0;
 
--- Test int2 INCLUDE (2-byte byval) with TEXT key - triggers line 4364 in smol_emit_single_tuple (RLE path)
+-- Test int2 INCLUDE (2-byte byval) with TEXT key - triggers int2 INCLUDE in RLE emit path in smol_emit_single_tuple (RLE path)
 DROP TABLE IF EXISTS inc_int2_text CASCADE;
 CREATE UNLOGGED TABLE inc_int2_text(k text COLLATE "C", v int2);
 -- Create duplicates to trigger RLE encoding
@@ -437,7 +437,7 @@ SET enable_seqscan=off; SET enable_indexscan=off; SET enable_bitmapscan=off;
 SELECT count(*) FROM inc_int2_text WHERE k >= 'key_050';
 SELECT sum(v::int8) FROM inc_int2_text WHERE k < 'key_010';
 
--- Test int8 INCLUDE (8-byte byval) with TEXT key - triggers line 4366 in smol_emit_single_tuple (RLE path)
+-- Test int8 INCLUDE (8-byte byval) with TEXT key - triggers int8 INCLUDE in RLE emit path in smol_emit_single_tuple (RLE path)
 DROP TABLE IF EXISTS inc_int8_text CASCADE;
 CREATE UNLOGGED TABLE inc_int8_text(k text COLLATE "C", v int8);
 -- Create duplicates to trigger RLE encoding
@@ -478,7 +478,7 @@ SELECT count(*), sum(v::int8) FROM inc_text32_unique WHERE k >= 'unique_00000005
 -- Need int8/uuid keys with text INCLUDE to trigger varwidth tuple building
 -- ============================================================================
 
--- Test int8 key + text INCLUDE (line 4375: key_len==8)
+-- Test int8 key + text INCLUDE (int8 key with text INCLUDE)
 DROP TABLE IF EXISTS inc_int8key_text CASCADE;
 CREATE UNLOGGED TABLE inc_int8key_text(k int8, t text COLLATE "C");
 INSERT INTO inc_int8key_text SELECT i::int8, 'text_' || i::text FROM generate_series(1, 1000) i;
@@ -492,7 +492,7 @@ ANALYZE inc_int8key_text;
 
 SELECT count(*), sum(k) FROM inc_int8key_text WHERE k >= 500::int8;
 
--- Test uuid key + text INCLUDE (line 4376: key_len==16)
+-- Test uuid key + text INCLUDE (uuid 16-byte key with text INCLUDE)
 DROP TABLE IF EXISTS inc_uuid_text CASCADE;
 CREATE UNLOGGED TABLE inc_uuid_text(k uuid, t text COLLATE "C");
 INSERT INTO inc_uuid_text SELECT md5(i::text)::uuid, 'data_' || i::text FROM generate_series(1, 1000) i;
@@ -506,7 +506,7 @@ ANALYZE inc_uuid_text;
 
 SELECT count(*) FROM inc_uuid_text WHERE k > '00000000-0000-0000-0000-000000000000'::uuid;
 
--- Test date key + text INCLUDE (line 4377: uncommon key_len)
+-- Test date key + text INCLUDE (uncommon key_len with text INCLUDE)
 -- Note: Changed from interval to date to avoid non-deterministic behavior
 DROP TABLE IF EXISTS inc_date_text CASCADE;
 CREATE UNLOGGED TABLE inc_date_text(k date, t text COLLATE "C");
@@ -545,7 +545,7 @@ SELECT count(*) FROM inc_char5_text WHERE k >= '0'::char;
 -- smol_include_rle_mismatch
 -- ============================================================================
 
--- Test Include-RLE run comparison mismatch (line 3457)
+-- Test Include-RLE run comparison mismatch (Include-RLE run comparison mismatch)
 
 DROP TABLE IF EXISTS t_rle_mismatch CASCADE;
 CREATE UNLOGGED TABLE t_rle_mismatch (k text, v int4);
@@ -566,7 +566,7 @@ SELECT * FROM t_rle_mismatch WHERE k = 'key1' ORDER BY v;
 
 DROP TABLE t_rle_mismatch CASCADE;
 
--- Test multi-column include with RLE run break on second column (line 3457)
+-- Test multi-column include with RLE run break on second column (Include-RLE run comparison mismatch)
 -- This specifically targets the inner loop that checks include value mismatches
 -- Need MANY duplicate keys to trigger Include-RLE format (not RLE format)
 DROP TABLE IF EXISTS t_multi_inc CASCADE;
@@ -575,7 +575,7 @@ CREATE UNLOGGED TABLE t_multi_inc (k text, v1 int4, v2 int4);
 -- Insert rows where:
 -- - Key is same (triggers RLE)
 -- - First include column matches
--- - Second include column differs mid-run (triggers line 3457)
+-- - Second include column differs mid-run (triggers Include-RLE run break on column mismatch)
 -- The RLE algorithm compares row 0 with rows 1, 2, 3...
 -- To ensure Include-RLE format is used, need many duplicates
 INSERT INTO t_multi_inc
@@ -639,7 +639,7 @@ CREATE INDEX t_bool_single_smol ON t_bool_single USING smol(k, v);
 SELECT k, count(*) FROM t_bool_single GROUP BY k ORDER BY k;
 
 -- ============================================================================
--- Test 3: Linear growth path for pair builder (line 4137)
+-- Test 3: Linear growth path for pair builder (linear growth for pair builder)
 -- Need to trigger growth beyond 8M entries threshold
 -- Use GUC to lower threshold for testing
 -- ============================================================================
@@ -664,7 +664,7 @@ SELECT count(*) FROM t_large_growth WHERE k >= 2500;
 SET smol.growth_threshold_test = 0;
 
 -- ============================================================================
--- Test 4: Progress logging (line 4168)
+-- Test 4: Progress logging (progress logging in build)
 -- Simplified to avoid non-deterministic OIDs and timing in output
 -- ============================================================================
 

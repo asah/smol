@@ -2286,9 +2286,10 @@ smol_test_find_first_leaf_rightmost(PG_FUNCTION_ARGS)
 }
 
 /*
- * smol_test_error_non_ios - Test function to exercise non-IOS error path (line 1286)
+ * smol_test_error_non_ios - Test function to exercise non-index-only scan error
  *
- * Calls smol_gettuple without setting xs_want_itup to trigger the error.
+ * Calls smol_gettuple without setting xs_want_itup to trigger the
+ * "smol supports index-only scans only" error in smol_gettuple.
  */
 PG_FUNCTION_INFO_V1(smol_test_error_non_ios);
 Datum
@@ -2314,9 +2315,10 @@ smol_test_error_non_ios(PG_FUNCTION_ARGS)
 }
 
 /*
- * smol_test_no_movement - Test function to exercise NoMovementScanDirection path (line 1288)
+ * smol_test_no_movement - Test function to exercise NoMovementScanDirection handling
  *
- * Calls smol_gettuple with NoMovementScanDirection to verify it returns false.
+ * Calls smol_gettuple with NoMovementScanDirection to verify the scan direction
+ * check in smol_gettuple returns false immediately.
  */
 PG_FUNCTION_INFO_V1(smol_test_no_movement);
 Datum
