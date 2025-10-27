@@ -15,7 +15,8 @@ sampledata/
 *.d
 
 *.gcov
-regression.*
+regression.diff
+regression.out
 *.gcda
 *.gcno
 
