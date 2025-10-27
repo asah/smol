@@ -920,6 +920,3 @@ This is the SMOL (Space-efficient, Memory-Optimized, Logarithmic) PostgreSQL ext
 *Current Coverage: 100.00% (2626/2626 lines)*
 *Tests: 79/79 passing ✅*
 
-
-
-everything takes 2x even when you double the estimate - why

@@ -20,8 +20,24 @@ smol_meta_read(Relation idx, SmolMeta *out)
     m = smol_meta_ptr(page);
     *out = *m;
     ReleaseBuffer(buf);
-    SMOL_LOGF("meta: magic=0x%x ver=%u nkeyatts=%u len1=%u len2=%u root=%u h=%u",
-              out->magic, out->version, out->nkeyatts, out->key_len1, out->key_len2, out->root_blkno, out->height);
+    SMOL_LOGF("meta: magic=0x%x ver=%u nkeyatts=%u len1=%u len2=%u root=%u h=%u zm=%d bloom=%d",
+              out->magic, out->version, out->nkeyatts, out->key_len1, out->key_len2,
+              out->root_blkno, out->height, out->zone_maps_enabled, out->bloom_enabled);
+}
+
+/*
+ * smol_meta_init_zone_maps - Initialize zone map fields in metapage
+ *
+ * Called after basic metapage fields are set to configure zone maps
+ * based on current GUC settings.
+ */
+void
+smol_meta_init_zone_maps(SmolMeta *meta)
+{
+    meta->zone_maps_enabled = smol_build_zone_maps;
+    meta->bloom_enabled = smol_build_bloom_filters;
+    meta->bloom_nhash = (uint8) smol_bloom_nhash;
+    meta->padding = 0;
 }
 
 void
@@ -557,4 +573,354 @@ smol_rightmost_leaf(Relation idx)
     }
 
     return rightmost_leaf;
+}
+
+/*
+ * ========================================================================
+ * Zone Map Statistics Collection
+ * ========================================================================
+ */
+
+/*
+ * smol_estimate_distinct - Estimate distinct count using run-length encoding
+ *
+ * For sorted data, we count the number of runs (consecutive equal values).
+ * This is exact for sorted data but may underestimate for unsorted data.
+ */
+static uint16
+smol_estimate_distinct(const void *keys, uint32 n, uint16 key_len, Oid typid)
+{
+    uint32 runs = 0;
+
+    if (n == 0)
+        return 0;
+    if (n == 1)
+        return 1;
+
+    /* Count runs by comparing consecutive keys */
+    runs = 1; /* First key starts a run */
+
+    for (uint32 i = 1; i < n; i++)
+    {
+        const char *prev = (const char *)keys + (i - 1) * key_len;
+        const char *curr = (const char *)keys + i * key_len;
+
+        if (memcmp(prev, curr, key_len) != 0)
+            runs++;
+    }
+
+    /* Saturate at UINT16_MAX */
+    if (runs > UINT16_MAX)
+        return UINT16_MAX;
+
+    return (uint16)runs;
+}
+
+/*
+ * smol_collect_leaf_stats - Collect zone map statistics for a leaf page
+ *
+ * Extracts min/max keys, row count, distinct count estimate, and builds
+ * a bloom filter for all keys in the leaf.
+ */
+void
+smol_collect_leaf_stats(SmolLeafStats *stats, const void *keys, uint32 n,
+                        uint16 key_len, Oid typid, BlockNumber blk)
+{
+    stats->blk = blk;
+    stats->row_count = n;
+
+    if (n == 0)
+    {
+        stats->minkey = 0;
+        stats->maxkey = 0;
+        stats->distinct_count = 0;
+        stats->bloom_filter = 0;
+        stats->padding = 0;
+        return;
+    }
+
+    /* Extract min and max keys (assuming sorted data) */
+    const char *first_key = (const char *)keys;
+    const char *last_key = (const char *)keys + (n - 1) * key_len;
+
+    /* Convert to int32 based on type */
+    switch (typid)
+    {
+        case INT2OID:
+            {
+                int16 v;
+                memcpy(&v, first_key, sizeof(int16));
+                stats->minkey = (int32)v;
+                memcpy(&v, last_key, sizeof(int16));
+                stats->maxkey = (int32)v;
+                break;
+            }
+        case INT4OID:
+            memcpy(&stats->minkey, first_key, sizeof(int32));
+            memcpy(&stats->maxkey, last_key, sizeof(int32));
+            break;
+        case INT8OID:
+            {
+                int64 v;
+                memcpy(&v, first_key, sizeof(int64));
+                stats->minkey = (int32)(v >> 32); /* High 32 bits for range check */
+                memcpy(&v, last_key, sizeof(int64));
+                stats->maxkey = (int32)(v >> 32);
+                break;
+            }
+        default:
+            /* For other types, use first 4 bytes as approximation */
+            memcpy(&stats->minkey, first_key, Min(sizeof(int32), key_len));
+            memcpy(&stats->maxkey, last_key, Min(sizeof(int32), key_len));
+            break;
+    }
+
+    /* Estimate distinct count */
+    stats->distinct_count = smol_estimate_distinct(keys, n, key_len, typid);
+
+    /* Build bloom filter if enabled */
+    if (smol_build_bloom_filters && smol_bloom_nhash > 0)
+    {
+        stats->bloom_filter = 0;
+
+        for (uint32 i = 0; i < n; i++)
+        {
+            const char *key = (const char *)keys + i * key_len;
+            Datum d;
+
+            /* Convert key to Datum */
+            switch (typid)
+            {
+                case INT2OID:
+                    {
+                        int16 v;
+                        memcpy(&v, key, sizeof(int16));
+                        d = Int16GetDatum(v);
+                        break;
+                    }
+                case INT4OID:
+                    {
+                        int32 v;
+                        memcpy(&v, key, sizeof(int32));
+                        d = Int32GetDatum(v);
+                        break;
+                    }
+                case INT8OID:
+                    {
+                        int64 v;
+                        memcpy(&v, key, sizeof(int64));
+                        d = Int64GetDatum(v);
+                        break;
+                    }
+                default:
+                    {
+                        int64 v = 0;
+                        memcpy(&v, key, Min(sizeof(int64), key_len));
+                        d = Int64GetDatum(v);
+                        break;
+                    }
+            }
+
+            smol_bloom_add(&stats->bloom_filter, d, typid, smol_bloom_nhash);
+        }
+    }
+    else
+    {
+        stats->bloom_filter = 0;
+    }
+
+    stats->padding = 0;
+}
+
+/*
+ * ========================================================================
+ * Bloom Filter Functions for Zone Maps
+ * ========================================================================
+ *
+ * Simple 64-bit bloom filter using FNV-1a + Murmur3 mixing with double hashing.
+ * For k hash functions, we use: h_i(x) = (h1(x) + i * h2(x)) mod 64
+ */
+
+/*
+ * smol_bloom_hash1 - Primary hash using FNV-1a
+ */
+static uint64
+smol_bloom_hash1(Datum key, Oid typid)
+{
+    uint64 h = UINT64_C(14695981039346656037);  /* FNV offset basis */
+    uint64 val;  /* Union approach to avoid uninitialized warnings */
+
+    /* Convert datum to uint64 for consistent hashing */
+    switch (typid)
+    {
+        case INT2OID:
+            val = (uint64) DatumGetInt16(key);
+            break;
+        case INT4OID:
+            val = (uint64) DatumGetInt32(key);
+            break;
+        case INT8OID:
+            val = (uint64) DatumGetInt64(key);
+            break;
+        default:
+            /* Fallback: hash the datum itself (works for pass-by-value types) */
+            val = (uint64) key;
+            break;
+    }
+
+    /* FNV-1a: h = (h XOR byte) * FNV_prime */
+    for (int i = 0; i < 8; i++)
+    {
+        h ^= (val >> (i * 8)) & 0xFF;
+        h *= UINT64_C(1099511628211);  /* FNV prime */
+    }
+
+    return h;
+}
+
+/*
+ * smol_bloom_hash2 - Secondary hash using Murmur3 finalizer
+ */
+static uint64
+smol_bloom_hash2(Datum key, Oid typid)
+{
+    uint64 h = smol_bloom_hash1(key, typid);
+
+    /* Murmur3 64-bit finalizer for additional mixing */
+    h ^= h >> 33;
+    h *= UINT64_C(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h *= UINT64_C(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+
+    return h;
+}
+
+/*
+ * smol_bloom_add - Add a key to bloom filter
+ *
+ * Uses double hashing: h_i(x) = (h1(x) + i * h2(x)) mod 64
+ */
+void
+smol_bloom_add(uint64 *bloom, Datum key, Oid typid, int nhash)
+{
+    uint64 h1, h2;
+
+    if (nhash <= 0 || nhash > 4)
+        return;  /* Invalid nhash */
+
+    h1 = smol_bloom_hash1(key, typid);
+    h2 = smol_bloom_hash2(key, typid);
+
+    for (int i = 0; i < nhash; i++)
+    {
+        uint64 h = (h1 + (uint64)i * h2) % 64;
+        *bloom |= (UINT64_C(1) << h);
+    }
+}
+
+/*
+ * smol_bloom_test - Test if key might be in bloom filter
+ *
+ * Returns:
+ *   true  = key might be present (or false positive)
+ *   false = key definitely not present
+ */
+bool
+smol_bloom_test(uint64 bloom, Datum key, Oid typid, int nhash)
+{
+    uint64 h1, h2;
+
+    if (bloom == 0)
+        return true;  /* Bloom disabled or empty - assume might match */
+
+    if (nhash <= 0 || nhash > 4)
+        return true;  /* Invalid nhash - assume might match */
+
+    h1 = smol_bloom_hash1(key, typid);
+    h2 = smol_bloom_hash2(key, typid);
+
+    for (int i = 0; i < nhash; i++)
+    {
+        uint64 h = (h1 + (uint64)i * h2) % 64;
+        if ((bloom & (UINT64_C(1) << h)) == 0)
+            return false;  /* Definitely not present */
+    }
+
+    return true;  /* Might be present */
+}
+
+/*
+ * smol_bloom_build_page - Build bloom filter for all keys in a page
+ *
+ * This is a placeholder for now - will be implemented when we integrate
+ * with the build path. For single-column plain pages, we'll scan the
+ * key array and add each key to the bloom filter.
+ */
+uint64
+smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash)
+{
+    uint64 bloom = 0;
+    uint16 nitems;
+    const char *keys;
+    ItemId iid;
+
+    if (nhash <= 0 || nhash > 4)
+        return 0;  /* Invalid nhash */
+
+    /* Get number of items in page */
+    nitems = smol_leaf_nitems(page);
+    if (nitems == 0)
+        return 0;  /* Empty page */
+
+    /* Get pointer to key array (assumes single-column plain page) */
+    iid = PageGetItemId(page, FirstOffsetNumber);
+    keys = (const char *) PageGetItem(page, iid);
+
+    /* Skip the nitems header (uint16) for plain pages */
+    keys += sizeof(uint16);
+
+    /* Add each key to bloom filter */
+    for (uint16 i = 0; i < nitems; i++)
+    {
+        Datum d;
+
+        /* Extract datum based on key type */
+        switch (typid)
+        {
+            case INT2OID:
+                {
+                    int16 v;
+                    memcpy(&v, keys + i * key_len, sizeof(int16));
+                    d = Int16GetDatum(v);
+                    break;
+                }
+            case INT4OID:
+                {
+                    int32 v;
+                    memcpy(&v, keys + i * key_len, sizeof(int32));
+                    d = Int32GetDatum(v);
+                    break;
+                }
+            case INT8OID:
+                {
+                    int64 v;
+                    memcpy(&v, keys + i * key_len, sizeof(int64));
+                    d = Int64GetDatum(v);
+                    break;
+                }
+            default:
+                /* For other types, treat as int64 for now */
+                {
+                    int64 v;
+                    memcpy(&v, keys + i * key_len, Min(sizeof(int64), key_len));
+                    d = Int64GetDatum(v);
+                    break;
+                }
+        }
+
+        smol_bloom_add(&bloom, d, typid, nhash);
+    }
+
+    return bloom;
 }

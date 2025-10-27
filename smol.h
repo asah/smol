@@ -87,7 +87,7 @@ typedef enum
 
 /* Metapage constants */
 #define SMOL_META_MAGIC   0x534D4F4CUL /* 'SMOL' */
-#define SMOL_META_VERSION 1
+#define SMOL_META_VERSION 2  /* v2: zone maps + bloom filters */
 
 /* Parallel build shared memory keys */
 #define PARALLEL_KEY_SMOL_SHARED  1
@@ -104,6 +104,12 @@ extern int smol_prefetch_depth;
 extern double smol_rle_uniqueness_threshold;
 extern int smol_key_rle_version;
 extern bool smol_use_position_scan;
+/* Zone maps + bloom filters GUCs */
+extern bool smol_zone_maps;              /* Enable zone map filtering during scan (default: on) */
+extern bool smol_bloom_filters;          /* Enable bloom filter checks during scan (default: on) */
+extern bool smol_build_zone_maps;        /* Collect zone maps during build (default: on) */
+extern bool smol_build_bloom_filters;    /* Build bloom filters during build (default: on) */
+extern int smol_bloom_nhash;             /* Number of hash functions for bloom (1-4, default: 2) */
 
 #ifdef SMOL_TEST_COVERAGE
 extern int smol_test_keylen_inflate;
@@ -204,6 +210,11 @@ typedef struct SmolMeta
     uint16      height;
     uint16      inc_count;
     uint16      inc_len[16];
+    /* v2 fields: zone maps + bloom filters */
+    bool        zone_maps_enabled;    /* zone maps present in internal nodes */
+    bool        bloom_enabled;        /* bloom filters present */
+    uint8       bloom_nhash;          /* number of hash functions (1-4) */
+    uint8       padding;              /* alignment padding */
 } SmolMeta;
 
 /* Page opaque data */
@@ -219,8 +230,14 @@ typedef SmolPageOpaqueData *SmolOpaque;
 /* Internal node item */
 typedef struct SmolInternalItem
 {
-    int32       highkey;
-    BlockNumber child;
+    int32       highkey;           /* maximum key in subtree (existing) */
+    BlockNumber child;             /* child block pointer (existing) */
+    /* v2 fields: zone map metadata */
+    int32       minkey;            /* minimum key in subtree */
+    uint32      row_count;         /* total rows in subtree */
+    uint16      distinct_count;    /* distinct values (saturates at 65535) */
+    uint16      padding;           /* alignment */
+    uint64      bloom_filter;      /* 64-bit bloom filter (0 = disabled) */
 } SmolInternalItem;
 
 /* Leaf reference during build */
@@ -228,6 +245,18 @@ typedef struct SmolLeafRef
 {
     BlockNumber blk;
 } SmolLeafRef;
+
+/* Leaf statistics for zone map building (v2) */
+typedef struct SmolLeafStats
+{
+    BlockNumber blk;            /* leaf block number */
+    int32       minkey;         /* minimum key in leaf */
+    int32       maxkey;         /* maximum key in leaf (highkey) */
+    uint32      row_count;      /* number of rows in leaf */
+    uint16      distinct_count; /* estimated distinct values (saturates at 65535) */
+    uint16      padding;        /* alignment */
+    uint64      bloom_filter;   /* 64-bit bloom filter for all keys in leaf */
+} SmolLeafStats;
 
 /*
  * SmolIncludeMetadata - Dynamically allocated INCLUDE column metadata
@@ -324,6 +353,11 @@ typedef struct SmolScanOpaqueData
     uint64      prof_bytes;     /* bytes copied into tuples */
     uint64      prof_touched;   /* bytes of key/include touched/emitted (independent of copying) */
     uint64      prof_bsteps;    /* binary-search steps */
+    /* Zone map profiling counters */
+    uint64      prof_subtrees_checked;   /* Total subtrees examined */
+    uint64      prof_subtrees_skipped;   /* Subtrees skipped by zone maps */
+    uint64      prof_bloom_checks;       /* Bloom filter checks performed */
+    uint64      prof_bloom_skips;        /* Subtrees skipped by bloom */
 
     /* two-col per-leaf cache to simplify correct emission */
     int64      *leaf_k1;
@@ -701,6 +735,7 @@ extern void smol_parallelrescan(IndexScanDesc scan);
 
 /* Utility functions (smol_utils.c) */
 extern void smol_meta_read(Relation idx, SmolMeta *out);
+extern void smol_meta_init_zone_maps(SmolMeta *meta);
 extern void smol_mark_heap0_allvisible(Relation heapRel);
 extern Buffer smol_extend(Relation idx);
 extern void smol_init_page(Buffer buf, bool leaf, BlockNumber rightlink);
@@ -715,6 +750,15 @@ extern uint16 smol_leaf_nitems(Page page);
 extern char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc, const uint32 *inc_cumul_offs);
 extern bool smol_key_eq_len(const char *a, const char *b, uint16 len);
 extern BlockNumber smol_rightmost_leaf(Relation idx);
+
+/* Zone map statistics collection (smol_utils.c) */
+extern void smol_collect_leaf_stats(SmolLeafStats *stats, const void *keys, uint32 n,
+                                    uint16 key_len, Oid typid, BlockNumber blk);
+
+/* Bloom filter functions (smol_utils.c) */
+extern void smol_bloom_add(uint64 *bloom, Datum key, Oid typid, int nhash);
+extern bool smol_bloom_test(uint64 bloom, Datum key, Oid typid, int nhash);
+extern uint64 smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash);
 
 /* Parallel build worker entry (must be extern for dynamic loading) */
 extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);

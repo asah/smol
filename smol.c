@@ -14,6 +14,13 @@ double smol_rle_uniqueness_threshold = 0.95;
 int smol_key_rle_version = KEY_RLE_AUTO;
 bool smol_use_position_scan = true;
 
+/* Zone maps + bloom filters GUCs */
+bool smol_zone_maps = true;
+bool smol_bloom_filters = true;
+bool smol_build_zone_maps = true;
+bool smol_build_bloom_filters = true;
+int smol_bloom_nhash = 2;
+
 #ifdef SMOL_TEST_COVERAGE
 int smol_test_keylen_inflate = 0;
 int smol_simulate_atomic_race = 0;
@@ -248,6 +255,51 @@ _PG_init(void)
                             "If nruns/nitems >= this threshold, keys are considered unique",
                             &smol_rle_uniqueness_threshold,
                             0.98, 0.0, 1.0,
+                            PGC_USERSET, 0,
+                            NULL, NULL, NULL);
+
+    /* Zone maps + bloom filters GUCs */
+    DefineCustomBoolVariable("smol.zone_maps",
+                            "Enable zone map filtering during scan",
+                            "When on, SMOL uses min/max statistics to skip subtrees that can't match query predicates.",
+                            &smol_zone_maps,
+                            true,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.bloom_filters",
+                            "Enable bloom filter checks during scan",
+                            "When on, SMOL uses bloom filters to skip subtrees for equality predicates.",
+                            &smol_bloom_filters,
+                            true,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.build_zone_maps",
+                            "Collect zone maps during index build",
+                            "When on, SMOL stores min/max statistics in internal nodes (must be set before CREATE INDEX).",
+                            &smol_build_zone_maps,
+                            true,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.build_bloom_filters",
+                            "Build bloom filters during index build",
+                            "When on, SMOL builds bloom filters for each page (must be set before CREATE INDEX).",
+                            &smol_build_bloom_filters,
+                            true,
+                            PGC_USERSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.bloom_nhash",
+                            "Number of hash functions for bloom filters (1-4)",
+                            "Higher values reduce false positives but increase computation cost.",
+                            &smol_bloom_nhash,
+                            2, 1, 4,
                             PGC_USERSET, 0,
                             NULL, NULL, NULL);
 

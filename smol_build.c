@@ -25,6 +25,7 @@ static void smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, co
 static void smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * const *incs, Size nkeys, uint16 key_len, int inc_count, const uint16 *inc_lens);
 static void smol_build_internal_levels(Relation idx, BlockNumber *leaf_blks, const int64 *leaf_highkeys, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
 static void smol_build_internal_levels_bytes(Relation idx, BlockNumber *leaf_blks, const char *leaf_highkeys, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
+static void smol_build_internal_levels_with_stats(Relation idx, SmolLeafStats *leaf_stats, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
 static void smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len);
 static void smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, bool byval);
 
@@ -403,6 +404,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                     LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
                     SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->inc_count=inc_count;
                     for (int i=0;i<inc_count;i++) { m->inc_len[i]=inc_lens[i]; }
+                    smol_meta_init_zone_maps(m);
                     MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
                 }
                 /* Write leaves in two-key + INCLUDE layout */
@@ -682,7 +684,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             {
                 Buffer mb = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
                 LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
-                SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
+                SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; smol_meta_init_zone_maps(m); MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
             }
             /* Write leaves in generic row-major 2-key layout:
              * payload: [uint16 nrows][row0: k1||k2][row1: k1||k2]...
@@ -788,6 +790,8 @@ smol_buildempty(Relation index)
     {
         meta->inc_len[i] = sizeof(int32); /* Default assumption */
     }
+    /* Initialize zone map fields */
+    smol_meta_init_zone_maps(meta);
     MarkBufferDirty(buf);
     UnlockReleaseBuffer(buf);
 }
@@ -821,6 +825,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
+        smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
     }
@@ -830,10 +835,10 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
     Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
 
-    /* Track leaf pages for building internal levels */
+    /* Track leaf pages for building internal levels (with zone map stats) */
     Size nleaves = 0, aleaves = 0;
-    BlockNumber *leaves = NULL;
-    int64 *leaf_highkeys = NULL;
+    SmolLeafStats *leaf_stats = NULL;
+    Oid typid = TupleDescAttr(idx->rd_att, 0)->atttypid;  /* First key type for zone maps */
 
     while (i < nkeys)
     {
@@ -1001,17 +1006,30 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         smol_link_siblings(idx, prev, cur);
         prev = cur;
 
-        /* Track this leaf and its highkey */
+        /* Track this leaf and collect zone map statistics */
         if (nleaves == aleaves)
         {
             aleaves = (aleaves == 0 ? 64 : aleaves * 2);
-            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber))
-                                      : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
-            leaf_highkeys = (leaf_highkeys == NULL) ? (int64 *) palloc(aleaves * sizeof(int64))
-                                                    : (int64 *) repalloc(leaf_highkeys, aleaves * sizeof(int64));
+            leaf_stats = (leaf_stats == NULL) ? (SmolLeafStats *) palloc(aleaves * sizeof(SmolLeafStats))
+                                              : (SmolLeafStats *) repalloc(leaf_stats, aleaves * sizeof(SmolLeafStats));
         }
-        leaves[nleaves] = cur;
-        leaf_highkeys[nleaves] = keys[i + n_this - 1]; /* Last key on this leaf */
+
+        /* Collect zone map statistics for this leaf */
+        if (smol_build_zone_maps)
+        {
+            smol_collect_leaf_stats(&leaf_stats[nleaves], &keys[i], n_this, key_len, typid, cur);
+        }
+        else
+        {
+            /* Zone maps disabled: fill minimal stats */
+            leaf_stats[nleaves].blk = cur;
+            leaf_stats[nleaves].maxkey = (int32)keys[i + n_this - 1]; /* highkey */
+            leaf_stats[nleaves].minkey = 0;
+            leaf_stats[nleaves].row_count = 0;
+            leaf_stats[nleaves].distinct_count = 0;
+            leaf_stats[nleaves].bloom_filter = 0;
+            leaf_stats[nleaves].padding = 0;
+        }
         nleaves++;
 
         i += n_this;
@@ -1032,33 +1050,13 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
     }
     else
     {
-        /* Multiple leaves: build internal levels */
+        /* Multiple leaves: build internal levels with zone map stats */
         BlockNumber rootblk = InvalidBlockNumber;
         uint16 levels = 0;
 
-        /* Convert int64 highkeys to bytes for smol_build_internal_levels_bytes */
-        char *highkey_bytes = (char *) palloc(nleaves * key_len);
-        for (Size j = 0; j < nleaves; j++)
-        {
-            if (key_len == 8)
-                memcpy(highkey_bytes + j * 8, &leaf_highkeys[j], 8);
-            else if (key_len == 4)
-            {
-                int32 v = (int32) leaf_highkeys[j];
-                memcpy(highkey_bytes + j * 4, &v, 4);
-            }
-            else
-            {
-                int16 v = (int16) leaf_highkeys[j];
-                memcpy(highkey_bytes + j * 2, &v, 2);
-            }
-        }
+        smol_build_internal_levels_with_stats(idx, leaf_stats, nleaves, key_len, &rootblk, &levels);
 
-        smol_build_internal_levels_bytes(idx, leaves, highkey_bytes, nleaves, key_len, &rootblk, &levels);
-
-        pfree(leaves);
-        pfree(leaf_highkeys);
-        pfree(highkey_bytes);
+        pfree(leaf_stats);
     }
 
     pfree(scratch);
@@ -1086,6 +1084,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
+        smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
     }
@@ -1093,10 +1092,10 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
     Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
     Size ninc_bytes = 0; for (int c=0;c<inc_count;c++) ninc_bytes += inc_lens[c];
 
-    /* Track leaf pages for building internal levels */
+    /* Track leaf pages for building internal levels (with zone map stats) */
     Size nleaves = 0, aleaves = 0;
-    BlockNumber *leaves = NULL;
-    char *leaf_highkeys = NULL;  /* Text keys stored as raw bytes */
+    SmolLeafStats *leaf_stats = NULL;
+    Oid typid = TEXTOID;  /* Text key type for zone maps */
 
     while (i < nkeys)
     {
@@ -1259,18 +1258,31 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         smol_link_siblings(idx, prev, cur);
         prev = cur;
 
-        /* Track this leaf and its highkey */
+        /* Track this leaf and collect zone map statistics */
         if (nleaves == aleaves)
         {
             aleaves = (aleaves == 0 ? 64 : aleaves * 2);
-            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber))
-                                      : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
-            leaf_highkeys = (leaf_highkeys == NULL) ? (char *) palloc(aleaves * key_len)
-                                                    : (char *) repalloc(leaf_highkeys, aleaves * key_len);
+            leaf_stats = (leaf_stats == NULL) ? (SmolLeafStats *) palloc(aleaves * sizeof(SmolLeafStats))
+                                              : (SmolLeafStats *) repalloc(leaf_stats, aleaves * sizeof(SmolLeafStats));
         }
-        leaves[nleaves] = cur;
-        /* Last key on this leaf (text keys are stored as raw bytes) */
-        memcpy(leaf_highkeys + nleaves * key_len, keys32 + (i + n_this - 1) * key_len, key_len);
+
+        /* Collect zone map statistics for this leaf */
+        if (smol_build_zone_maps)
+        {
+            smol_collect_leaf_stats(&leaf_stats[nleaves], keys32 + i * key_len, n_this, key_len, typid, cur);
+        }
+        else
+        {
+            /* Zone maps disabled: fill minimal stats */
+            leaf_stats[nleaves].blk = cur;
+            /* For text, store first 4 bytes of last key as maxkey */
+            memcpy(&leaf_stats[nleaves].maxkey, keys32 + (i + n_this - 1) * key_len, Min(sizeof(int32), key_len));
+            leaf_stats[nleaves].minkey = 0;
+            leaf_stats[nleaves].row_count = 0;
+            leaf_stats[nleaves].distinct_count = 0;
+            leaf_stats[nleaves].bloom_filter = 0;
+            leaf_stats[nleaves].padding = 0;
+        }
         nleaves++;
 
         i += n_this;
@@ -1291,14 +1303,13 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
     }
     else
     {
-        /* Multiple leaves: build internal levels */
+        /* Multiple leaves: build internal levels with zone map stats */
         BlockNumber rootblk = InvalidBlockNumber;
         uint16 levels = 0;
 
-        smol_build_internal_levels_bytes(idx, leaves, leaf_highkeys, nleaves, key_len, &rootblk, &levels);
+        smol_build_internal_levels_with_stats(idx, leaf_stats, nleaves, key_len, &rootblk, &levels);
 
-        pfree(leaves);
-        pfree(leaf_highkeys);
+        pfree(leaf_stats);
     }
 
     pfree(scratch);
@@ -1418,7 +1429,167 @@ smol_build_internal_levels(Relation idx,
 } /* GCOV_EXCL_LINE - dead function */
 
 /* Build internal levels using raw key bytes for highkeys (e.g., text32). */
+/*
+ * smol_build_internal_levels_with_stats - Build internal tree levels with zone map metadata
+ *
+ * This version accepts SmolLeafStats and aggregates zone map statistics up the tree.
+ */
 static void
+smol_build_internal_levels_with_stats(Relation idx,
+                                      SmolLeafStats *leaf_stats, Size nleaves,
+                                      uint16 key_len,
+                                      BlockNumber *out_root, uint16 *out_levels)
+{
+    SmolMeta meta;
+    smol_meta_read(idx, &meta);
+    bool zone_maps_enabled = meta.zone_maps_enabled;
+
+    /* Convert leaf stats to current level stats */
+    Size cur_n = nleaves;
+    SmolLeafStats *cur_stats = leaf_stats;
+    uint16 levels = 0;
+
+    while (cur_n > 1)
+    {
+        Size cap_next = (cur_n / 2) + 2;
+        SmolLeafStats *next_stats = (SmolLeafStats *) palloc(cap_next * sizeof(SmolLeafStats));
+        Size next_n = 0;
+        Size i = 0;
+
+        while (i < cur_n)
+        {
+            Buffer ibuf = smol_extend(idx);
+            smol_init_page(ibuf, false, InvalidBlockNumber);
+            Page ipg = BufferGetPage(ibuf);
+            Size item_sz = sizeof(SmolInternalItem);
+            SmolInternalItem *item = (SmolInternalItem *) palloc(item_sz);
+            Size children_added = 0;
+
+            /* Initialize aggregated stats for this internal node */
+            SmolLeafStats aggregated;
+            aggregated.blk = BufferGetBlockNumber(ibuf);
+            aggregated.minkey = INT32_MAX;
+            aggregated.maxkey = INT32_MIN;
+            aggregated.row_count = 0;
+            aggregated.distinct_count = 0;
+            aggregated.bloom_filter = 0;
+            aggregated.padding = 0;
+
+            for (; i < cur_n; i++)
+            {
+                /* Build internal node entry with zone map metadata */
+                item->child = cur_stats[i].blk;
+                item->highkey = cur_stats[i].maxkey;
+
+                if (zone_maps_enabled)
+                {
+                    item->minkey = cur_stats[i].minkey;
+                    item->row_count = cur_stats[i].row_count;
+                    item->distinct_count = cur_stats[i].distinct_count;
+                    item->bloom_filter = cur_stats[i].bloom_filter;
+                    item->padding = 0;
+
+                    /* Aggregate statistics for parent level */
+                    if (cur_stats[i].minkey < aggregated.minkey)
+                        aggregated.minkey = cur_stats[i].minkey;
+                    if (cur_stats[i].maxkey > aggregated.maxkey)
+                        aggregated.maxkey = cur_stats[i].maxkey;
+                    aggregated.row_count += cur_stats[i].row_count;
+                    /* Sum distinct counts, saturate at UINT16_MAX */
+                    if ((uint32)aggregated.distinct_count + (uint32)cur_stats[i].distinct_count > UINT16_MAX)
+                        aggregated.distinct_count = UINT16_MAX;
+                    else
+                        aggregated.distinct_count += cur_stats[i].distinct_count;
+                    /* OR bloom filters together */
+                    aggregated.bloom_filter |= cur_stats[i].bloom_filter;
+                }
+                else
+                {
+                    /* Zone maps disabled: zero out fields */
+                    item->minkey = 0;
+                    item->row_count = 0;
+                    item->distinct_count = 0;
+                    item->bloom_filter = 0;
+                    item->padding = 0;
+                }
+
+                if (PageGetFreeSpace(ipg) < item_sz + sizeof(ItemIdData))
+                    break;
+
+                OffsetNumber off = PageAddItem(ipg, (Item) item, item_sz, InvalidOffsetNumber, false, false);
+                SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
+                    (errmsg("smol: internal page add failed during build (with stats)")));
+                if (off == InvalidOffsetNumber)
+                    break;
+
+                children_added++;
+
+                /* For testing: limit fanout to force tall trees */
+                if (smol_test_max_internal_fanout > 0 && children_added >= (Size) smol_test_max_internal_fanout)
+                {
+                    i++;
+                    break;
+                }
+            }
+
+            MarkBufferDirty(ibuf);
+
+            /* Reallocation check (same as original function) */
+#ifdef SMOL_TEST_COVERAGE
+            if (smol_test_force_realloc_at > 0 && next_n == (Size) smol_test_force_realloc_at && cap_next == (Size) smol_test_force_realloc_at)
+            {
+                cap_next = cap_next * 2;
+                next_stats = (SmolLeafStats *) repalloc(next_stats, cap_next * sizeof(SmolLeafStats));
+            }
+            else
+#endif
+            if (next_n >= cap_next)
+            {
+                cap_next = cap_next * 2;
+                next_stats = (SmolLeafStats *) repalloc(next_stats, cap_next * sizeof(SmolLeafStats));
+            }
+
+            next_stats[next_n] = aggregated;
+            next_n++;
+            UnlockReleaseBuffer(ibuf);
+            pfree(item);
+        }
+
+        /* Link right siblings */
+        for (Size j = 1; j < next_n; j++)
+        {
+            Buffer pb = ReadBuffer(idx, next_stats[j-1].blk);
+            LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE);
+            smol_page_opaque(BufferGetPage(pb))->rightlink = next_stats[j].blk;
+            MarkBufferDirty(pb);
+            UnlockReleaseBuffer(pb);
+        }
+
+        if (levels > 0)
+            pfree(cur_stats);
+
+        cur_stats = next_stats;
+        cur_n = next_n;
+        levels++;
+    }
+
+    /* Set root */
+    {
+        Buffer mb = ReadBuffer(idx, 0);
+        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+        SmolMeta *m = smol_meta_ptr(BufferGetPage(mb));
+        m->root_blkno = cur_stats[0].blk;
+        m->height = (uint16) (levels + 1);
+        MarkBufferDirty(mb);
+        UnlockReleaseBuffer(mb);
+    }
+
+    if (out_root) *out_root = cur_stats[0].blk;
+    if (out_levels) *out_levels = levels;
+    pfree(cur_stats);
+}
+
+static void __attribute__((unused))
 smol_build_internal_levels_bytes(Relation idx,
                                  BlockNumber *child_blks, const char *child_high_bytes,
                                  Size nchildren, uint16 key_len,
@@ -1541,6 +1712,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
     }
@@ -1548,8 +1720,8 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         return;
     BlockNumber prev = InvalidBlockNumber;
     Size nleaves = 0, aleaves = 0;
-    BlockNumber *leaves = NULL;
-    char *leaf_high = NULL; /* bytes array nleaves*key_len */
+    SmolLeafStats *leaf_stats = NULL;
+    Oid typid = TEXTOID;
     char lastkey[32];
     Size remaining = nkeys;
 
@@ -1697,15 +1869,70 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         UnlockReleaseBuffer(buf);
         smol_link_siblings(idx, prev, cur);
         prev = cur;
-        /* record leaf and highkey */
+        /* record leaf statistics */
         if (nleaves == aleaves)
         {
             aleaves = (aleaves == 0 ? 64 : aleaves * 2);
-            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber)) : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
-            leaf_high = (leaf_high == NULL) ? (char *) palloc(aleaves * key_len) : (char *) repalloc(leaf_high, aleaves * key_len);
+            leaf_stats = (leaf_stats == NULL) ? (SmolLeafStats *) palloc(aleaves * sizeof(SmolLeafStats)) : (SmolLeafStats *) repalloc(leaf_stats, aleaves * sizeof(SmolLeafStats));
         }
-        leaves[nleaves] = cur;
-        memcpy(leaf_high + ((size_t) nleaves * key_len), lastkey, key_len);
+        if (smol_build_zone_maps)
+        {
+            /* Collect zone map stats by re-reading the leaf page we just wrote */
+            Buffer rbuf = ReadBuffer(idx, cur);
+            LockBuffer(rbuf, BUFFER_LOCK_SHARE);
+            Page rpage = BufferGetPage(rbuf);
+            OffsetNumber roff = FirstOffsetNumber;
+            ItemId iid = PageGetItemId(rpage, roff);
+            Item item = PageGetItem(rpage, iid);
+            /* Extract keys from the leaf payload for stats collection */
+            uint16 tag = *(uint16 *) item;
+            char *keys_for_stats;
+            Size n_for_stats;
+            if (tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2)
+            {
+                /* Decode RLE to get all keys */
+                char *p = (char *) item;
+                uint16 nitems, nruns;
+                p += sizeof(uint16); /* skip tag */
+                memcpy(&nitems, p, sizeof(uint16)); p += sizeof(uint16);
+                memcpy(&nruns, p, sizeof(uint16)); p += sizeof(uint16);
+                if (tag == SMOL_TAG_KEY_RLE_V2)
+                    p++; /* skip continues_byte */
+                keys_for_stats = (char *) palloc(nitems * key_len);
+                Size pos = 0;
+                for (uint16 r = 0; r < nruns; r++)
+                {
+                    char *run_key = p; p += key_len;
+                    uint16 cnt; memcpy(&cnt, p, sizeof(uint16)); p += sizeof(uint16);
+                    for (uint16 c = 0; c < cnt; c++)
+                        memcpy(keys_for_stats + (pos++ * key_len), run_key, key_len);
+                }
+                n_for_stats = nitems;
+            }
+            else
+            {
+                /* Plain format */
+                char *p = (char *) item;
+                uint16 nitems;
+                memcpy(&nitems, p, sizeof(uint16)); p += sizeof(uint16);
+                keys_for_stats = p;
+                n_for_stats = nitems;
+            }
+            smol_collect_leaf_stats(&leaf_stats[nleaves], keys_for_stats, n_for_stats, key_len, typid, cur);
+            if (tag == SMOL_TAG_KEY_RLE || tag == SMOL_TAG_KEY_RLE_V2)
+                pfree(keys_for_stats);
+            UnlockReleaseBuffer(rbuf);
+        }
+        else
+        {
+            /* Minimal stats when zone maps disabled */
+            leaf_stats[nleaves].blk = cur;
+            memcpy(&leaf_stats[nleaves].maxkey, lastkey, sizeof(int32));
+            leaf_stats[nleaves].minkey = 0;
+            leaf_stats[nleaves].row_count = 0;
+            leaf_stats[nleaves].distinct_count = 0;
+            leaf_stats[nleaves].bloom_filter = 0;
+        }
         nleaves++;
         remaining -= n_this;
     }
@@ -1716,16 +1943,17 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         Buffer mb = ReadBuffer(idx, 0);
         LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
         SmolMeta *m = smol_meta_ptr(BufferGetPage(mb));
-        m->root_blkno = 1;
+        m->root_blkno = leaf_stats[0].blk;
         m->height = 1;
         MarkBufferDirty(mb);
         UnlockReleaseBuffer(mb);
+        pfree(leaf_stats);
     }
     else
     {
         BlockNumber rootblk = InvalidBlockNumber; uint16 levels = 0;
-        smol_build_internal_levels_bytes(idx, leaves, leaf_high, nleaves, key_len, &rootblk, &levels);
-        pfree(leaves); pfree(leaf_high);
+        smol_build_internal_levels_with_stats(idx, leaf_stats, nleaves, key_len, &rootblk, &levels);
+        pfree(leaf_stats);
     }
 }
 
@@ -1748,6 +1976,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
     }
@@ -1755,8 +1984,8 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         return;
     BlockNumber prev = InvalidBlockNumber;
     Size nleaves = 0, aleaves = 0;
-    BlockNumber *leaves = NULL;
-    char *leaf_high = NULL; /* byte array for highkeys */
+    SmolLeafStats *leaf_stats = NULL;
+    Oid typid = TupleDescAttr(idx->rd_att, 0)->atttypid;
     char lastkey[16]; /* buffer for last key (max 16 bytes for UUID) */
     Size remaining = nkeys;
     IndexTuple itup;
@@ -2007,15 +2236,69 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         UnlockReleaseBuffer(buf);
         smol_link_siblings(idx, prev, cur);
         prev = cur;
-        /* record leaf and highkey */
+        /* record leaf statistics */
         if (nleaves == aleaves)
         {
             aleaves = (aleaves == 0 ? 64 : aleaves * 2);
-            leaves = (leaves == NULL) ? (BlockNumber *) palloc(aleaves * sizeof(BlockNumber)) : (BlockNumber *) repalloc(leaves, aleaves * sizeof(BlockNumber));
-            leaf_high = (leaf_high == NULL) ? (char *) palloc(aleaves * key_len) : (char *) repalloc(leaf_high, aleaves * key_len);
+            leaf_stats = (leaf_stats == NULL) ? (SmolLeafStats *) palloc(aleaves * sizeof(SmolLeafStats)) : (SmolLeafStats *) repalloc(leaf_stats, aleaves * sizeof(SmolLeafStats));
         }
-        leaves[nleaves] = cur;
-        memcpy(leaf_high + (nleaves * key_len), lastkey, key_len);
+        if (smol_build_zone_maps)
+        {
+            /* Collect zone map stats by re-reading the leaf page we just wrote */
+            Buffer rbuf = ReadBuffer(idx, cur);
+            LockBuffer(rbuf, BUFFER_LOCK_SHARE);
+            Page rpage = BufferGetPage(rbuf);
+            OffsetNumber roff = FirstOffsetNumber;
+            ItemId iid = PageGetItemId(rpage, roff);
+            Item item = PageGetItem(rpage, iid);
+            /* Extract keys from the leaf payload for stats collection */
+            uint16 tag = *(uint16 *) item;
+            char *keys_for_stats;
+            Size n_for_stats;
+            if (tag == SMOL_TAG_KEY_RLE_V2)
+            {
+                /* Decode RLE V2 to get all keys */
+                char *p = (char *) item;
+                uint16 nitems, nruns;
+                p += sizeof(uint16); /* skip tag */
+                memcpy(&nitems, p, sizeof(uint16)); p += sizeof(uint16);
+                memcpy(&nruns, p, sizeof(uint16)); p += sizeof(uint16);
+                p++; /* skip continues_byte */
+                keys_for_stats = (char *) palloc(nitems * key_len);
+                Size pos = 0;
+                for (uint16 r = 0; r < nruns; r++)
+                {
+                    char *run_key = p; p += key_len;
+                    uint16 cnt; memcpy(&cnt, p, sizeof(uint16)); p += sizeof(uint16);
+                    for (uint16 c = 0; c < cnt; c++)
+                        memcpy(keys_for_stats + (pos++ * key_len), run_key, key_len);
+                }
+                n_for_stats = nitems;
+            }
+            else
+            {
+                /* Plain format */
+                char *p = (char *) item;
+                uint16 nitems;
+                memcpy(&nitems, p, sizeof(uint16)); p += sizeof(uint16);
+                keys_for_stats = p;
+                n_for_stats = nitems;
+            }
+            smol_collect_leaf_stats(&leaf_stats[nleaves], keys_for_stats, n_for_stats, key_len, typid, cur);
+            if (tag == SMOL_TAG_KEY_RLE_V2)
+                pfree(keys_for_stats);
+            UnlockReleaseBuffer(rbuf);
+        }
+        else
+        {
+            /* Minimal stats when zone maps disabled */
+            leaf_stats[nleaves].blk = cur;
+            memcpy(&leaf_stats[nleaves].maxkey, lastkey, sizeof(int32));
+            leaf_stats[nleaves].minkey = 0;
+            leaf_stats[nleaves].row_count = 0;
+            leaf_stats[nleaves].distinct_count = 0;
+            leaf_stats[nleaves].bloom_filter = 0;
+        }
         nleaves++;
         remaining -= n_this;
     }
@@ -2026,18 +2309,17 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         Buffer mb = ReadBuffer(idx, 0);
         LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
         SmolMeta *m = smol_meta_ptr(BufferGetPage(mb));
-        m->root_blkno = leaves[0];
+        m->root_blkno = leaf_stats[0].blk;
         m->height = 1;
         MarkBufferDirty(mb);
         UnlockReleaseBuffer(mb);
-        pfree(leaves);
-        pfree(leaf_high);
+        pfree(leaf_stats);
     }
     else
     {
         BlockNumber rootblk = InvalidBlockNumber; uint16 levels = 0;
-        smol_build_internal_levels_bytes(idx, leaves, leaf_high, nleaves, key_len, &rootblk, &levels);
-        pfree(leaves); pfree(leaf_high);
+        smol_build_internal_levels_with_stats(idx, leaf_stats, nleaves, key_len, &rootblk, &levels);
+        pfree(leaf_stats);
     }
 }
 
