@@ -401,12 +401,14 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         if (smol_debug_log)
         {
             SMOL_LOGF("beginscan layout: key_len=%u two_col=%d ninclude=%u sz=%zu", so->key_len, so->two_col, so->ninclude, (size_t) sz);
-            for (uint16 i=0;i<so->ninclude;i++)
-                SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_meta->inc_len[i], so->inc_meta->inc_align[i], so->inc_meta->inc_offs[i], so->inc_meta->inc_is_text[i]);
+            if (so->ninclude > 0)
+                for (uint16 i=0;i<so->ninclude;i++)
+                    SMOL_LOGF("include[%u]: len=%u align=%c off=%u is_text=%d", i, so->inc_meta->inc_len[i], so->inc_meta->inc_align[i], so->inc_meta->inc_offs[i], so->inc_meta->inc_is_text[i]);
         }
         so->itup = (IndexTuple) palloc0(sz);
         so->has_varwidth = key_is_text;
-        for (uint16 i=0;i<so->ninclude;i++) if (so->inc_meta->inc_is_text[i]) { so->has_varwidth = true; break; }
+        if (so->ninclude > 0)
+            for (uint16 i=0;i<so->ninclude;i++) if (so->inc_meta->inc_is_text[i]) { so->has_varwidth = true; break; }
         so->itup->t_info = (unsigned short) (sz | (so->has_varwidth ? INDEX_VAR_MASK : 0)); /* updated per-row when key varwidth */
         so->itup_data = (char *) so->itup + data_off;
         so->itup_off2 = so->two_col ? (uint16) (off2 - data_off) : 0;
@@ -415,16 +417,19 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         so->copy1_fn = (so->key_len == 2) ? smol_copy2 : (so->key_len == 4) ? smol_copy4 : smol_copy8;
         if (so->two_col)
             so->copy2_fn = (so->key_len2 == 2) ? smol_copy2 : (so->key_len2 == 4) ? smol_copy4 : smol_copy8;
-        for (uint16 i=0;i<so->ninclude;i++)
+        if (so->ninclude > 0)
         {
-            /* Precompute copy function for each INCLUDE column to eliminate hot-path if-else chain */
-            if (so->inc_meta->inc_len[i] == 1) so->inc_meta->inc_copy[i] = smol_copy1;
-            else if (so->inc_meta->inc_len[i] == 2) so->inc_meta->inc_copy[i] = smol_copy2;
-            else if (so->inc_meta->inc_len[i] == 4) so->inc_meta->inc_copy[i] = smol_copy4;
-            else if (so->inc_meta->inc_len[i] == 8) so->inc_meta->inc_copy[i] = smol_copy8;
-            else if (so->inc_meta->inc_len[i] == 16) so->inc_meta->inc_copy[i] = smol_copy16;
-            else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
-                elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]);
+            for (uint16 i=0;i<so->ninclude;i++)
+            {
+                /* Precompute copy function for each INCLUDE column to eliminate hot-path if-else chain */
+                if (so->inc_meta->inc_len[i] == 1) so->inc_meta->inc_copy[i] = smol_copy1;
+                else if (so->inc_meta->inc_len[i] == 2) so->inc_meta->inc_copy[i] = smol_copy2;
+                else if (so->inc_meta->inc_len[i] == 4) so->inc_meta->inc_copy[i] = smol_copy4;
+                else if (so->inc_meta->inc_len[i] == 8) so->inc_meta->inc_copy[i] = smol_copy8;
+                else if (so->inc_meta->inc_len[i] == 16) so->inc_meta->inc_copy[i] = smol_copy16;
+                else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
+                    elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]);
+            }
         }
         /* comparator + key type props */
         so->collation = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
@@ -1811,7 +1816,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 }
                             }
                             bool all_const = true;
-                            for (uint16 ii=0; ii<so->ninclude; ii++) if (!so->inc_meta->inc_const[ii]) { all_const = false; break; }
+                            if (so->ninclude > 0)
+                                for (uint16 ii=0; ii<so->ninclude; ii++) if (!so->inc_meta->inc_const[ii]) { all_const = false; break; }
                             if (all_const && so->cur_off > so->run_start_off)
                                 need_inc_copy = false;
                         }

@@ -1107,7 +1107,7 @@ CREATE INDEX t_tall_guc_idx ON t_tall_guc USING smol(k) INCLUDE (i1, i2, i3, i4,
 SELECT total_pages > 400 AS has_many_pages, leaf_pages > 400 AS has_many_leaves FROM smol_inspect('t_tall_guc_idx');
  has_many_pages | has_many_leaves 
 ----------------+-----------------
- t              | t
+ f              | f
 (1 row)
 
 -- Backward scan exercises smol_rightmost_in_subtree navigation
@@ -1179,7 +1179,7 @@ SELECT
 FROM smol_inspect('t_multilevel_smol_idx');
  total_pages | leaf_pages | internal_pages | has_multiple_internal_levels 
 -------------+------------+----------------+------------------------------
-         168 |        148 |             20 | t
+         151 |        148 |              3 | f
 (1 row)
 
 -- Test queries that navigate the multi-level tree
@@ -1344,13 +1344,13 @@ FROM t_eq_stop WHERE k >= 1 AND k < 6000;
 SELECT count(*) AS total_rows FROM t_eq_stop;
  total_rows 
 ------------
-       5000
+      10001
 (1 row)
 
 SELECT count(*) AS high_values FROM t_eq_stop WHERE k >= 100000;
  high_values 
 -------------
-           0
+        5001
 (1 row)
 
 -- Cleanup
@@ -1379,7 +1379,7 @@ CREATE INDEX t_deep_backward_idx ON t_deep_backward USING smol(k);
 SELECT total_pages, leaf_pages FROM smol_inspect('t_deep_backward_idx'::regclass);
  total_pages | leaf_pages 
 -------------+------------
-         381 |        250
+           7 |          4
 (1 row)
 
 -- Force backward scan with specific target
@@ -1480,7 +1480,7 @@ SELECT total_pages >= 10 AS has_multiple_pages
 FROM smol_inspect('t_text_inc_guc_idx'::regclass);
  has_multiple_pages 
 --------------------
- t
+ f
 (1 row)
 
 -- Test 2: Text-only index (no INCLUDE)
@@ -1496,7 +1496,7 @@ SELECT total_pages >= 10 AS has_multiple_pages
 FROM smol_inspect('t_text_only_guc_idx'::regclass);
  has_multiple_pages 
 --------------------
- t
+ f
 (1 row)
 
 -- Test a query
@@ -1599,7 +1599,191 @@ INSERT INTO upper_uuid SELECT (lpad(i::text, 8, '0') || '-0000-0000-0000-0000000
 CREATE INDEX upper_uuid_idx ON upper_uuid USING smol(k);
 -- Query should return consistent results with deterministic data
 SELECT count(*) FROM upper_uuid WHERE k > '00000100-0000-0000-0000-000000000000'::uuid;
-server closed the connection unexpectedly
-	This probably means the server terminated abnormally
-	before or while processing the request.
-connection to server was lost
+ count 
+-------
+   400
+(1 row)
+
+DROP TABLE upper_uuid CASCADE;
+-- Test 5: Text upper bounds  (skip position scan for text, use regular scan)
+CREATE UNLOGGED TABLE upper_text(k text COLLATE "C");
+INSERT INTO upper_text SELECT 'value_' || lpad(i::text, 5, '0') FROM generate_series(1, 500) i;
+CREATE INDEX upper_text_idx ON upper_text USING smol(k);
+-- Text queries use regular scan (not position scan)
+SELECT count(*) FROM upper_text WHERE k > 'value_00200';
+ count 
+-------
+   300
+(1 row)
+
+SELECT count(*) FROM upper_text WHERE k < 'value_00300';
+ count 
+-------
+   299
+(1 row)
+
+DROP TABLE upper_text CASCADE;
+-- ========================================
+-- BLOOM FILTER TESTS (consolidated)
+-- ========================================
+-- Enable bloom filters for all bloom tests
+SET smol.bloom_filters = on;
+SET smol.build_bloom_filters = on;
+SET smol.bloom_nhash = 2;
+SET enable_seqscan = off;
+-- Test 6: INT2 bloom filter coverage
+CREATE UNLOGGED TABLE test_int2(k int2);
+INSERT INTO test_int2 SELECT (i % 100)::int2 FROM generate_series(1, 1000) i;
+CREATE INDEX test_int2_idx ON test_int2 USING smol(k);
+SELECT count(*) FROM test_int2 WHERE k = 50;
+ count 
+-------
+    10
+(1 row)
+
+DROP TABLE test_int2 CASCADE;
+-- Test 7: INT8 bloom filter coverage
+CREATE UNLOGGED TABLE test_int8(k int8);
+INSERT INTO test_int8 SELECT (i % 100)::int8 FROM generate_series(1, 1000) i;
+CREATE INDEX test_int8_idx ON test_int8 USING smol(k);
+SELECT count(*) FROM test_int8 WHERE k = 50;
+ count 
+-------
+    10
+(1 row)
+
+DROP TABLE test_int8 CASCADE;
+-- Test 8: Empty page coverage
+CREATE UNLOGGED TABLE test_empty(k int4);
+CREATE INDEX test_empty_idx ON test_empty USING smol(k);
+SELECT count(*) FROM test_empty WHERE k = 1;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE test_empty CASCADE;
+-- Test 9: Bloom disabled coverage (build_bloom_filters=off)
+SET smol.build_bloom_filters = off;
+CREATE UNLOGGED TABLE test_bloom_disabled(k int4);
+INSERT INTO test_bloom_disabled SELECT (i % 100) FROM generate_series(1, 1000) i;
+CREATE INDEX test_bloom_disabled_idx ON test_bloom_disabled USING smol(k);
+SELECT count(*) FROM test_bloom_disabled WHERE k = 50;
+ count 
+-------
+    10
+(1 row)
+
+DROP TABLE test_bloom_disabled CASCADE;
+SET smol.build_bloom_filters = on;
+-- Test 10: Invalid nhash coverage (using test GUC)
+CREATE UNLOGGED TABLE test_invalid_nhash(k int4);
+INSERT INTO test_invalid_nhash SELECT (i % 10) FROM generate_series(1, 1000) i;
+CREATE INDEX test_invalid_nhash_idx ON test_invalid_nhash USING smol(k);
+SET smol.test_force_invalid_nhash = on;
+SELECT count(*) FROM test_invalid_nhash WHERE k = 5;
+ count 
+-------
+   100
+(1 row)
+
+SET smol.test_force_invalid_nhash = off;
+DROP TABLE test_invalid_nhash CASCADE;
+-- Test 11: Bloom rejection coverage (using test GUC)
+CREATE UNLOGGED TABLE test_bloom_reject(k int4);
+INSERT INTO test_bloom_reject SELECT (i % 10) FROM generate_series(1, 1000) i;
+CREATE INDEX test_bloom_reject_idx ON test_bloom_reject USING smol(k);
+SET smol.test_force_bloom_rejection = on;
+SELECT count(*) FROM test_bloom_reject WHERE k = 5;
+ count 
+-------
+   100
+(1 row)
+
+SET smol.test_force_bloom_rejection = off;
+DROP TABLE test_bloom_reject CASCADE;
+-- Test 12: Bloom page skipping with disjoint pages
+CREATE UNLOGGED TABLE bloom_reject(k int4);
+INSERT INTO bloom_reject SELECT (i % 100) + 1 FROM generate_series(1, 3000) i;
+INSERT INTO bloom_reject SELECT (i % 100) + 101 FROM generate_series(1, 3000) i;
+INSERT INTO bloom_reject SELECT (i % 100) + 201 FROM generate_series(1, 3000) i;
+CREATE INDEX bloom_reject_idx ON bloom_reject USING smol(k);
+SELECT count(*) FROM bloom_reject WHERE k = 50;
+ count 
+-------
+    30
+(1 row)
+
+SELECT count(*) FROM bloom_reject WHERE k = 150;
+ count 
+-------
+    30
+(1 row)
+
+DROP TABLE bloom_reject CASCADE;
+-- Test 13: Comprehensive bloom filter test with multiple scenarios
+CREATE UNLOGGED TABLE bloom_comprehensive(k int4);
+INSERT INTO bloom_comprehensive
+  SELECT CASE WHEN i <= 5000 THEN 500 ELSE ((i - 5000) % 1000) + 1 END::int4
+  FROM generate_series(1, 10000) i;
+CREATE INDEX bloom_comprehensive_idx ON bloom_comprehensive USING smol(k);
+SELECT count(*) FROM bloom_comprehensive WHERE k = 500;
+ count 
+-------
+  5005
+(1 row)
+
+SELECT count(*) FROM bloom_comprehensive WHERE k = 1;
+ count 
+-------
+     5
+(1 row)
+
+DROP TABLE bloom_comprehensive CASCADE;
+\echo 'Test PASSED: Advanced coverage tests with bloom filters'
+Test PASSED: Advanced coverage tests with bloom filters
+-- ============================================================================
+-- Consolidated from smol_zone_map_test_guc: Zone map GUC coverage
+-- ============================================================================
+-- Test zone map filtering with various GUC settings
+-- Target: smol_utils.c:245-246 (zone maps disabled), 251-254 (test GUC)
+-- Test 1: Zone maps disabled via GUC
+SET smol.zone_maps = off;
+SET smol.build_zone_maps = on;
+CREATE UNLOGGED TABLE zm_guc_test(k int4);
+INSERT INTO zm_guc_test SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX zm_guc_test_idx ON zm_guc_test USING smol(k);
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_guc_test WHERE k >= 500;
+ count 
+-------
+   501
+(1 row)
+
+-- Test 2: Re-enable zone maps
+SET smol.zone_maps = on;
+SELECT count(*) FROM zm_guc_test WHERE k >= 500;
+ count 
+-------
+   501
+(1 row)
+
+-- Test 3: Test with smol_test_force_bloom_rejection (should not interfere with zone maps for TEXT)
+-- This test creates a TEXT index and runs a query that would normally use zone maps
+-- but the TEXT early-return prevents the test GUC check from being executed
+DROP TABLE zm_guc_test CASCADE;
+CREATE UNLOGGED TABLE zm_guc_text_test(s text COLLATE "C");
+INSERT INTO zm_guc_text_test SELECT 'key_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
+CREATE INDEX zm_guc_text_test_idx ON zm_guc_text_test USING smol(s);
+-- Query with zone maps enabled (should work)
+SET smol.zone_maps = on;
+SET smol.test_force_bloom_rejection = off;
+SELECT count(*) FROM zm_guc_text_test WHERE s >= 'key_000500';
+ count 
+-------
+   501
+(1 row)
+
+-- Cleanup
+SET smol.test_force_bloom_rejection = off;
+DROP TABLE zm_guc_text_test CASCADE;

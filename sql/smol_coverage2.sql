@@ -1203,7 +1203,7 @@ SELECT count(*) FROM zm_guc_test WHERE k >= 500;
 -- This test creates a TEXT index and runs a query that would normally use zone maps
 -- but the TEXT early-return prevents the test GUC check from being executed
 DROP TABLE zm_guc_test CASCADE;
-CREATE UNLOGGED TABLE zm_guc_text_test(s text);
+CREATE UNLOGGED TABLE zm_guc_text_test(s text COLLATE "C");
 INSERT INTO zm_guc_text_test SELECT 'key_' || lpad(i::text, 6, '0') FROM generate_series(1, 1000) i;
 CREATE INDEX zm_guc_text_test_idx ON zm_guc_text_test USING smol(s);
 
