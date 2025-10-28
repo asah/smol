@@ -691,6 +691,12 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
              * One ItemId (FirstOffsetNumber) per leaf.
              */
             Size i = 0; BlockNumber prev = InvalidBlockNumber; char *scratch = (char *) palloc(BLCKSZ);
+
+            /* Track leaf pages for building internal levels with zone map stats */
+            Size nleaves = 0, aleaves = 0;
+            SmolLeafStats *leaf_stats = NULL;
+            Oid typid = atttypid; /* First key type for zone maps */
+
             while (i < n)
             {
                 Buffer buf = smol_extend(index); Page page = BufferGetPage(buf); smol_init_page(buf, true, InvalidBlockNumber);
@@ -714,9 +720,80 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 Assert(off != InvalidOffsetNumber);
                 (void) off; /* suppress unused variable warning in non-assert builds */
                 MarkBufferDirty(buf); BlockNumber cur = BufferGetBlockNumber(buf); UnlockReleaseBuffer(buf);
-                if (BlockNumberIsValid(prev)) { Buffer pb = ReadBuffer(index, prev); LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE); Page pp=BufferGetPage(pb); smol_page_opaque(pp)->rightlink=cur; MarkBufferDirty(pb); UnlockReleaseBuffer(pb);} prev = cur; i += n_this;
+                if (BlockNumberIsValid(prev)) { Buffer pb = ReadBuffer(index, prev); LockBuffer(pb, BUFFER_LOCK_EXCLUSIVE); Page pp=BufferGetPage(pb); smol_page_opaque(pp)->rightlink=cur; MarkBufferDirty(pb); UnlockReleaseBuffer(pb);} prev = cur;
+
+                /* Track this leaf and collect zone map statistics */
+                if (nleaves == aleaves)
+                {
+                    aleaves = (aleaves == 0 ? 64 : aleaves * 2);
+                    leaf_stats = (leaf_stats == NULL) ? (SmolLeafStats *) palloc(aleaves * sizeof(SmolLeafStats))
+                                                      : (SmolLeafStats *) repalloc(leaf_stats, aleaves * sizeof(SmolLeafStats));
+                }
+
+                /* Collect zone map statistics for this leaf (first key only for two-column) */
+                if (smol_build_zone_maps)
+                {
+                    /* For two-column indexes, extract first key column for zone map statistics */
+                    char *keys_for_stats = (char *) palloc(n_this * key_len);
+                    if (use_radix)
+                    {
+                        /* Data is already sorted, copy k1 values */
+                        for (Size j = 0; j < n_this; j++)
+                            memcpy(keys_for_stats + j * key_len, k1buf + (i + j) * key_len, key_len);
+                    }
+                    else
+                    {
+                        /* Use index permutation */
+                        for (Size j = 0; j < n_this; j++)
+                        {
+                            uint32 id = idx[i + j];
+                            memcpy(keys_for_stats + j * key_len, k1buf + id * key_len, key_len);
+                        }
+                    }
+                    smol_collect_leaf_stats(&leaf_stats[nleaves], keys_for_stats, n_this, key_len, typid, cur);
+                    pfree(keys_for_stats);
+                }
+                else
+                {
+                    /* Zone maps disabled: fill minimal stats */
+                    leaf_stats[nleaves].blk = cur;
+                    /* Store last key's first 4 bytes as maxkey */
+                    if (use_radix)
+                        memcpy(&leaf_stats[nleaves].maxkey, k1buf + (i + n_this - 1) * key_len, Min(sizeof(int32), key_len));
+                    else
+                        memcpy(&leaf_stats[nleaves].maxkey, k1buf + idx[i + n_this - 1] * key_len, Min(sizeof(int32), key_len));
+                    leaf_stats[nleaves].minkey = 0;
+                    leaf_stats[nleaves].row_count = 0;
+                    leaf_stats[nleaves].distinct_count = 0;
+                    leaf_stats[nleaves].bloom_filter = 0;
+                    leaf_stats[nleaves].padding = 0;
+                }
+
+                nleaves++;
+                i += n_this;
             }
-            Buffer mb = ReadBuffer(index, 0); LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); SmolMeta *m = smol_meta_ptr(pg); m->root_blkno = 1; m->height = 1; MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
+
+            /* Build internal levels with zone map aggregation if we have multiple leaves */
+            if (nleaves > 1)
+            {
+                BlockNumber rootblk;
+                uint16 levels;
+                smol_build_internal_levels_with_stats(index, leaf_stats, nleaves, key_len, &rootblk, &levels);
+            }
+            else if (nleaves == 1)
+            {
+                /* Single leaf: set root directly */
+                Buffer mb = ReadBuffer(index, 0);
+                LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+                Page pg = BufferGetPage(mb);
+                SmolMeta *m = smol_meta_ptr(pg);
+                m->root_blkno = leaf_stats[0].blk;
+                m->height = 1;
+                MarkBufferDirty(mb);
+                UnlockReleaseBuffer(mb);
+            }
+
+            if (leaf_stats) pfree(leaf_stats);
             if (idx) pfree(idx);
             pfree(scratch);
         }

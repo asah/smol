@@ -187,6 +187,110 @@ smol_find_first_leaf(Relation idx, int64 lower_bound, Oid atttypid, uint16 key_l
     return cur;
 }
 
+/*
+ * smol_subtree_can_match - Check if a subtree can contain matching rows
+ *
+ * Uses zone map metadata (min/max keys, bloom filter) to prune entire subtrees
+ * that provably cannot contain rows matching the scan predicates.
+ *
+ * Returns true if the subtree might contain matches (must descend),
+ * false if it definitely has no matches (skip subtree).
+ */
+static inline bool
+smol_subtree_can_match(SmolInternalItem *item, SmolScanOpaque so, SmolMeta *meta)
+{
+    /* Skip if zone map filtering disabled */
+    if (!smol_zone_maps || !meta->zone_maps_enabled)
+        return true;
+
+    /* Lower bound check: if subtree's max < lower_bound, skip entire subtree */
+    if (so->have_bound)
+    {
+        int32 bound_prefix = 0;
+
+        /* Extract 32-bit prefix from bound for comparison */
+        if (so->atttypid == INT2OID)
+            bound_prefix = (int32)DatumGetInt16(so->bound_datum);
+        else if (so->atttypid == INT4OID)
+            bound_prefix = DatumGetInt32(so->bound_datum);
+        else if (so->atttypid == INT8OID)
+            bound_prefix = (int32)DatumGetInt64(so->bound_datum); /* Truncate to 32-bit */
+        else if (so->atttypid == TEXTOID && so->key_len >= 4)
+        {
+            text *t = DatumGetTextPP(so->bound_datum);
+            const char *str = VARDATA_ANY(t);
+            int len = VARSIZE_ANY_EXHDR(t);
+            if (len >= 4)
+                memcpy(&bound_prefix, str, 4);
+            else if (len > 0)
+                memcpy(&bound_prefix, str, len);
+        }
+
+        /* If subtree's maxkey < lower_bound, skip */
+        if (item->highkey < bound_prefix || (so->bound_strict && item->highkey == bound_prefix))
+        {
+            if (so->prof_enabled)
+                so->prof_subtrees_skipped++;
+            return false;
+        }
+    }
+
+    /* Upper bound check: if subtree's min > upper_bound, skip entire subtree */
+    if (so->have_upper_bound)
+    {
+        int32 upper_prefix = 0;
+
+        /* Extract 32-bit prefix from upper bound */
+        if (so->atttypid == INT2OID)
+            upper_prefix = (int32)DatumGetInt16(so->upper_bound_datum);
+        else if (so->atttypid == INT4OID)
+            upper_prefix = DatumGetInt32(so->upper_bound_datum);
+        else if (so->atttypid == INT8OID)
+            upper_prefix = (int32)DatumGetInt64(so->upper_bound_datum);
+        else if (so->atttypid == TEXTOID && so->key_len >= 4)
+        {
+            text *t = DatumGetTextPP(so->upper_bound_datum);
+            const char *str = VARDATA_ANY(t);
+            int len = VARSIZE_ANY_EXHDR(t);
+            if (len >= 4)
+                memcpy(&upper_prefix, str, 4);
+            else if (len > 0)
+                memcpy(&upper_prefix, str, len);
+        }
+
+        /* If subtree's minkey > upper_bound, skip */
+        if (item->minkey > upper_prefix || (so->upper_bound_strict && item->minkey == upper_prefix))
+        {
+            if (so->prof_enabled)
+                so->prof_subtrees_skipped++;
+            return false;
+        }
+    }
+
+    /* Bloom filter check for equality predicates */
+    if (so->have_k1_eq && smol_bloom_filters && meta->bloom_enabled)
+    {
+        if (so->prof_enabled)
+            so->prof_bloom_checks++;
+
+        if (!smol_bloom_test(item->bloom_filter, so->bound_datum, so->atttypid, meta->bloom_nhash))
+        {
+            /* Definitely not in this subtree */
+            if (so->prof_enabled)
+            {
+                so->prof_subtrees_skipped++;
+                so->prof_bloom_skips++;
+            }
+            return false;
+        }
+    }
+
+    /* Subtree might contain matches */
+    if (so->prof_enabled)
+        so->prof_subtrees_checked++;
+    return true;
+}
+
 /* Generic version of smol_find_first_leaf that supports all key types including text.
  * Uses SmolScanOpaque's comparison context to correctly handle text/varchar types.
  *

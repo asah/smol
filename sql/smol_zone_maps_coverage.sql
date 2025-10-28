@@ -514,6 +514,68 @@ SET smol.test_max_tuples_per_page = 0;
 \echo 'Test 12 PASSED: Bloom filters'
 \echo ''
 
+\echo '============================================================================'
+\echo 'Test 13: Two-column index with zone maps disabled (non-radix path)'
+\echo 'Coverage: Lines 758-769 in smol_build (two-column zone maps disabled, non-radix)'
+\echo '============================================================================'
+
+-- Create two-column table with int4 (non-radix sort path)
+CREATE UNLOGGED TABLE zm_twocol_disabled(a int4, b int4);
+INSERT INTO zm_twocol_disabled
+  SELECT i % 100, i
+  FROM generate_series(1, 5000) i;
+ANALYZE zm_twocol_disabled;
+
+-- Build two-column index with zone maps disabled
+SET smol.build_zone_maps = false;
+SET smol.build_bloom_filters = false;
+CREATE INDEX zm_twocol_disabled_smol ON zm_twocol_disabled USING smol(a, b);
+
+-- Verify index works correctly without zone maps
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SELECT count(*) FROM zm_twocol_disabled WHERE a = 50 AND b > 4000;
+SELECT sum(b)::bigint FROM zm_twocol_disabled WHERE a < 10;
+
+DROP TABLE zm_twocol_disabled CASCADE;
+
+\echo 'Test 13 PASSED: Two-column zone maps disabled (non-radix)'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 14: Two-column index with zone maps disabled (radix path)'
+\echo 'Coverage: Line 762 in smol_build (two-column zone maps disabled, radix sort)'
+\echo '============================================================================'
+
+-- Create two-column table with bigint (radix sort path: use_radix=true)
+CREATE UNLOGGED TABLE zm_twocol_radix_disabled(a bigint, b bigint);
+INSERT INTO zm_twocol_radix_disabled
+  SELECT i % 100, i
+  FROM generate_series(1, 5000) i;
+ANALYZE zm_twocol_radix_disabled;
+
+-- Build two-column bigint index with zone maps disabled (triggers radix path)
+SET smol.build_zone_maps = false;
+SET smol.build_bloom_filters = false;
+CREATE INDEX zm_twocol_radix_disabled_smol ON zm_twocol_radix_disabled USING smol(a, b);
+
+-- Verify index works correctly without zone maps
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SELECT count(*) FROM zm_twocol_radix_disabled WHERE a = 50 AND b > 4000;
+SELECT sum(b)::bigint FROM zm_twocol_radix_disabled WHERE a < 10;
+
+DROP TABLE zm_twocol_radix_disabled CASCADE;
+
+-- Re-enable zone maps for any subsequent tests
+SET smol.build_zone_maps = true;
+SET smol.build_bloom_filters = true;
+
+\echo 'Test 14 PASSED: Two-column zone maps disabled (radix)'
+\echo ''
+
 -- ============================================================================
 -- Cleanup
 -- ============================================================================
