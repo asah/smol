@@ -248,12 +248,34 @@ coverage-build: stop coverage-clean
 	@echo "[coverage] Coverage build complete."
 
 # Run tests with coverage
-# Note: BASE tests (smol_core, smol_build, smol_scan, smol_rle) work in both builds.
-# Coverage-only tests use test GUCs and only run with COVERAGE=1.
+# Note: Run each test separately to avoid stack overflow from accumulated gcov data.
+# Each test run merges coverage data, preventing crashes in long test suites.
 coverage-test: stop start
+	@echo "[coverage] Running tests individually to prevent stack overflow..."
 	@set -euo pipefail; \
-	  COVERAGE=1 $(MAKE) installcheck; \
-	  $(MAKE) stop
+	  failed_tests=""; \
+	  all_tests="$(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)"; \
+	  test_count=$$(echo $$all_tests | wc -w); \
+	  test_num=0; \
+	  for test in $$all_tests; do \
+	    test_num=$$((test_num + 1)); \
+	    echo "[coverage] Running test $$test_num/$$test_count: $$test"; \
+	    if COVERAGE=1 $(MAKE) installcheck REGRESS=$$test > /tmp/test_$$test.log 2>&1; then \
+	      echo "[coverage] ✓ Test $$test passed"; \
+	    else \
+	      echo "[coverage] ✗ Test $$test FAILED"; \
+	      failed_tests="$$failed_tests $$test"; \
+	      tail -10 /tmp/test_$$test.log; \
+	    fi; \
+	    $(PG_BIN)pg_ctl -D $(PGDATA) restart -w > /dev/null 2>&1; \
+	    sleep 1; \
+	  done; \
+	  $(MAKE) stop; \
+	  if [ -n "$$failed_tests" ]; then \
+	    echo "[coverage] Failed tests:$$failed_tests"; \
+	    exit 1; \
+	  fi; \
+	  echo "[coverage] All tests passed!"
 
 # Generate HTML coverage report using lcov
 coverage-html:
