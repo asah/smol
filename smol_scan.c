@@ -962,6 +962,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         }
                         so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                     }
+
+                    /* Zone map filtering may return InvalidBlockNumber if no subtrees can match */
+                    if (!BlockNumberIsValid(so->cur_blk))
+                    {
+                        SMOL_LOG("zone map filtering: no matching subtrees, returning false");
+                        return false;  /* No tuples match the query */
+                    }
+
                     so->cur_off = FirstOffsetNumber;
                     so->initialized = true;
                     so->last_dir = dir;

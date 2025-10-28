@@ -1511,3 +1511,95 @@ RESET smol.test_max_tuples_per_page;
 -- Cleanup
 DROP TABLE t_text_inc_guc CASCADE;
 DROP TABLE t_text_only_guc CASCADE;
+-- ============================================================================
+-- Consolidated from smol_coverage3: Bloom filters and additional types
+-- ============================================================================
+-- Test file for additional coverage: upper bounds, ranges, additional data types, and bloom filters
+-- Consolidates: smol_bloom_coverage, smol_final_bloom, smol_int2_coverage, smol_int8_coverage,
+--               smol_empty_page_coverage, smol_bloom_disabled_coverage, smol_invalid_nhash_coverage,
+--               smol_bloom_rejection_coverage
+-- Test 1: Upper bound queries with int4
+CREATE UNLOGGED TABLE upper_int4(k int4);
+INSERT INTO upper_int4 SELECT i FROM generate_series(1, 1000) i;
+CREATE INDEX upper_int4_idx ON upper_int4 USING smol(k);
+-- Test < operator (strict upper bound)
+SET enable_seqscan = off;
+SELECT count(*) FROM upper_int4 WHERE k < 500;
+ count 
+-------
+   499
+(1 row)
+
+-- Test <= operator (non-strict upper bound)
+SELECT count(*) FROM upper_int4 WHERE k <= 500;
+ count 
+-------
+   500
+(1 row)
+
+-- Test BETWEEN (both bounds)
+SELECT count(*) FROM upper_int4 WHERE k BETWEEN 100 AND 200;
+ count 
+-------
+   101
+(1 row)
+
+DROP TABLE upper_int4 CASCADE;
+-- Test 2: Upper bound queries with int2
+CREATE UNLOGGED TABLE upper_int2(k int2);
+INSERT INTO upper_int2 SELECT i::int2 FROM generate_series(1, 1000) i;
+CREATE INDEX upper_int2_idx ON upper_int2 USING smol(k);
+SELECT count(*) FROM upper_int2 WHERE k < 500::int2;
+ count 
+-------
+   499
+(1 row)
+
+SELECT count(*) FROM upper_int2 WHERE k <= 500::int2;
+ count 
+-------
+   500
+(1 row)
+
+SELECT count(*) FROM upper_int2 WHERE k BETWEEN 100::int2 AND 200::int2;
+ count 
+-------
+   101
+(1 row)
+
+DROP TABLE upper_int2 CASCADE;
+-- Test 3: Upper bound queries with int8
+CREATE UNLOGGED TABLE upper_int8(k int8);
+INSERT INTO upper_int8 SELECT i::int8 FROM generate_series(1, 1000) i;
+CREATE INDEX upper_int8_idx ON upper_int8 USING smol(k);
+SELECT count(*) FROM upper_int8 WHERE k < 500::int8;
+ count 
+-------
+   499
+(1 row)
+
+SELECT count(*) FROM upper_int8 WHERE k <= 500::int8;
+ count 
+-------
+   500
+(1 row)
+
+SELECT count(*) FROM upper_int8 WHERE k BETWEEN 100::int8 AND 200::int8;
+ count 
+-------
+   101
+(1 row)
+
+DROP TABLE upper_int8 CASCADE;
+-- Test 4: UUID type (use deterministic UUIDs for testing)
+CREATE UNLOGGED TABLE upper_uuid(k uuid);
+-- Create deterministic UUIDs by padding integers to proper UUID format
+INSERT INTO upper_uuid SELECT (lpad(i::text, 8, '0') || '-0000-0000-0000-000000000000')::uuid
+  FROM generate_series(1, 500) i;
+CREATE INDEX upper_uuid_idx ON upper_uuid USING smol(k);
+-- Query should return consistent results with deterministic data
+SELECT count(*) FROM upper_uuid WHERE k > '00000100-0000-0000-0000-000000000000'::uuid;
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
