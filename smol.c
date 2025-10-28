@@ -36,6 +36,8 @@ int smol_test_force_parallel_workers = 0;
 int smol_test_max_internal_fanout = 0;
 int smol_test_max_tuples_per_page = 0;
 int smol_test_leaf_offset = 0;
+bool smol_test_force_invalid_nhash = false;
+bool smol_test_force_bloom_rejection = false;
 #endif
 
 /* Sorting globals (used by smol_build.c) */
@@ -159,6 +161,24 @@ _PG_init(void)
                             PGC_USERSET,
                             0,
                             NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.test_force_invalid_nhash",
+                             "TEST ONLY: Force invalid nhash value for bloom filter coverage",
+                             "For coverage testing: triggers defensive checks in smol_bloom_test/build_page (lines 919,951)",
+                             &smol_test_force_invalid_nhash,
+                             false, /* default: disabled */
+                             PGC_USERSET,
+                             0,
+                             NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.test_force_bloom_rejection",
+                             "TEST ONLY: Force bloom filter to reject lookups",
+                             "For coverage testing: forces bloom rejection path (line 928) by clearing a bit",
+                             &smol_test_force_bloom_rejection,
+                             false, /* default: disabled */
+                             PGC_USERSET,
+                             0,
+                             NULL, NULL, NULL);
 #endif
 
     DefineCustomRealVariable("smol.cost_page",

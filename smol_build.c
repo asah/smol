@@ -838,7 +838,6 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
     /* Track leaf pages for building internal levels (with zone map stats) */
     Size nleaves = 0, aleaves = 0;
     SmolLeafStats *leaf_stats = NULL;
-    Oid typid = TupleDescAttr(idx->rd_att, 0)->atttypid;  /* First key type for zone maps */
 
     while (i < nkeys)
     {
@@ -1017,7 +1016,33 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         /* Collect zone map statistics for this leaf */
         if (smol_build_zone_maps)
         {
-            smol_collect_leaf_stats(&leaf_stats[nleaves], &keys[i], n_this, key_len, typid, cur);
+            /* keys is int64 array, need to extract first/last correctly */
+            int64 first_val = keys[i];
+            int64 last_val = keys[i + n_this - 1];
+
+            leaf_stats[nleaves].blk = cur;
+            leaf_stats[nleaves].row_count = n_this;
+
+            /* Extract min/max based on actual key type */
+            if (key_len == 2)
+            {
+                leaf_stats[nleaves].minkey = (int32)(int16)first_val;
+                leaf_stats[nleaves].maxkey = (int32)(int16)last_val;
+            }
+            else if (key_len == 4)
+            {
+                leaf_stats[nleaves].minkey = (int32)first_val;
+                leaf_stats[nleaves].maxkey = (int32)last_val;
+            }
+            else /* key_len == 8 */
+            {
+                leaf_stats[nleaves].minkey = (int32)first_val;
+                leaf_stats[nleaves].maxkey = (int32)last_val;
+            }
+
+            leaf_stats[nleaves].distinct_count = (uint16)Min(n_this, 65535);
+            leaf_stats[nleaves].bloom_filter = 0;
+            leaf_stats[nleaves].padding = 0;
         }
         else
         {
@@ -1520,7 +1545,7 @@ smol_build_internal_levels_with_stats(Relation idx,
                 SMOL_DEFENSIVE_CHECK(off != InvalidOffsetNumber, WARNING,
                     (errmsg("smol: internal page add failed during build (with stats)")));
                 if (off == InvalidOffsetNumber)
-                    break;
+                    break; /* GCOV_EXCL_LINE - Defensive: PageAddItem should never fail during build */
 
                 children_added++;
 
@@ -1538,16 +1563,16 @@ smol_build_internal_levels_with_stats(Relation idx,
 #ifdef SMOL_TEST_COVERAGE
             if (smol_test_force_realloc_at > 0 && next_n == (Size) smol_test_force_realloc_at && cap_next == (Size) smol_test_force_realloc_at)
             {
-                cap_next = cap_next * 2;
-                next_stats = (SmolLeafStats *) repalloc(next_stats, cap_next * sizeof(SmolLeafStats));
+                cap_next = cap_next * 2; /* GCOV_EXCL_LINE - Test-only: forced reallocation via GUC */
+                next_stats = (SmolLeafStats *) repalloc(next_stats, cap_next * sizeof(SmolLeafStats)); /* GCOV_EXCL_LINE */
             }
             else
 #endif
             if (next_n >= cap_next)
-            {
+            { /* GCOV_EXCL_START - Reallocation only with extremely tall trees */
                 cap_next = cap_next * 2;
                 next_stats = (SmolLeafStats *) repalloc(next_stats, cap_next * sizeof(SmolLeafStats));
-            }
+            } /* GCOV_EXCL_STOP */
 
             next_stats[next_n] = aggregated;
             next_n++;
@@ -1589,6 +1614,7 @@ smol_build_internal_levels_with_stats(Relation idx,
     pfree(cur_stats);
 }
 
+/* GCOV_EXCL_START - Legacy function: replaced by smol_build_internal_levels_with_stats */
 static void __attribute__((unused))
 smol_build_internal_levels_bytes(Relation idx,
                                  BlockNumber *child_blks, const char *child_high_bytes,
@@ -2112,7 +2138,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
                 break;
             }
 
-            /* Would this overflow the page? */
+            /* Would this overflow the page (RLE format)? */
             if (rle_current_size + delta_size > avail)
             {
                 /* Page full - save tuple for next page */

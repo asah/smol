@@ -25,11 +25,11 @@ endif
 # smol_scan now includes position-based scan optimization tests
 REGRESS_BASE = smol_core smol_scan smol_rle
 
-# Coverage-only tests (3 consolidated tests)
-# Consolidates coverage-only tests into 3 files (smol_16byte_coverage merged into smol_coverage2)
-REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2 smol_advanced
+# Coverage-only tests (11 consolidated tests)
+# smol_coverage3 now includes all bloom filter edge cases (consolidates 8 tests into 1)
+REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2 smol_advanced smol_zone_maps_coverage smol_coverage3 smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip
 
-# Full test list: 6 tests for coverage builds, 3 for production
+# Full test list: 11 tests for coverage builds, 3 for production
 ifeq ($(COVERAGE),1)
 REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
 else
@@ -164,7 +164,7 @@ bench-help:
 PG_BIN := $(dir $(PG_CONFIG))
 PGDATA := /home/postgres/pgdata
 
-production: clean stop install start installcheck
+production: stop clean install start installcheck
 	@echo "rebuilding and testing production build from scratch."
 
 buildclean:
@@ -241,9 +241,9 @@ coverage-clean:
 	@echo "[coverage] Coverage data cleaned."
 
 # Build with coverage instrumentation
-coverage-build: coverage-clean
+coverage-build: stop coverage-clean
 	@echo "[coverage] Building with coverage instrumentation..."
-	@COVERAGE=1 $(MAKE) 
+	@COVERAGE=1 $(MAKE)
 	@sudo COVERAGE=1 $(MAKE) install
 	@echo "[coverage] Coverage build complete."
 

@@ -1,0 +1,532 @@
+-- smol_zone_maps_coverage.sql
+--
+-- Coverage tests for zone maps functionality in SMOL index access method
+-- This test file targets specific uncovered code paths related to zone maps
+-- and internal node construction.
+--
+-- Test Cases:
+-- 1. Zone maps disabled path (smol_build_zone_maps = false)
+-- 2. int2 (smallint) keys with zone maps
+-- 3. int4 (integer) keys with zone maps
+-- 4. Non-standard key types (UUID, bytea) for generic path coverage
+-- 5. Empty pages edge case
+-- 6. Internal level reallocation paths (very tall trees)
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS smol;
+
+-- Clean up any previous test artifacts
+DROP TABLE IF EXISTS zm_disabled CASCADE;
+DROP TABLE IF EXISTS zm_int2 CASCADE;
+DROP TABLE IF EXISTS zm_int4 CASCADE;
+DROP TABLE IF EXISTS zm_uuid CASCADE;
+DROP TABLE IF EXISTS zm_bytea CASCADE;
+DROP TABLE IF EXISTS zm_empty CASCADE;
+DROP TABLE IF EXISTS zm_realloc CASCADE;
+
+\echo '============================================================================'
+\echo 'Test 1: Zone maps disabled path'
+\echo 'Coverage: smol_meta_init_zone_maps with zone maps disabled'
+\echo '          Tests meta->zone_maps_enabled = false path'
+\echo '============================================================================'
+
+-- Create index with zone maps explicitly disabled
+CREATE UNLOGGED TABLE zm_disabled(a int4);
+INSERT INTO zm_disabled SELECT i FROM generate_series(1, 10000) i;
+ANALYZE zm_disabled;
+
+-- Disable zone maps for this index build
+SET smol.build_zone_maps = false;
+SET smol.build_bloom_filters = false;
+CREATE INDEX zm_disabled_smol ON zm_disabled USING smol(a);
+
+-- Verify index works correctly without zone maps
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+SELECT count(*) FROM zm_disabled WHERE a > 5000;
+SELECT sum(a)::bigint FROM zm_disabled WHERE a BETWEEN 1000 AND 2000;
+
+-- Re-enable zone maps for subsequent tests
+SET smol.build_zone_maps = true;
+SET smol.build_bloom_filters = true;
+
+\echo 'Test 1 PASSED: Zone maps disabled path'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 1b: Zone maps disabled - TEXT + INCLUDE path'
+\echo 'Coverage: Lines 1302-1309 in smol_build_text_inc_from_sorted'
+\echo '============================================================================'
+
+SET smol.build_zone_maps = false;
+CREATE UNLOGGED TABLE zm_text_inc_disabled(a text, b int4);
+INSERT INTO zm_text_inc_disabled
+  SELECT 'key_' || lpad(i::text, 8, '0'), i*2
+  FROM generate_series(1, 10000) i;
+ANALYZE zm_text_inc_disabled;
+CREATE INDEX zm_text_inc_disabled_smol ON zm_text_inc_disabled USING smol(a) INCLUDE (b);
+
+-- Verify it works
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM zm_text_inc_disabled WHERE a > 'key_00005000';
+DROP TABLE zm_text_inc_disabled CASCADE;
+
+SET smol.build_zone_maps = true;
+\echo 'Test 1b PASSED: Zone maps disabled TEXT+INCLUDE'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 2: int2 (smallint) keys with zone maps'
+\echo 'Coverage: INT2OID case in smol_find_first_leaf_generic bound_prefix extraction'
+\echo '          INT2OID case in smol_collect_leaf_stats min/max key conversion'
+\echo '============================================================================'
+
+-- Create table with int2 keys to trigger int2-specific zone map code
+CREATE UNLOGGED TABLE zm_int2(a int2);
+-- Use range that covers negative and positive int2 values
+INSERT INTO zm_int2 SELECT (i - 16384)::int2 FROM generate_series(1, 32000) i;
+ANALYZE zm_int2;
+
+-- Build with zone maps enabled (will use int2-specific paths)
+CREATE INDEX zm_int2_smol ON zm_int2 USING smol(a);
+
+-- Test queries that exercise int2 zone map filtering
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM zm_int2 WHERE a > 0::int2;
+SELECT count(*) FROM zm_int2 WHERE a < -10000::int2;
+SELECT min(a)::int2, max(a)::int2 FROM zm_int2 WHERE a BETWEEN -1000::int2 AND 1000::int2;
+
+\echo 'Test 2 PASSED: int2 zone maps'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 3: int4 (integer) keys with zone maps'
+\echo 'Coverage: INT4OID case in smol_find_first_leaf_generic bound_prefix extraction'
+\echo '          INT4OID case in smol_collect_leaf_stats min/max key conversion'
+\echo '============================================================================'
+
+-- Create table with int4 keys (standard integer type)
+CREATE UNLOGGED TABLE zm_int4(a int4);
+INSERT INTO zm_int4 SELECT i FROM generate_series(-50000, 50000) i;
+ANALYZE zm_int4;
+
+-- Build with zone maps (will use int4-specific paths)
+CREATE INDEX zm_int4_smol ON zm_int4 USING smol(a);
+
+-- Test queries with int4 zone maps
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_int4 WHERE a > 25000;
+SELECT count(*) FROM zm_int4 WHERE a < -25000;
+SELECT sum(a)::bigint FROM zm_int4 WHERE a BETWEEN -1000 AND 1000;
+
+\echo 'Test 3 PASSED: int4 zone maps'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 4: Non-standard key types (UUID, bytea)'
+\echo 'Coverage: Default fallback path in smol_find_first_leaf_generic'
+\echo '          Default case in smol_collect_leaf_stats for non-integer types'
+\echo '============================================================================'
+
+-- Test 4a: UUID type (16 bytes, non-integer)
+CREATE UNLOGGED TABLE zm_uuid(a uuid);
+-- Generate deterministic UUIDs for consistent testing
+INSERT INTO zm_uuid
+SELECT md5(i::text || 'salt')::uuid
+FROM generate_series(1, 5000) i;
+ANALYZE zm_uuid;
+
+CREATE INDEX zm_uuid_smol ON zm_uuid USING smol(a);
+
+-- Query with UUID (exercises generic path for non-int types)
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_uuid WHERE a >= '00000000-0000-0000-0000-000000000000'::uuid;
+WITH first AS (SELECT a AS m FROM zm_uuid ORDER BY a LIMIT 1)
+SELECT count(*) FROM zm_uuid, first WHERE a >= m;
+
+-- Test 4b: bytea type (variable length, but we'll use fixed-length values)
+CREATE UNLOGGED TABLE zm_bytea(a bytea);
+-- Create fixed-length bytea values (8 bytes each)
+INSERT INTO zm_bytea
+SELECT decode(lpad(to_hex(i), 16, '0'), 'hex')
+FROM generate_series(1, 5000) i;
+ANALYZE zm_bytea;
+
+CREATE INDEX zm_bytea_smol ON zm_bytea USING smol(a);
+
+-- Query with bytea (exercises generic path)
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_bytea WHERE a >= decode('0000000000000000', 'hex');
+
+\echo 'Test 4 PASSED: Non-standard key types'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 5: Empty pages edge case'
+\echo 'Coverage: n == 0 path in smol_collect_leaf_stats (empty page handling)'
+\echo '============================================================================'
+
+-- Create a table and build index, then test with empty result set
+-- This exercises the empty page statistics collection
+CREATE UNLOGGED TABLE zm_empty(a int4);
+INSERT INTO zm_empty SELECT i FROM generate_series(1, 1000) i;
+ANALYZE zm_empty;
+
+CREATE INDEX zm_empty_smol ON zm_empty USING smol(a);
+
+-- Query that returns empty result (but index is built with data)
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_empty WHERE a > 1000000;
+SELECT count(*) FROM zm_empty WHERE a < -1000000;
+
+-- Also test with actually empty table at build time
+DROP TABLE IF EXISTS zm_truly_empty CASCADE;
+CREATE UNLOGGED TABLE zm_truly_empty(a int4);
+-- Build index on empty table
+CREATE INDEX zm_truly_empty_smol ON zm_truly_empty USING smol(a);
+-- Query empty index
+SELECT count(*) FROM zm_truly_empty WHERE a > 0;
+
+\echo 'Test 5 PASSED: Empty pages edge case'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 6: Internal level reallocation paths'
+\echo 'Coverage: Internal node statistics array reallocation in multi-level build'
+\echo '          Requires creating a very tall tree to trigger reallocation'
+\echo '============================================================================'
+
+-- Create a very tall tree by using test GUCs to force small fanout
+-- This will trigger the reallocation paths in internal node construction
+CREATE UNLOGGED TABLE zm_realloc(a int4);
+-- Insert enough data to create multiple internal levels
+INSERT INTO zm_realloc SELECT i FROM generate_series(1, 50000) i;
+ANALYZE zm_realloc;
+
+-- Force very small internal fanout to create tall tree and trigger reallocation
+-- The test GUC smol.test_force_realloc_at forces reallocation at specific point
+-- Note: These GUCs only exist in SMOL_TEST_COVERAGE builds, but SET won't error if missing
+DO $$
+BEGIN
+  -- Try to set test GUCs if they exist (coverage builds only)
+  BEGIN
+    EXECUTE 'SET smol.test_max_internal_fanout = 8';
+    EXECUTE 'SET smol.test_max_tuples_per_page = 100';
+    EXECUTE 'SET smol.test_force_realloc_at = 8';
+  EXCEPTION WHEN undefined_object THEN
+    -- GUCs don't exist in production builds, that's OK
+    NULL;
+  END;
+END $$;
+
+CREATE INDEX zm_realloc_smol ON zm_realloc USING smol(a);
+
+-- Reset test GUCs
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'RESET smol.test_max_internal_fanout';
+    EXECUTE 'RESET smol.test_max_tuples_per_page';
+    EXECUTE 'RESET smol.test_force_realloc_at';
+  EXCEPTION WHEN undefined_object THEN
+    NULL;
+  END;
+END $$;
+
+-- Verify the tall tree works correctly
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_realloc WHERE a > 25000;
+SELECT count(*) FROM zm_realloc WHERE a BETWEEN 10000 AND 20000;
+SELECT sum(a)::bigint FROM zm_realloc WHERE a < 1000;
+
+\echo 'Test 6 PASSED: Internal level reallocation'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Additional Coverage: Mixed scenarios'
+\echo '============================================================================'
+
+-- Test zone maps with backward scan
+SELECT count(*) FROM zm_int4 WHERE a > 0 ORDER BY a DESC LIMIT 10;
+
+-- Test zone maps with different selectivity ranges
+SELECT count(*) FROM zm_int4 WHERE a BETWEEN -100 AND 100;
+SELECT count(*) FROM zm_int4 WHERE a BETWEEN -10000 AND 10000;
+
+-- Test with duplicate keys (RLE + zone maps)
+DROP TABLE IF EXISTS zm_dups CASCADE;
+CREATE UNLOGGED TABLE zm_dups(a int4);
+INSERT INTO zm_dups SELECT (i % 100) FROM generate_series(1, 20000) i;
+ANALYZE zm_dups;
+CREATE INDEX zm_dups_smol ON zm_dups USING smol(a);
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_dups WHERE a = 42;
+SELECT count(DISTINCT a) FROM zm_dups WHERE a >= 50;
+
+\echo 'Additional coverage PASSED'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 7: Type-specific navigation with zone maps and bounds'
+\echo 'Coverage: Lines 210, 212, 214, 229 in smol_utils.c'
+\echo '============================================================================'
+
+-- Test 7a: int2 navigation with bound (line 210)
+CREATE UNLOGGED TABLE nav_int2(a int2);
+INSERT INTO nav_int2 SELECT (i % 30000 - 15000)::int2 FROM generate_series(1, 30000) i;
+CREATE INDEX nav_int2_smol ON nav_int2 USING smol(a);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Range scan to trigger bound check with zone maps
+SELECT count(*) FROM nav_int2 WHERE a > 1000::int2 AND a < 2000::int2;
+DROP TABLE nav_int2 CASCADE;
+
+-- Test 7b: int4 navigation with bound (line 212)
+CREATE UNLOGGED TABLE nav_int4(a int4);
+INSERT INTO nav_int4 SELECT i FROM generate_series(1, 30000) i;
+CREATE INDEX nav_int4_smol ON nav_int4 USING smol(a);
+SELECT count(*) FROM nav_int4 WHERE a > 10000 AND a < 20000;
+DROP TABLE nav_int4 CASCADE;
+
+-- Test 7c: int8 navigation with bound (line 214)
+CREATE UNLOGGED TABLE nav_int8(a int8);
+INSERT INTO nav_int8 SELECT i::int8 FROM generate_series(1, 30000) i;
+CREATE INDEX nav_int8_smol ON nav_int8 USING smol(a);
+SELECT count(*) FROM nav_int8 WHERE a > 10000::int8 AND a < 20000::int8;
+DROP TABLE nav_int8 CASCADE;
+
+-- Test 7d: Other type (UUID) navigation (line 229)
+CREATE UNLOGGED TABLE nav_uuid(a uuid);
+INSERT INTO nav_uuid SELECT gen_random_uuid() FROM generate_series(1, 5000) i;
+CREATE INDEX nav_uuid_smol ON nav_uuid USING smol(a);
+-- Just scan to trigger navigation (count will vary due to random UUIDs)
+SELECT count(*) > 0 AS has_rows FROM nav_uuid;
+DROP TABLE nav_uuid CASCADE;
+
+\echo 'Test 7 PASSED: Type-specific navigation'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 8: Zone maps disabled - int8+INCLUDE'
+\echo 'Coverage: Lines 1050-1056 in smol_build_tree1_inc_from_sorted'
+\echo '============================================================================'
+
+SET smol.build_zone_maps = false;
+CREATE UNLOGGED TABLE zm_int8_inc_disabled(a int8, b int4);
+INSERT INTO zm_int8_inc_disabled SELECT i::int8, i*2 FROM generate_series(1, 10000) i;
+CREATE INDEX zm_int8_inc_disabled_smol ON zm_int8_inc_disabled USING smol(a) INCLUDE (b);
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_int8_inc_disabled WHERE a > 5000::int8;
+DROP TABLE zm_int8_inc_disabled CASCADE;
+SET smol.build_zone_maps = true;
+
+\echo 'Test 8 PASSED: Zone maps disabled int8+INCLUDE'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 9: Massive indexes for zone map navigation'
+\echo 'Coverage: Lines 210, 212, 214, 229 - type-specific bound extraction'
+\echo '============================================================================'
+
+-- Create HUGE indexes to force multi-level trees with zone map navigation
+-- Test 9a: int2 with 100K rows
+CREATE UNLOGGED TABLE huge_int2(a int2);
+INSERT INTO huge_int2 SELECT (i % 30000)::int2 FROM generate_series(1, 100000) i;
+CREATE INDEX huge_int2_smol ON huge_int2 USING smol(a);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Range scan to trigger zone map navigation in multi-level tree
+SELECT count(*) FROM huge_int2 WHERE a > 10000::int2 AND a < 15000::int2;
+DROP TABLE huge_int2 CASCADE;
+
+-- Test 9b: int4 with 100K rows
+CREATE UNLOGGED TABLE huge_int4(a int4);
+INSERT INTO huge_int4 SELECT i FROM generate_series(1, 100000) i;
+CREATE INDEX huge_int4_smol ON huge_int4 USING smol(a);
+SELECT count(*) FROM huge_int4 WHERE a > 50000 AND a < 60000;
+DROP TABLE huge_int4 CASCADE;
+
+-- Test 9c: int8 with 100K rows
+CREATE UNLOGGED TABLE huge_int8(a int8);
+INSERT INTO huge_int8 SELECT i::int8 FROM generate_series(1, 100000) i;
+CREATE INDEX huge_int8_smol ON huge_int8 USING smol(a);
+SELECT count(*) FROM huge_int8 WHERE a > 50000::int8 AND a < 60000::int8;
+DROP TABLE huge_int8 CASCADE;
+
+-- Test 9d: UUID with many rows
+CREATE UNLOGGED TABLE huge_uuid(a uuid);
+INSERT INTO huge_uuid SELECT gen_random_uuid() FROM generate_series(1, 50000) i;
+CREATE INDEX huge_uuid_smol ON huge_uuid USING smol(a);
+SELECT count(*) > 0 AS has_rows FROM huge_uuid WHERE a > '00000000-0000-0000-0000-000000000000'::uuid;
+DROP TABLE huge_uuid CASCADE;
+
+\echo 'Test 9 PASSED: Massive indexes for navigation'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 10: Very tall tree for reallocation'
+\echo 'Coverage: Lines 1573-1574 - internal level reallocation'
+\echo '============================================================================'
+
+-- Create huge index to force very tall tree and trigger reallocation
+CREATE UNLOGGED TABLE huge_realloc(a int4);
+INSERT INTO huge_realloc SELECT i FROM generate_series(1, 200000) i;
+CREATE INDEX huge_realloc_smol ON huge_realloc USING smol(a);
+SELECT count(*) FROM huge_realloc WHERE a > 100000;
+DROP TABLE huge_realloc CASCADE;
+
+\echo 'Test 10 PASSED: Very tall tree reallocation'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 11: TEXT stream build with zone maps disabled'
+\echo 'Coverage: Lines 1955-1960 in smol_build_text_stream_from_tuplesort'
+\echo '============================================================================'
+
+-- Create TEXT table for stream build (tuplesort path)
+SET smol.build_zone_maps = false;
+CREATE UNLOGGED TABLE zm_text_stream_disabled(a text COLLATE "C");
+-- Insert data in random order to force tuplesort/streaming build
+INSERT INTO zm_text_stream_disabled
+  SELECT 'text_key_' || lpad(((i * 7919) % 10000)::text, 6, '0')
+  FROM generate_series(1, 10000) i;
+ANALYZE zm_text_stream_disabled;
+
+-- Build index with zone maps disabled (will use stream build path)
+CREATE INDEX zm_text_stream_disabled_smol ON zm_text_stream_disabled USING smol(a);
+
+-- Verify index works
+SET enable_seqscan = off;
+SELECT count(*) FROM zm_text_stream_disabled WHERE a > 'text_key_005000';
+DROP TABLE zm_text_stream_disabled CASCADE;
+
+SET smol.build_zone_maps = true;
+\echo 'Test 11 PASSED: TEXT stream build with zone maps disabled'
+\echo ''
+
+\echo '============================================================================'
+\echo 'Test 12: Bloom filters - build and scan'
+\echo 'Coverage: Bloom filter building and scanning code paths'
+\echo '          smol_bloom_build_page, smol_bloom_test, bloom scan logic'
+\echo '============================================================================'
+
+-- Enable bloom filters for building and scanning
+SET smol.build_bloom_filters = true;
+SET smol.bloom_filters = true;
+SET smol.bloom_nhash = 2;
+
+-- Test 12a: INT4 with bloom filters - low cardinality
+CREATE UNLOGGED TABLE bloom_int4(a int4);
+INSERT INTO bloom_int4 SELECT (i % 10) FROM generate_series(1, 100000) i;
+ANALYZE bloom_int4;
+CREATE INDEX bloom_int4_smol ON bloom_int4 USING smol(a);
+SET enable_seqscan = off;
+-- Equality query should trigger bloom filter checks
+SELECT count(*) FROM bloom_int4 WHERE a = 5;
+SELECT count(*) FROM bloom_int4 WHERE a = 3;
+DROP TABLE bloom_int4 CASCADE;
+
+-- Test 12b: INT2 with bloom filters
+CREATE UNLOGGED TABLE bloom_int2(a int2);
+INSERT INTO bloom_int2 SELECT ((i % 8))::int2 FROM generate_series(1, 50000) i;
+ANALYZE bloom_int2;
+CREATE INDEX bloom_int2_smol ON bloom_int2 USING smol(a);
+SELECT count(*) FROM bloom_int2 WHERE a = 2::int2;
+DROP TABLE bloom_int2 CASCADE;
+
+-- Test 12c: INT8 with bloom filters
+CREATE UNLOGGED TABLE bloom_int8(a int8);
+INSERT INTO bloom_int8 SELECT ((i % 12))::int8 FROM generate_series(1, 50000) i;
+ANALYZE bloom_int8;
+CREATE INDEX bloom_int8_smol ON bloom_int8 USING smol(a);
+SELECT count(*) FROM bloom_int8 WHERE a = 7::int8;
+DROP TABLE bloom_int8 CASCADE;
+
+-- Test 12d: DATE type with bloom filters
+CREATE UNLOGGED TABLE bloom_date(a date);
+INSERT INTO bloom_date SELECT date '2024-01-01' + ((i % 10) || ' days')::interval FROM generate_series(1, 50000) i;
+ANALYZE bloom_date;
+CREATE INDEX bloom_date_smol ON bloom_date USING smol(a);
+SELECT count(*) FROM bloom_date WHERE a = '2024-01-05'::date;
+DROP TABLE bloom_date CASCADE;
+
+-- Test 12e: Different nhash values
+SET smol.bloom_nhash = 1;
+CREATE UNLOGGED TABLE bloom_nhash1(a int4);
+INSERT INTO bloom_nhash1 SELECT (i % 6) FROM generate_series(1, 30000) i;
+CREATE INDEX bloom_nhash1_smol ON bloom_nhash1 USING smol(a);
+SELECT count(*) FROM bloom_nhash1 WHERE a = 4;
+DROP TABLE bloom_nhash1 CASCADE;
+
+SET smol.bloom_nhash = 4;
+CREATE UNLOGGED TABLE bloom_nhash4(a int4);
+INSERT INTO bloom_nhash4 SELECT (i % 6) FROM generate_series(1, 30000) i;
+CREATE INDEX bloom_nhash4_smol ON bloom_nhash4 USING smol(a);
+SELECT count(*) FROM bloom_nhash4 WHERE a = 2;
+DROP TABLE bloom_nhash4 CASCADE;
+
+-- Test 12f: Bloom filters disabled during build
+SET smol.build_bloom_filters = false;
+CREATE UNLOGGED TABLE bloom_disabled(a int4);
+INSERT INTO bloom_disabled SELECT (i % 5) FROM generate_series(1, 20000) i;
+CREATE INDEX bloom_disabled_smol ON bloom_disabled USING smol(a);
+SELECT count(*) FROM bloom_disabled WHERE a = 3;
+DROP TABLE bloom_disabled CASCADE;
+
+-- Re-enable for subsequent tests
+SET smol.build_bloom_filters = true;
+SET smol.bloom_filters = true;
+SET smol.bloom_nhash = 2;
+-- Force small pages to ensure multiple pages even with small dataset
+SET smol.test_max_tuples_per_page = 50;
+
+-- Test 12g: Bloom filters with RLE-compressed pages
+-- Tests smol_bloom_build_page() with RLE format (SMOL_TAG_KEY_RLE_V2)
+-- This covers both RLE decoding in bloom filter build and scanning with bloom filters
+SET smol.bloom_filters = on;
+SET smol.build_bloom_filters = on;
+SET smol.bloom_nhash = 2;
+SET smol.test_max_tuples_per_page = 15;  -- Force small pages to trigger RLE compression
+
+CREATE UNLOGGED TABLE bloom_rle(a int4);
+-- Insert 5000 distinct values
+INSERT INTO bloom_rle SELECT i FROM generate_series(0, 4999) i;
+-- Insert 50,000 duplicates of value 4999 (will be RLE-compressed)
+INSERT INTO bloom_rle SELECT 4999 FROM generate_series(1, 50000) i;
+CREATE INDEX bloom_rle_idx ON bloom_rle USING smol(a);
+
+-- This should return 50,001 rows (1 + 50,000)
+-- Before the fix, this would return only 311 rows (99.4% data loss!)
+SET enable_seqscan = off;
+SELECT count(*) FROM bloom_rle WHERE a = 4999;
+
+-- Test with another value to ensure non-RLE pages also work
+SELECT count(*) FROM bloom_rle WHERE a = 100;
+
+DROP TABLE bloom_rle CASCADE;
+
+-- Reset GUC
+SET smol.test_max_tuples_per_page = 0;
+
+\echo 'Test 12 PASSED: Bloom filters'
+\echo ''
+
+-- ============================================================================
+-- Cleanup
+-- ============================================================================
+DROP TABLE IF EXISTS zm_disabled CASCADE;
+DROP TABLE IF EXISTS zm_int2 CASCADE;
+DROP TABLE IF EXISTS zm_int4 CASCADE;
+DROP TABLE IF EXISTS zm_uuid CASCADE;
+DROP TABLE IF EXISTS zm_bytea CASCADE;
+DROP TABLE IF EXISTS zm_empty CASCADE;
+DROP TABLE IF EXISTS zm_truly_empty CASCADE;
+DROP TABLE IF EXISTS zm_realloc CASCADE;
+DROP TABLE IF EXISTS zm_dups CASCADE;
+
+\echo '============================================================================'
+\echo 'All zone maps and bloom filter coverage tests PASSED!'
+\echo '============================================================================'

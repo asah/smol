@@ -1,0 +1,44 @@
+-- Mini test to cover bloom filter skip logic during scan
+-- Target: smol_scan.c:1230-1254 (bloom rejection and page skipping)
+-- Strategy: Use test GUC to force bloom rejection on pages after the first
+SET smol.bloom_filters = on;
+SET smol.build_bloom_filters = on;
+SET smol.profile = on;
+
+-- Create large multi-page table with specific value distribution
+-- Value 1 appears on first AND last pages to force rightlink traversal
+CREATE UNLOGGED TABLE test_bloom_skip(k int4);
+
+-- Insert value 1 at the beginning (will be on first leaf page)
+INSERT INTO test_bloom_skip SELECT 1 FROM generate_series(1, 625);
+
+-- Insert many different values to create multiple middle leaf pages
+-- These pages will NOT contain value 1, so bloom should reject them
+INSERT INTO test_bloom_skip SELECT (i % 10000) + 2 FROM generate_series(1, 125000) i;
+
+-- Insert value 1 at the end (will be on last leaf pages)
+-- This forces scanner to traverse through middle pages to find more matches
+INSERT INTO test_bloom_skip SELECT 1 FROM generate_series(1, 625);
+
+-- Force small pages to trigger rightlink traversal
+-- This is THE KEY to making prof_pages++ execute (line 2020)
+SET smol.test_max_tuples_per_page = 10;
+
+-- Create index with bloom filters
+CREATE INDEX test_bloom_skip_idx ON test_bloom_skip USING smol(k);
+
+-- Now use test GUC to force bloom rejection on pages after the first
+-- This will trigger the skip logic (lines 1230-1254) that we're trying to cover
+SET smol.test_force_bloom_rejection = on;
+SET enable_seqscan = off;
+
+-- Equality scan for k=1:
+-- 1. Finds value 1 on first page (prof_pages=0, no bloom check)
+-- 2. Follows rightlinks (prof_pages>0, bloom checks enabled)
+-- 3. GUC forces bloom to reject middle pages (triggers skip logic)
+-- 4. Eventually stops when no more pages (covers "no more pages" branch)
+SELECT count(*) FROM test_bloom_skip WHERE k = 1;
+
+-- Reset and cleanup
+SET smol.test_force_bloom_rejection = off;
+DROP TABLE test_bloom_skip CASCADE;

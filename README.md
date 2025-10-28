@@ -121,6 +121,7 @@ SMOL uses a B-tree structure like nbtree, but optimized for read-only access:
 4. **Adaptive compression**: Run-length encoding (RLE) for duplicate-heavy data, plain format for unique data
 5. **Tuple caching**: Pre-built tuple structures reduce per-row overhead
 6. **C collation**: Text treated as fixed-width binary data for efficient comparison
+7. **Lookup and Scan Optimizations**: Several advanced techniques for optimizing query performance, including page prefetch, zone maps and bloom filters
 
 ### Design Decision: Plain Format vs Zero-Copy
 

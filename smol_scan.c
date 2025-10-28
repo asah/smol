@@ -439,6 +439,11 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->prof_bytes = 0;
     so->prof_touched = 0;
     so->prof_bsteps = 0;
+    /* Zone map + bloom filter profiling counters */
+    so->prof_subtrees_checked = 0;
+    so->prof_subtrees_skipped = 0;
+    so->prof_bloom_checks = 0;
+    so->prof_bloom_skips = 0;
     so->run_key_built = false;
     if (so->inc_meta)
     {
@@ -1155,10 +1160,10 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         BlockNumber next;
 
         /* Ensure current leaf is pinned; page pointer valid */
-        if (!so->have_pin || !BufferIsValid(so->cur_buf)) 
+        if (!so->have_pin || !BufferIsValid(so->cur_buf))
         {
-            so->cur_buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy); /* GCOV_EXCL_LINE */
-            so->have_pin = true; /* GCOV_EXCL_LINE */
+            so->cur_buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
+            so->have_pin = true;
         }
         buf = so->cur_buf;
         page = BufferGetPage(buf);
@@ -1188,6 +1193,69 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             /* Plain format: first u16 is nitems (no tag) */
             so->cur_page_nitems = tag;
             so->cur_page_format = 0;
+        }
+
+        /* Bloom filter check for equality queries: skip pages that definitely don't contain the target value
+         * Only applicable for:
+         * - Equality queries (have_k1_eq set, which means WHERE col = value)
+         * - Single-column indexes (bloom on k1 only)
+         * - Forward scans (backward scans handle bounds differently)
+         * - When bloom filters are enabled globally and in metadata
+         * - NOT the first page (prof_pages > 0): first page found via B-tree descent should contain target
+         *
+         * NOTE: Bloom filters are built on-the-fly for each page during rightlink sequential scanning.
+         * While this adds overhead, it can save significant work if the bloom indicates the page
+         * definitely doesn't contain the search value, allowing us to skip scanning potentially
+         * thousands of tuples. A better implementation would check blooms during B-tree descent
+         * using pre-built blooms stored in internal nodes, but that requires more invasive changes.
+         */
+        if (smol_bloom_filters && so->have_k1_eq && !so->two_col && dir == ForwardScanDirection && so->prof_pages > 0)
+        {
+            SmolMeta meta;
+            smol_meta_read(idx, &meta);
+            if (meta.bloom_enabled && meta.bloom_nhash > 0)
+            {
+                /* Build bloom filter for this page on-the-fly */
+                uint64 page_bloom = smol_bloom_build_page(page, so->key_len, so->atttypid, meta.bloom_nhash);
+                if (so->prof_enabled)
+                    so->prof_bloom_checks++;
+
+                SMOL_LOGF("bloom check page %u: bloom=%lx key=%d nhash=%d", so->cur_blk,
+                         (unsigned long)page_bloom, DatumGetInt32(so->bound_datum), meta.bloom_nhash);
+
+                /* Test if our search key might be in this page */
+                if (!smol_bloom_test(page_bloom, so->bound_datum, so->atttypid, meta.bloom_nhash))
+                {
+                    /* Bloom filter says the key is definitely NOT in this page - skip it */
+                    if (so->prof_enabled)
+                        so->prof_bloom_skips++;
+                    SMOL_LOGF("bloom SKIP page %u for equality scan", so->cur_blk);
+
+                    /* Advance to next page */
+                    op = smol_page_opaque(page);
+                    next = op->rightlink;
+                    if (BlockNumberIsValid(next))
+                    {
+                        /* Release current buffer and move to next */
+                        ReleaseBuffer(so->cur_buf);
+                        so->have_pin = false;
+                        so->cur_blk = next;
+                        continue;  /* Skip to next iteration of while loop */
+                    }
+                    else
+                    {
+                        /* No more pages */
+                        if (so->have_pin && BufferIsValid(so->cur_buf))
+                        {
+                            ReleaseBuffer(so->cur_buf);
+                            so->have_pin = false;
+                        }
+                        so->cur_blk = InvalidBlockNumber;
+                        return false;
+                    }
+                }
+                /* Bloom test passed - page might contain our key, proceed with scan */
+            }
         }
 
         /* Run-detection optimization: check page type ONCE per page (not per row)
@@ -1948,8 +2016,11 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
             so->have_pin = false;
             so->cur_buf = InvalidBuffer;
         }
-        if (so->prof_enabled)
-            so->prof_pages++;
+        /* Increment page counter unconditionally (needed for bloom filter checks) */
+        so->prof_pages++;
+        /* Update profiling stats if enabled */
+        if (!so->prof_enabled)
+            ;  /* No-op, but keeps symmetry with other prof_* increments */
         so->cur_blk = next;
         so->cur_off = (dir == BackwardScanDirection) ? InvalidOffsetNumber : FirstOffsetNumber;
         so->cur_group = 0;
@@ -2098,13 +2169,15 @@ smol_endscan(IndexScanDesc scan)
         if (so->inc_meta)
             pfree(so->inc_meta);
         if (so->prof_enabled)
-            elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu",
+            elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu bloom_checks=%lu bloom_skips=%lu",
                  (unsigned long) so->prof_calls,
                  (unsigned long) so->prof_rows,
                  (unsigned long) so->prof_pages,
                  (unsigned long) so->prof_bytes,
                  (unsigned long) so->prof_touched,
-                 (unsigned long) so->prof_bsteps);
+                 (unsigned long) so->prof_bsteps,
+                 (unsigned long) so->prof_bloom_checks,
+                 (unsigned long) so->prof_bloom_skips);
         pfree(so);
     }
 }

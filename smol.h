@@ -135,6 +135,9 @@ extern int smol_test_max_tuples_per_page;
  * N blocks earlier than optimal. Used to test binary search in subsequent leaves.
  */
 extern int smol_test_leaf_offset;
+/* Bloom filter coverage testing GUCs */
+extern bool smol_test_force_invalid_nhash;   /* Force invalid nhash for coverage (lines 919,951) */
+extern bool smol_test_force_bloom_rejection; /* Force bloom rejection for coverage (line 928) */
 #else
 /* Production builds: test GUCs are constant 0 (dead code elimination) */
 #define smol_test_max_internal_fanout 0
