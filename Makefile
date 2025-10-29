@@ -102,9 +102,7 @@ dpsql:
 
 
 dclaude:
-	docker exec -u postgres smol bash -c "mkdir -p .claude"
-	docker cp $(HOME)/.claude/.credentials.json smol:/home/postgres/.claude/.credentials.json
-	docker exec -u postgres -w /home/postgres  -it smol bash -c "claude --allowedTools 'Bash:*,ReadFile:*,WriteFile:(/home/postgres/*),DeleteFile:(/home/postgres/*),git,grep,ls,python,bash,psql,su,make' --model claude-sonnet-4-5-20250929 \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read *.md, smol.c, sql/*, bench/*. Read AGENTS.md and do what it says.\""
+	docker exec -u postgres -w /home/postgres  -it smol bash -c "claude --dangerously-skip-permissions --model claude-sonnet-4-5-20250929 \"you are running inside a Docker container; to understand the goals, restore your memory and know what to work on next, please read *.md, *.c, sql/*, bench/*.\""
 
 # ---------------------------------------------------------------------------
 # Benchmarks - Pretty output with Python runner + legacy SQL benchmarks
