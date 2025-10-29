@@ -2963,7 +2963,10 @@ SELECT * FROM t_utf8_basic WHERE name >= 'café' COLLATE "en-US-x-icu" AND name 
  café
  cherry
  Date
-(3 rows)
+ éclair
+ élève
+ naïve
+(6 rows)
 
 -- Range scan with strict bounds (> AND <)
 EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name > 'café' COLLATE "en-US-x-icu" AND name < 'naïve' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
@@ -2978,7 +2981,9 @@ SELECT * FROM t_utf8_basic WHERE name > 'café' COLLATE "en-US-x-icu" AND name <
 --------
  cherry
  Date
-(2 rows)
+ éclair
+ élève
+(4 rows)
 
 -- Test 6: Range scans with longer UTF-8 strings
 EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_long WHERE description >= 'crème' COLLATE "en-US-x-icu" ORDER BY description COLLATE "en-US-x-icu";

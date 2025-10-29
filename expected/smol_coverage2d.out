@@ -278,3 +278,43 @@ SELECT count(*) FROM zm_guc_text_test WHERE s >= 'key_000500';
 -- Cleanup
 SET smol.test_force_bloom_rejection = off;
 DROP TABLE zm_guc_text_test CASCADE;
+-- ============================================================================
+-- Generic comparator for non-C collation text (lines 698-710, 725 in smol_utils.c)
+-- ============================================================================
+-- Test text key comparisons with non-C collation to cover generic comparator varlena conversion
+DROP TABLE IF EXISTS t_text_collation_cmp CASCADE;
+CREATE UNLOGGED TABLE t_text_collation_cmp (k text);
+-- Insert short text values (will use 8-byte keys)
+INSERT INTO t_text_collation_cmp VALUES
+    ('apple'), ('banana'), ('cherry'), ('date'),
+    ('café'), ('naïve'), ('résumé');
+-- Create index with ICU collation (non-C)
+CREATE INDEX idx_text_collation ON t_text_collation_cmp USING smol(k COLLATE "en-US-x-icu");
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Queries that force generic comparator usage (non-C collation)
+-- These will hit the text varlena conversion code in smol_cmp_keyptr_bound_generic
+-- Lower bound (>=) triggers line 698-710
+SELECT count(*) FROM t_text_collation_cmp WHERE k >= 'café' COLLATE "en-US-x-icu";
+ count 
+-------
+     5
+(1 row)
+
+-- Upper bound (<=) also triggers line 698-710
+SELECT count(*) FROM t_text_collation_cmp WHERE k <= 'date' COLLATE "en-US-x-icu";
+ count 
+-------
+     5
+(1 row)
+
+-- Both bounds trigger pfree at line 725
+SELECT count(*) FROM t_text_collation_cmp WHERE k >= 'banana' COLLATE "en-US-x-icu" AND k <= 'cherry' COLLATE "en-US-x-icu";
+ count 
+-------
+     3
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE t_text_collation_cmp CASCADE;

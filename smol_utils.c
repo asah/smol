@@ -675,7 +675,7 @@ smol_find_end_position(Relation idx, SmolScanOpaque so,
 
 
 int
-smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, uint16 key_len, bool key_byval, Datum bound)
+smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, Oid atttypid, const char *keyp, uint16 key_len, bool key_byval, Datum bound)
 {
     Datum kd;
     if (key_byval)
@@ -694,7 +694,7 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
     else
     {
         /* Non-byval types: handle text vs other fixed-length types (UUID, etc.) */
-        if (key_len == 8 || key_len == 32)
+        if (atttypid == TEXTOID)
         {
             /* Text type: convert zero-padded data to proper varlena */
             /* Find actual length (up to first zero byte or key_len) */
@@ -711,7 +711,7 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
         }
         else
         {
-            /* Fixed-length type (UUID=16 bytes, etc.): pass raw pointer */
+            /* Fixed-length type (UUID, etc.): pass raw pointer */
             kd = PointerGetDatum((void *) keyp);
         }
     }
@@ -721,7 +721,7 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
     int32 c = DatumGetInt32(FunctionCall2Coll(cmp, coll, kd, bound));
 
     /* Free temporary varlena if we allocated one (only for text types) */
-    if (!key_byval && (key_len == 8 || key_len == 32))
+    if (!key_byval && atttypid == TEXTOID)
         pfree(DatumGetPointer(kd));
 
     return (c > 0) - (c < 0);

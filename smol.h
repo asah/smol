@@ -762,7 +762,7 @@ extern BlockNumber smol_find_first_leaf(Relation idx, int64 lower_bound, Oid att
 extern BlockNumber smol_find_first_leaf_generic(Relation idx, SmolScanOpaque so);
 extern BlockNumber smol_find_leaf_for_upper_bound(Relation idx, SmolScanOpaque so);
 extern void smol_find_end_position(Relation idx, SmolScanOpaque so, BlockNumber *end_blk_out, OffsetNumber *end_off_out);
-extern int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, uint16 key_len, bool key_byval, Datum bound);
+extern int smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, Oid atttypid, const char *keyp, uint16 key_len, bool key_byval, Datum bound);
 extern int smol_cmp_keyptr_bound(const char *keyp, uint16 key_len, Oid atttypid, int64 bound);
 extern uint16 smol_leaf_nitems(Page page);
 extern char *smol_leaf_keyptr_ex(Page page, uint16 idx, uint16 key_len, const uint16 *inc_lens, uint16 ninc, const uint32 *inc_cumul_offs);
@@ -798,7 +798,7 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
         if (so->use_generic_cmp)
         {
             /* Fall through to generic comparator for non-C collations */
-            return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+            return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->bound_datum);
         }
 
         /* C collation: compare 32-byte padded keyp with detoasted bound text (binary) */
@@ -814,7 +814,7 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
         /* If common prefix equal, shorter is smaller */
         return (klen > blen) - (klen < blen);
     }
-    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->bound_datum);
 }
 
 static inline int
@@ -835,7 +835,7 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
         if (so->use_generic_cmp)
         {
             /* Fall through to generic comparator for non-C collations */
-            return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
+            return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
         }
 
         /* C collation: compare with detoasted bound text (binary) */
@@ -850,7 +850,7 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
         return (klen > blen) - (klen < blen);
     }
     /* Generic comparator for other types (e.g., UUID, TIMESTAMP, FLOAT8) */
-    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
+    return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
 }
 #endif /* !SMOL_TEST_COVERAGE */
 

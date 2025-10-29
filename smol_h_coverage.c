@@ -94,7 +94,14 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
 		                                                                                : DatumGetInt64(so->bound_datum)));
 	if (so->have_bound && (so->atttypid == TEXTOID /* || so->atttypid == VARCHAROID */))
 	{
-		/* Compare 32-byte padded keyp with detoasted bound text under C collation (binary) */
+		/* Non-C collation: use PostgreSQL's comparator (can't use memcmp with non-C collations) */
+		if (so->use_generic_cmp)
+		{
+			/* Fall through to generic comparator for non-C collations */
+			return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->bound_datum);
+		}
+
+		/* C collation: compare 32-byte padded keyp with detoasted bound text (binary) */
 		text *bt = DatumGetTextPP(so->bound_datum);
 		int blen = VARSIZE_ANY_EXHDR(bt);
 		const char *b = VARDATA_ANY(bt);
@@ -107,7 +114,7 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
 		/* If common prefix equal, shorter is smaller */
 		return (klen > blen) - (klen < blen);
 	}
-	return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->bound_datum);
+	return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->bound_datum);
 }
 
 int
@@ -124,6 +131,14 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
 		                                                                                : DatumGetInt64(so->upper_bound_datum)));
 	if (so->atttypid == TEXTOID)
 	{
+		/* Non-C collation: use PostgreSQL's comparator (can't use memcmp with non-C collations) */
+		if (so->use_generic_cmp)
+		{
+			/* Fall through to generic comparator for non-C collations */
+			return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
+		}
+
+		/* C collation: compare with detoasted bound text (binary) */
 		text *bt = DatumGetTextPP(so->upper_bound_datum);
 		int blen = VARSIZE_ANY_EXHDR(bt);
 		const char *b = VARDATA_ANY(bt);
@@ -135,5 +150,5 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
 		return (klen > blen) - (klen < blen);
 	}
 	/* Generic comparator for other types (e.g., UUID, TIMESTAMP, FLOAT8) */
-	return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
+	return smol_cmp_keyptr_bound_generic(&so->cmp_fmgr, so->collation, so->atttypid, keyp, so->key_len, so->key_byval, so->upper_bound_datum);
 }
