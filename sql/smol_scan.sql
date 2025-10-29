@@ -271,14 +271,52 @@ SELECT count(*) FROM pos_test_gap WHERE a >= 1 AND a < 26000;
 SELECT count(*) FROM pos_test_gap WHERE a >= 1 AND a < 40000;
 SELECT count(*) FROM pos_test_gap WHERE a >= 40000 AND a < 66000;
 
--- Cleanup
+-- Cleanup position scan tests
 DROP TABLE pos_test CASCADE;
 DROP TABLE pos_test_multi CASCADE;
 DROP TABLE pos_test_gap CASCADE;
 
--- Reset settings
+-- Reset position scan settings
 RESET smol.use_position_scan;
+
+-- =============================================================================
+-- Tuple Buffering Tests
+-- =============================================================================
+-- Test tuple buffering optimization (plain format with INCLUDE columns)
+
+SET smol.use_tuple_buffering = on;
+
+-- Test 1: Basic tuple buffering with plain format
+DROP TABLE IF EXISTS t_tuple_buffer CASCADE;
+CREATE UNLOGGED TABLE t_tuple_buffer(k int4, v int4, extra text);
+INSERT INTO t_tuple_buffer SELECT i, i*2, 'data' || i FROM generate_series(1, 1000) i;
+CREATE INDEX t_tuple_buffer_idx ON t_tuple_buffer USING smol(k) INCLUDE (v);
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = on;
+
+-- Forward scan using tuple buffering
+SELECT count(*), sum(k), sum(v) FROM t_tuple_buffer WHERE k >= 100 AND k <= 200;
+
+-- Test 2: Multiple INCLUDE columns
+DROP TABLE IF EXISTS t_multi_include CASCADE;
+CREATE UNLOGGED TABLE t_multi_include(k int4, v1 int4, v2 int4, v3 int4);
+INSERT INTO t_multi_include SELECT i, i*2, i*3, i*4 FROM generate_series(1, 500) i;
+CREATE INDEX t_multi_include_idx ON t_multi_include USING smol(k) INCLUDE (v1, v2, v3);
+
+SELECT count(*), sum(v1), sum(v2), sum(v3) FROM t_multi_include WHERE k >= 50 AND k <= 450;
+
+-- Cleanup tuple buffering tests
+DROP TABLE t_tuple_buffer CASCADE;
+DROP TABLE t_multi_include CASCADE;
+RESET smol.use_tuple_buffering;
+
+-- Reset all scan settings
 RESET enable_seqscan;
+RESET enable_indexscan;
 RESET enable_bitmapscan;
+RESET enable_indexonlyscan;
 RESET max_parallel_workers_per_gather;
 

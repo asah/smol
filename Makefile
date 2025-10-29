@@ -25,12 +25,12 @@ endif
 # smol_scan now includes position-based scan optimization tests
 REGRESS_BASE = smol_core smol_scan smol_rle
 
-# Coverage-only tests (12 consolidated tests)
+# Coverage-only tests (10 consolidated tests)
 # smol_coverage3 now includes all bloom filter edge cases (consolidates 8 tests into 1)
-# smol_tuple_buffering exercises tuple buffering optimization code paths
-REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip smol_tuple_buffering
+# Tuple buffering tests merged into smol_scan (production test)
+REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip
 
-# Full test list: 12 tests for coverage builds, 3 for production
+# Full test list: 13 tests for coverage builds (3 production + 10 coverage-only), 3 for production
 ifeq ($(COVERAGE),1)
 REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
 else
@@ -260,7 +260,12 @@ coverage-test: stop start
 	    test_num=$$((test_num + 1)); \
 	    echo "[coverage] Running test $$test_num/$$test_count: $$test"; \
 	    if COVERAGE=1 $(MAKE) installcheck REGRESS=$$test > /tmp/test_$$test.log 2>&1; then \
-	      echo "[coverage] ✓ Test $$test passed"; \
+	      timing=$$(grep "^ok.*$$test" /tmp/test_$$test.log | sed 's/.*\([0-9]\+ ms\)$$/\1/' || echo ""); \
+	      if [ -n "$$timing" ]; then \
+	        echo "[coverage] ✓ Test $$test passed ($$timing)"; \
+	      else \
+	        echo "[coverage] ✓ Test $$test passed"; \
+	      fi; \
 	    else \
 	      echo "[coverage] ✗ Test $$test FAILED"; \
 	      failed_tests="$$failed_tests $$test"; \
