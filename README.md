@@ -254,8 +254,154 @@ flowchart TD
     style Write2 fill:#e8f5e9
 ```
 
+## Performance Optimizations
 
+This section documents optimization attempts, their results, and rationale for adoption or rejection.
 
+### Implemented Optimizations ✅
+
+#### 1. Tuple Buffering (Plain Pages)
+**Status**: Enabled by default (configurable via `smol.use_tuple_buffering`)
+**Performance Impact**: **39-50% improvement** on high-selectivity range queries
+**Description**: Pre-builds multiple IndexTuple structures in a buffer during forward scans, reducing per-tuple overhead.
+
+**Why It Works (Plain Pages)**:
+- Amortizes function call overhead across multiple tuples
+- Reduces repeated page header access
+- Leverages sequential access patterns
+
+**Benchmark Results**:
+- 0.1% selectivity: 0.1ms (now tied with BTREE)
+- 10% selectivity: 7.9ms vs 6.4ms BTREE (gap closed from 1.8x to 1.2x)
+- Buffer size: 64 tuples (configurable via `smol.tuple_buffer_size`)
+
+**Configuration**:
+```sql
+SET smol.use_tuple_buffering = on;  -- default
+SET smol.tuple_buffer_size = 64;    -- tuples per buffer, default
+```
+
+#### 2. RLE Run Caching
+**Status**: Always enabled for RLE pages
+**Performance Impact**: O(1) access for sequential scans within runs
+**Description**: Caches the current RLE run position to avoid linear scanning through run headers.
+
+**Why It Works**:
+- RLE pages have runs where consecutive tuples share the same key
+- Caching run bounds provides O(1) access within a run
+- Amortized O(1) across entire page for sequential scans
+
+#### 3. Zone Maps
+**Status**: Enabled by default (configurable via `smol.zone_maps`)
+**Description**: Per-page min/max values for early page filtering in range queries.
+
+#### 4. Bloom Filters
+**Status**: Enabled by default (configurable via `smol.bloom_filters`)
+**Description**: Probabilistic filters for point queries to skip irrelevant pages.
+
+### Rejected Optimizations ❌
+
+#### 1. Tuple Buffering (RLE Pages)
+**Status**: Implemented but disabled (benchmarks showed regression)
+**Performance Impact**: **1.8-2.1x SLOWER** than unbuffered RLE scans
+
+**Why It Doesn't Work**:
+- RLE pages already have efficient run caching (see above)
+- Tuple buffering adds overhead without benefit:
+  - Additional function calls
+  - Memory allocation
+  - Memcpy operations per tuple
+  - Redundant work since run caching already provides O(1) access
+
+**Benchmark Results** (1M rows with high duplication):
+- id >= 90: 8.9ms (buffering) vs **5.0ms** (no buffering)
+- id = 50: 1.3ms (buffering) vs **0.6ms** (no buffering)
+
+**Implementation Notes**: The RLE buffering code exists in `smol_scan.c` (`smol_refill_tuple_buffer_rle()`) but is not called. Kept for documentation purposes.
+
+#### 2. Zero-Copy Format
+**Status**: Prototyped during initial development, abandoned
+**Description**: Pre-materialized IndexTuple structures on disk to eliminate memcpy during scans.
+
+**Why It Doesn't Work**:
+- PostgreSQL's index-only scan protocol requires tuple construction anyway
+- Per-tuple overhead doubled index size for narrow rows
+- Hurt I/O and cache efficiency (more pages to read)
+- Benchmarks showed no performance benefit (slightly slower due to extra I/O)
+
+**Decision**: Use plain format for unique data, RLE compression for duplicates.
+
+#### 3. Explicit SIMD Vectorization
+**Status**: Assessed but deferred (not currently needed)
+**Rationale**:
+- Tuple buffering already achieved 39-50% improvement (exceeded 25-35% target)
+- Compiler already auto-vectorizes memcpy operations
+- Explicit SIMD would add only 10-15% additional gain
+- High implementation complexity for diminishing returns
+- Platform-specific code increases maintenance burden
+
+**When to Reconsider**: If profiling shows memcpy as a bottleneck (>20% of scan time).
+
+### Not Yet Attempted
+
+#### 1. Backward Scan Buffering
+**Status**: Not implemented
+**Complexity**: Medium
+**Potential Impact**: 20-30% improvement for backward scans
+**Priority**: Low (backward scans are rare in analytical workloads)
+
+#### 2. Two-Column Index Buffering
+**Status**: Not implemented
+**Complexity**: High (requires different buffering strategy)
+**Potential Impact**: Unknown
+**Blocker**: Two-column indexes have different page layout and access patterns
+
+#### 3. Variable-Width Tuple Buffering
+**Status**: Not implemented
+**Complexity**: Very high (requires dynamic buffer sizing)
+**Potential Impact**: Unknown
+**Note**: Fixed-width optimization is a core SMOL design principle
+
+### Configuration Reference
+
+```sql
+-- Tuple buffering (plain pages only)
+SET smol.use_tuple_buffering = on;     -- Enable/disable, default: on
+SET smol.tuple_buffer_size = 64;       -- Tuples per buffer, default: 64
+
+-- Zone maps and bloom filters
+SET smol.zone_maps = on;               -- Enable zone maps, default: on
+SET smol.bloom_filters = on;           -- Enable bloom filters, default: on
+SET smol.build_zone_maps = on;         -- Build zone maps during CREATE INDEX, default: on
+SET smol.build_bloom_filters = on;     -- Build blooms during CREATE INDEX, default: on
+SET smol.bloom_nhash = 2;              -- Number of hash functions, default: 2
+
+-- Debug/profiling (for development only)
+SET smol.debug_log = off;              -- Enable debug logging, default: off
+```
+
+### Performance Tuning Guidelines
+
+1. **Enable tuple buffering** for plain pages (default is ON)
+2. **Keep zone maps enabled** for range queries (default is ON)
+3. **Keep bloom filters enabled** for point queries (default is ON)
+4. **Adjust buffer size** based on typical result set size:
+   - Default (64): Good for most workloads
+   - Larger (128-256): High-selectivity queries returning many rows
+   - Smaller (32): Memory-constrained environments
+
+5. **Profile before tuning**: Use `EXPLAIN (ANALYZE, BUFFERS)` to understand query execution
+
+### Benchmark Methodology
+
+All benchmarks use:
+- PostgreSQL 15+
+- 1M row test tables
+- Warm cache (data in shared_buffers)
+- Index-only scans forced via `SET enable_seqscan = off`
+- Times averaged over 3 runs
+
+See `bench/` directory for comprehensive benchmark suite.
 
 
 
