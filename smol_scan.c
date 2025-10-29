@@ -538,6 +538,7 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
     so->have_upper_bound = false;
     so->have_k1_eq = false;
     so->have_k2_eq = false;
+    so->use_generic_cmp = false;
     so->chunk_left = 0;
 
     /* Store all scankeys for runtime filtering */
@@ -607,6 +608,16 @@ smol_rescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int n
                     so->need_runtime_key_test = true;
                 }
             }
+        }
+
+        /* Check if we need to use generic comparator for non-C collation text keys */
+        if ((so->have_bound || so->have_upper_bound) && so->atttypid == TEXTOID)
+        {
+            pg_locale_t locale = pg_newlocale_from_collation(so->collation);
+
+            /* Set flag to route to generic comparator for non-C collations */
+            if (locale && !locale->collate_is_c)
+                so->use_generic_cmp = true;
         }
     }
     else

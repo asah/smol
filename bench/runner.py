@@ -66,7 +66,7 @@ class BenchmarkRunner:
         workloads = []
 
         if self.mode == 'quick':
-            # Quick mode: Comprehensive 20-second suite
+            # Quick mode: Comprehensive 30-second suite (18 workloads)
             rows = 1_000_000
             workers = min(4, self.env.max_workers)
 
@@ -83,91 +83,97 @@ class BenchmarkRunner:
                     {'rows': rows, 'key_type': 'uuid', 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 3. Composite keys (3s) - multi-column RLE
+                # 3. UTF-8 text keys (2s) - ICU collation with strxfrm
+                TextKeysWorkload(
+                    self.db, self.cache,
+                    {'rows': rows, 'key_type': 'text_utf8', 'collation': 'en-US-x-icu', 'cache_modes': ['hot'], 'parallelism': 0}
+                ),
+
+                # 4. Composite keys (3s) - multi-column RLE
                 CompositeWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 4. Selectivity 0.1% (2s) - point query baseline
+                # 5. Selectivity 0.1% (2s) - point query baseline
                 SelectivityRangeWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'selectivity': 0.001, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 5. Selectivity 10% (2s) - large range scan
+                # 6. Selectivity 10% (2s) - large range scan
                 SelectivityRangeWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'selectivity': 0.10, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 6. Parallel scaling 4 workers (2s) - parallelization advantage
+                # 7. Parallel scaling 4 workers (2s) - parallelization advantage
                 ParallelScalingWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': workers}
                 ),
 
-                # 7. INCLUDE overhead 0 cols (1s) - baseline
+                # 8. INCLUDE overhead 0 cols (1s) - baseline
                 IncludeOverheadWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'n_includes': 0, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 8. INCLUDE overhead 4 cols (1s) - columnar advantage
+                # 9. INCLUDE overhead 4 cols (1s) - columnar advantage
                 IncludeOverheadWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'n_includes': 4, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 9. RLE extreme (2s) - maximum compression
+                # 10. RLE extreme (2s) - maximum compression
                 TimeSeriesWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'metrics': 10, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 10. Backward scans (2s) - DESC optimization
+                # 11. Backward scans (2s) - DESC optimization
                 BackwardScanWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 11. LIMIT queries (2s) - early termination
+                # 12. LIMIT queries (2s) - early termination
                 LimitWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 12. IN clause (2s) - multiple point lookups
+                # 13. IN clause (2s) - multiple point lookups
                 InClauseWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 13. Data types: int2 (2s) - small integer optimization
+                # 14. Data types: int2 (2s) - small integer optimization
                 DataTypesWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'data_type': 'int2', 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 14. Data types: int8 (2s) - large integer
+                # 15. Data types: int8 (2s) - large integer
                 DataTypesWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'data_type': 'int8', 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 15. Data types: date (2s) - temporal data
+                # 16. Data types: date (2s) - temporal data
                 DataTypesWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'data_type': 'date', 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 16. Index-only scans (2s) - covering index
+                # 17. Index-only scans (2s) - covering index
                 IndexOnlyScanWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
                 ),
 
-                # 17. Partial indexes (2s) - filtered index
+                # 18. Partial indexes (2s) - filtered index
                 PartialIndexWorkload(
                     self.db, self.cache,
                     {'rows': rows, 'cache_modes': ['hot'], 'parallelism': 0}
@@ -288,7 +294,7 @@ def main():
     parser.add_argument(
         '--quick',
         action='store_true',
-        help='Run quick benchmark suite (2-3 min, for CI/regression)'
+        help='Run quick benchmark suite (~30 sec, 18 workloads, for CI/regression)'
     )
     parser.add_argument(
         '--full',

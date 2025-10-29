@@ -25,13 +25,13 @@ endif
 # smol_scan now includes position-based scan optimization tests
 REGRESS_BASE = smol_core smol_scan smol_rle
 
-# Coverage-only tests (11 consolidated tests)
+# Coverage-only tests (10 consolidated tests)
 # smol_coverage3 now includes all bloom filter edge cases (consolidates 8 tests into 1)
 # Tuple buffering tests merged into smol_scan (production test)
-# smol_utf8_collation tests UTF-8 collation support (pg_strnxfrm code path)
-REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip smol_utf8_collation
+# UTF-8 collation tests merged into smol_advanced
+REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip
 
-# Full test list: 14 tests for coverage builds (3 production + 11 coverage-only), 3 for production
+# Full test list: 13 tests for coverage builds (3 production + 10 coverage-only), 3 for production
 ifeq ($(COVERAGE),1)
 REGRESS = $(REGRESS_BASE) $(REGRESS_COVERAGE_ONLY)
 else
@@ -132,7 +132,7 @@ bench-help:
 	@echo ""
 	@echo "$(shell tput bold)Quick Start:$(shell tput sgr0)"
 	@echo "  make bench              # Run quick benchmark (alias for bench-quick)"
-	@echo "  make bench-quick        # Quick suite (~30 sec, 17 workloads)"
+	@echo "  make bench-quick        # Quick suite (~30 sec, 18 workloads)"
 	@echo "  make bench-full         # Full comprehensive suite (~15-20 min)"
 	@echo ""
 	@echo "$(shell tput bold)Features:$(shell tput sgr0)"

@@ -1877,30 +1877,13 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
 
             char *dest = keys_buf + (i * key_len);
 
-            /* Get locale for collation - handles C/POSIX/ICU/libc automatically */
-            pg_locale_t locale = pg_newlocale_from_collation(collation_oid);
-
-            if (!locale || locale->collate_is_c)
-            {
-                /* Fast path: C/POSIX collation - direct binary copy */
-                if (blen > 0) memcpy(dest, src, blen);
-                if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
-            }
-            else
-            {
-                /* Collation path: transform to sort key using pg_strnxfrm */
-                size_t xfrm_len = pg_strnxfrm(dest, key_len, src, blen, locale);
-
-                if (xfrm_len >= key_len)
-                    ereport(ERROR,
-                           (errmsg("smol: collation key exceeds %u bytes (source: %u bytes)",
-                                  key_len, blen),
-                            errhint("Try using a shorter text value or C collation.")));
-
-                /* Zero-pad remainder */
-                if (xfrm_len < key_len)
-                    memset(dest + xfrm_len, 0, key_len - xfrm_len);
-            }
+            /* Store original text (zero-padded) for all collations.
+             * Tuplesort has already sorted using the correct collation comparator,
+             * so the keys are in the right order. We store original text to support
+             * index-only scans. During scan, we'll transform both stored keys and
+             * query bounds for comparison. */
+            if (blen > 0) memcpy(dest, src, blen);
+            if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
 
             if (i == n_this - 1) memcpy(lastkey, dest, key_len);
             /* Do not pfree itup - owned by tuplesort */

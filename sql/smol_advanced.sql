@@ -495,3 +495,108 @@ SELECT count(*), sum(value) FROM t_line2041 WHERE id >= 50000;
 -- Clean up
 RESET smol.test_leaf_offset;
 DROP TABLE t_line2041;
+
+-- ============================================================================
+-- UTF-8 Collation Support
+-- ============================================================================
+-- Test UTF-8 collation support for text keys
+-- Tests both index building with non-C collations and scan-time comparisons
+
+-- Test 1: Basic UTF-8 collation index creation
+DROP TABLE IF EXISTS t_utf8_basic CASCADE;
+CREATE TABLE t_utf8_basic (
+    name text
+);
+
+INSERT INTO t_utf8_basic VALUES
+    ('apple'), ('Banana'), ('cherry'), ('Date'),
+    ('élève'), ('éclair'), ('café'), ('naïve');
+
+-- Create index with C collation (baseline)
+CREATE INDEX t_utf8_basic_c_idx ON t_utf8_basic USING smol(name COLLATE "C");
+
+-- Create index with ICU collation (uses generic comparator during scans)
+CREATE INDEX t_utf8_basic_icu_idx ON t_utf8_basic USING smol(name COLLATE "en-US-x-icu");
+
+-- Verify index was created
+\d t_utf8_basic
+
+-- Test 2: Longer UTF-8 strings
+DROP TABLE IF EXISTS t_utf8_long CASCADE;
+CREATE TABLE t_utf8_long (
+    description text
+);
+
+INSERT INTO t_utf8_long VALUES
+    ('café au lait'),
+    ('crème brûlée'),
+    ('naïve approach'),
+    ('résumé submitted'),
+    ('Zürich airport');
+
+CREATE INDEX t_utf8_long_idx ON t_utf8_long USING smol(description COLLATE "en-US-x-icu");
+
+-- Test 3: Various length strings
+DROP TABLE IF EXISTS t_utf8_lengths CASCADE;
+CREATE TABLE t_utf8_lengths (
+    val text
+);
+
+INSERT INTO t_utf8_lengths VALUES
+    ('a'),  -- 1 byte
+    ('hello'),  -- 5 bytes
+    ('test string here'),  -- 16 bytes
+    ('longer text value for testing'),  -- 31 bytes
+    ('exactly thirty-two bytes!!!!!!!');  -- 32 bytes
+
+CREATE INDEX t_utf8_lengths_idx ON t_utf8_lengths USING smol(val COLLATE "en-US-x-icu");
+
+-- Test 4: Verify C collation still uses optimized path (8-byte keys for short strings)
+DROP TABLE IF EXISTS t_c_collation CASCADE;
+CREATE TABLE t_c_collation (
+    name text
+);
+
+INSERT INTO t_c_collation VALUES ('z'), ('a'), ('m'), ('b');
+
+CREATE INDEX t_c_collation_idx ON t_c_collation USING smol(name COLLATE "C");
+
+-- C collation should use optimized path
+SELECT * FROM t_c_collation ORDER BY name COLLATE "C";
+
+-- Test 5: Range scans with UTF-8 collation (uses generic comparator)
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- Equality scan
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name = 'café' COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_basic WHERE name = 'café' COLLATE "en-US-x-icu";
+
+-- Range scan with lower bound (>=)
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name >= 'café' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_basic WHERE name >= 'café' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+
+-- Range scan with upper bound (<=)
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name <= 'café' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_basic WHERE name <= 'café' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+
+-- Range scan with both bounds (>= AND <=)
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name >= 'café' COLLATE "en-US-x-icu" AND name <= 'naïve' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_basic WHERE name >= 'café' COLLATE "en-US-x-icu" AND name <= 'naïve' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+
+-- Range scan with strict bounds (> AND <)
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_basic WHERE name > 'café' COLLATE "en-US-x-icu" AND name < 'naïve' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_basic WHERE name > 'café' COLLATE "en-US-x-icu" AND name < 'naïve' COLLATE "en-US-x-icu" ORDER BY name COLLATE "en-US-x-icu";
+
+-- Test 6: Range scans with longer UTF-8 strings
+EXPLAIN (COSTS OFF) SELECT * FROM t_utf8_long WHERE description >= 'crème' COLLATE "en-US-x-icu" ORDER BY description COLLATE "en-US-x-icu";
+SELECT * FROM t_utf8_long WHERE description >= 'crème' COLLATE "en-US-x-icu" ORDER BY description COLLATE "en-US-x-icu";
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- Cleanup
+DROP TABLE t_utf8_basic CASCADE;
+DROP TABLE t_utf8_long CASCADE;
+DROP TABLE t_utf8_lengths CASCADE;
+DROP TABLE t_c_collation CASCADE;
