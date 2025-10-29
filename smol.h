@@ -46,6 +46,7 @@
 #include "access/tupmacs.h"
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
+#include "utils/pg_locale.h"
 #include "portability/instr_time.h"
 #include "pgstat.h"
 #include "utils/selfuncs.h"
@@ -220,6 +221,8 @@ typedef struct SmolMeta
     bool        bloom_enabled;        /* bloom filters present */
     uint8       bloom_nhash;          /* number of hash functions (1-4) */
     uint8       padding;              /* alignment padding */
+    /* v3 field: collation for text keys */
+    Oid         collation_oid;        /* collation for first text key (InvalidOid if not text or C collation) */
 } SmolMeta;
 
 /* Page opaque data */

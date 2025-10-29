@@ -26,7 +26,7 @@ static void smol_build_text_inc_from_sorted(Relation idx, const char *keys32, co
 static void smol_build_internal_levels(Relation idx, BlockNumber *leaf_blks, const int64 *leaf_highkeys, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
 static void smol_build_internal_levels_bytes(Relation idx, BlockNumber *leaf_blks, const char *leaf_highkeys, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
 static void smol_build_internal_levels_with_stats(Relation idx, SmolLeafStats *leaf_stats, Size nleaves, uint16 key_len, BlockNumber *out_root, uint16 *out_levels);
-static void smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len);
+static void smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, Oid collation_oid);
 static void smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, bool byval);
 
 
@@ -509,14 +509,8 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     }
     else if (nkeyatts == 1 && atttypid == TEXTOID)
     {
-        /* Single-key text: sort with tuplesort then pack to 32-byte padded keys */
+        /* Single-key text: sort with tuplesort then pack to 32-byte padded keys (supports any collation) */
         Oid coll = TupleDescAttr(RelationGetDescr(index), 0)->attcollation;
-        /* Defensive check - no if-statement needed, macro handles everything */
-        SMOL_DEFENSIVE_CHECK(coll == C_COLLATION_OID ||
-            (get_collation_name(coll) &&
-             (strcmp(get_collation_name(coll), "C") == 0 ||
-              strcmp(get_collation_name(coll), "POSIX") == 0)), ERROR,
-            (errmsg("smol text keys require C/POSIX collation")));
         TypeCacheEntry *tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
         Tuplesortstate *ts;
         SmolTextBuildContext cb; int maxlen = 0;
@@ -569,10 +563,20 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         }
         INSTR_TIME_SET_CURRENT(t_sort_end);
         if (maxlen > 32) ereport(ERROR, (errmsg("smol text32 key exceeds 32 bytes")));
-        /* choose auto cap 8/16/32 */
-        uint16 cap = (maxlen <= 8) ? 8 : (maxlen <= 16 ? 16 : 32);
-        /* stream write */
-        smol_build_text_stream_from_tuplesort(index, ts, nkeys, cap);
+
+        /* Check if using non-C collation - ICU/libc sort keys are larger than source text */
+        pg_locale_t locale = pg_newlocale_from_collation(coll);
+        bool is_c_collation = (!locale || locale->collate_is_c);
+
+        /* Choose key length: C collation can optimize (8/16/32), non-C always uses 32 */
+        uint16 cap;
+        if (is_c_collation)
+            cap = (maxlen <= 8) ? 8 : (maxlen <= 16 ? 16 : 32);
+        else
+            cap = 32;  /* Non-C collations need 32 bytes for transformation */
+
+        /* stream write with collation support */
+        smol_build_text_stream_from_tuplesort(index, ts, nkeys, cap, coll);
         tuplesort_end(ts);
         INSTR_TIME_SET_CURRENT(t_write_end);
     }
@@ -862,6 +866,7 @@ smol_buildempty(Relation index)
     meta->root_blkno = InvalidBlockNumber;
     meta->height = 0;
     meta->inc_count = ninclude;
+    meta->collation_oid = InvalidOid;  /* No data yet, will be set during build */
     /* Set default INCLUDE lengths (will be overwritten by build callback if data exists) */
     for (int i = 0; i < ninclude && i < 16; i++)
     {
@@ -901,6 +906,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
+        meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
@@ -1185,6 +1191,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
+        meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
@@ -1796,9 +1803,10 @@ smol_build_internal_levels_bytes(Relation idx,
 }
 /* GCOV_EXCL_STOP */
 
-/* Stream-write text keys from tuplesort into leaf pages with given cap (8/16/32). */
+/* Stream-write text keys from tuplesort into leaf pages with given cap (8/16/32).
+ * Supports any collation via strxfrm transformation for non-C collations. */
 static void
-smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len)
+smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nkeys, uint16 key_len, Oid collation_oid)
 {
     /* init meta page if new */
     if (RelationGetNumberOfBlocks(idx) == 0)
@@ -1815,6 +1823,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        meta->collation_oid = collation_oid;  /* Store collation for text keys */
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
@@ -1867,8 +1876,31 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
             if (blen > (int) key_len) ereport(ERROR,(errmsg("smol text key exceeds cap")));
 
             char *dest = keys_buf + (i * key_len);
-            if (blen > 0) memcpy(dest, src, blen);
-            if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
+
+            /* Get locale for collation - handles C/POSIX/ICU/libc automatically */
+            pg_locale_t locale = pg_newlocale_from_collation(collation_oid);
+
+            if (!locale || locale->collate_is_c)
+            {
+                /* Fast path: C/POSIX collation - direct binary copy */
+                if (blen > 0) memcpy(dest, src, blen);
+                if (blen < (int) key_len) memset(dest + blen, 0, key_len - blen);
+            }
+            else
+            {
+                /* Collation path: transform to sort key using pg_strnxfrm */
+                size_t xfrm_len = pg_strnxfrm(dest, key_len, src, blen, locale);
+
+                if (xfrm_len >= key_len)
+                    ereport(ERROR,
+                           (errmsg("smol: collation key exceeds %u bytes (source: %u bytes)",
+                                  key_len, blen),
+                            errhint("Try using a shorter text value or C collation.")));
+
+                /* Zero-pad remainder */
+                if (xfrm_len < key_len)
+                    memset(dest + xfrm_len, 0, key_len - xfrm_len);
+            }
 
             if (i == n_this - 1) memcpy(lastkey, dest, key_len);
             /* Do not pfree itup - owned by tuplesort */
@@ -2079,6 +2111,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
         UnlockReleaseBuffer(mbuf);
