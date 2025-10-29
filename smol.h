@@ -104,6 +104,8 @@ extern int smol_prefetch_depth;
 extern double smol_rle_uniqueness_threshold;
 extern int smol_key_rle_version;
 extern bool smol_use_position_scan;
+extern bool smol_use_tuple_buffering;
+extern int smol_tuple_buffer_size;
 /* Zone maps + bloom filters GUCs */
 extern bool smol_zone_maps;              /* Enable zone map filtering during scan (default: on) */
 extern bool smol_bloom_filters;          /* Enable bloom filter checks during scan (default: on) */
@@ -412,6 +414,15 @@ typedef struct SmolScanOpaqueData
     /* key type flags */
     bool        key_is_text32;  /* true when key type is text/varchar packed to 32B */
     bool        has_varwidth;   /* any varlena field present in tuple (key or includes) */
+
+    /* Tuple buffering for high-selectivity scans (forward direction only) */
+    bool        tuple_buffering_enabled; /* true when buffering is active for this scan */
+    IndexTuple *tuple_buffer;     /* array of pre-built tuples */
+    char       *tuple_buffer_data; /* backing memory for tuple data */
+    uint16      tuple_buffer_capacity; /* buffer size (tuples) */
+    uint16      tuple_buffer_count;    /* number of valid tuples in buffer */
+    uint16      tuple_buffer_current;  /* current read position in buffer */
+    uint16      tuple_size;       /* size of each tuple (key + includes) */
 } SmolScanOpaqueData;
 typedef SmolScanOpaqueData *SmolScanOpaque;
 typedef struct SmolParallelScan

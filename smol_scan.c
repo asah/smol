@@ -464,6 +464,36 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     /* Initialize adaptive prefetch counters */
     so->pages_scanned = 0;
     so->adaptive_prefetch_depth = 0;
+
+    /* Initialize tuple buffering (forward scans only, fixed-width tuples only) */
+    if (smol_use_tuple_buffering && !so->two_col && !so->has_varwidth)
+    {
+        so->tuple_buffering_enabled = true;
+        so->tuple_buffer_capacity = smol_tuple_buffer_size;
+        so->tuple_buffer_count = 0;
+        so->tuple_buffer_current = 0;
+
+        /* Calculate tuple size: header + key + INCLUDE columns */
+        so->tuple_size = MAXALIGN(sizeof(IndexTupleData)) + MAXALIGN(so->key_len);
+        if (so->ninclude > 0)
+            so->tuple_size += so->inc_meta->inc_cumul_offs[so->ninclude - 1] +
+                             so->inc_meta->inc_len[so->ninclude - 1];
+
+        /* Allocate buffer arrays */
+        so->tuple_buffer = palloc(so->tuple_buffer_capacity * sizeof(IndexTuple));
+        so->tuple_buffer_data = palloc(so->tuple_buffer_capacity * so->tuple_size);
+
+        /* Initialize tuple pointers to point into contiguous data buffer */
+        for (int i = 0; i < so->tuple_buffer_capacity; i++)
+            so->tuple_buffer[i] = (IndexTuple)(so->tuple_buffer_data + i * so->tuple_size);
+    }
+    else
+    {
+        so->tuple_buffering_enabled = false;
+        so->tuple_buffer = NULL;
+        so->tuple_buffer_data = NULL;
+    }
+
     scan->opaque = so;
     return scan;
 }
@@ -764,6 +794,75 @@ smol_leaf_keyptr_cached(SmolScanOpaque so, Page page, uint16 idx, uint16 key_len
     /* Should not reach here - idx out of range */ /* GCOV_EXCL_LINE - defensive: idx always in valid range */
     ereport(ERROR, (errmsg("smol: cached keyptr index %u out of range [1,%u]", idx, nitems))); /* GCOV_EXCL_LINE */
     return NULL;  /* unreachable */ /* GCOV_EXCL_LINE */
+}
+
+/*
+ * smol_refill_tuple_buffer - Pre-build multiple tuples into buffer
+ *
+ * Returns number of tuples buffered (0 if end of scan or no matches)
+ * Only handles plain pages with fixed-width keys and INCLUDE columns.
+ */
+static uint16
+smol_refill_tuple_buffer_plain(SmolScanOpaque so, Page page)
+{
+    uint16 n = so->cur_page_nitems;
+    uint16 count = 0;
+    uint16 start_off = so->cur_off;
+    uint16 max_tuples = (n >= start_off) ? (n - start_off + 1) : 0;
+
+    if (max_tuples > so->tuple_buffer_capacity)
+        max_tuples = so->tuple_buffer_capacity;
+
+    if (max_tuples == 0)
+        return 0; // GCOV_EXCL_LINE - defensive: should never happen in normal operation
+
+    /* Get base pointer for keys: [uint16 n][keys][inc blocks...] */
+    ItemId iid = PageGetItemId(page, 1);
+    char *base = (char *) PageGetItem(page, iid);
+    char *key_base = base + sizeof(uint16);  /* Skip nitems count */
+
+    /* Bulk copy tuples */
+    for (uint16 i = 0; i < max_tuples; i++)
+    {
+        uint16 off = start_off + i;
+
+        /* Check upper bound if present */
+        if (so->have_upper_bound)
+        {
+            char *keyp = key_base + ((size_t)(off - 1)) * so->key_len;
+            int c = smol_cmp_keyptr_to_upper_bound(so, keyp);
+            if (so->upper_bound_strict ? (c >= 0) : (c > 0))
+                break;  /* Beyond upper bound */
+        }
+
+        /* Build tuple in buffer */
+        IndexTuple itup = so->tuple_buffer[count];
+        char *tup_data = (char *)itup + MAXALIGN(sizeof(IndexTupleData));
+
+        /* Copy key */
+        char *keyp = key_base + ((size_t)(off - 1)) * so->key_len;
+        memcpy(tup_data, keyp, so->key_len);
+
+        /* Copy INCLUDE columns if present */
+        if (so->ninclude > 0 && so->plain_inc_cached)
+        {
+            for (uint16 ii = 0; ii < so->ninclude; ii++)
+            {
+                char *src = so->inc_meta->plain_inc_base[ii] + (size_t)(off - 1) * so->inc_meta->inc_len[ii];
+                char *dst = tup_data + so->inc_meta->inc_offs[ii];
+                memcpy(dst, src, so->inc_meta->inc_len[ii]);
+            }
+        }
+
+        /* Set tuple metadata (TID not used for IOS, but set for consistency) */
+        ItemPointerSetBlockNumber(&itup->t_tid, BufferGetBlockNumber(so->cur_buf));
+        ItemPointerSetOffsetNumber(&itup->t_tid, off);
+        itup->t_info = so->tuple_size;
+
+        count++;
+    }
+
+    return count;
 }
 
 bool
@@ -1252,6 +1351,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         /* Release current buffer and move to next */
                         ReleaseBuffer(so->cur_buf);
                         so->have_pin = false;
+                        /* Invalidate tuple buffer - tuples point to released page */
+                        so->tuple_buffer_count = 0;
+                        so->tuple_buffer_current = 0;
                         so->cur_blk = next;
                         continue;  /* Skip to next iteration of while loop */
                     }
@@ -1603,6 +1705,58 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 /* Initialize cur_off for forward scans on new pages */
                 if (so->cur_off == InvalidOffsetNumber || so->cur_off == 0)
                     so->cur_off = FirstOffsetNumber; /* GCOV_EXCL_LINE - defensive: cur_off always FirstOffsetNumber (set at lines 2464, 2522, 3495) */
+
+                /* Tuple buffering optimization for plain pages (forward scans only) */
+                if (so->tuple_buffering_enabled && so->plain_inc_cached)
+                {
+                    /* Check if we have buffered tuples available */
+                    if (so->tuple_buffer_current < so->tuple_buffer_count)
+                    {
+                        /* Return next tuple from buffer */
+                        IndexTuple itup = so->tuple_buffer[so->tuple_buffer_current];
+                        scan->xs_itup = itup;
+                        scan->xs_heaptid = itup->t_tid;
+
+                        so->tuple_buffer_current++;
+                        so->cur_off++;
+
+                        if (so->prof_enabled)
+                        {
+                            so->prof_rows++; // GCOV_EXCL_LINE - profiling instrumentation
+                            so->prof_bytes += so->tuple_size; // GCOV_EXCL_LINE - profiling instrumentation
+                        }
+
+                        return true;
+                    }
+
+                    /* Buffer empty - try to refill from current page */
+                    if (so->cur_off <= n)
+                    {
+                        so->tuple_buffer_count = smol_refill_tuple_buffer_plain(so, page);
+                        so->tuple_buffer_current = 0;
+
+                        if (so->tuple_buffer_count > 0)
+                        {
+                            /* Successfully refilled, return first tuple */
+                            IndexTuple itup = so->tuple_buffer[0];
+                            scan->xs_itup = itup;
+                            scan->xs_heaptid = itup->t_tid;
+
+                            so->tuple_buffer_current = 1;  /* Consumed first tuple */
+                            so->cur_off++;
+
+                            if (so->prof_enabled)
+                            {
+                                so->prof_rows++; // GCOV_EXCL_LINE - profiling instrumentation
+                                so->prof_bytes += so->tuple_size; // GCOV_EXCL_LINE - profiling instrumentation
+                            }
+
+                            return true;
+                        }
+                        /* else: refill returned 0, fall through to page advance */
+                    }
+                    /* else: cur_off > n, fall through to page advance */
+                }
 
                 while (so->cur_off <= n)
                 {
@@ -2182,6 +2336,14 @@ smol_endscan(IndexScanDesc scan)
             pfree(so->runtime_keys);
         if (so->inc_meta)
             pfree(so->inc_meta);
+        /* Clean up tuple buffer */
+        if (so->tuple_buffering_enabled)
+        {
+            if (so->tuple_buffer)
+                pfree(so->tuple_buffer);
+            if (so->tuple_buffer_data)
+                pfree(so->tuple_buffer_data);
+        }
         if (so->prof_enabled)
             elog(LOG, "[smol] scan profile: calls=%lu rows=%lu leaf_pages=%lu bytes_copied=%lu bytes_touched=%lu binsearch_steps=%lu bloom_checks=%lu bloom_skips=%lu",
                  (unsigned long) so->prof_calls,

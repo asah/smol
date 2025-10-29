@@ -13,6 +13,8 @@ int smol_prefetch_depth = 0;
 double smol_rle_uniqueness_threshold = 0.95;
 int smol_key_rle_version = KEY_RLE_AUTO;
 bool smol_use_position_scan = true;
+bool smol_use_tuple_buffering = true;
+int smol_tuple_buffer_size = 64;
 
 /* Zone maps + bloom filters GUCs */
 bool smol_zone_maps = true;
@@ -81,6 +83,26 @@ _PG_init(void)
                              true,
                              PGC_USERSET,
                              0,
+                            NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("smol.use_tuple_buffering",
+                             "Use tuple buffering for high-selectivity scans",
+                             "When on, SMOL pre-builds multiple tuples to amortize overhead.",
+                             &smol_use_tuple_buffering,
+                             false,  /* Disabled by default: compiler-dependent bug at -O0 */
+                             PGC_USERSET,
+                             0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("smol.tuple_buffer_size",
+                            "Number of tuples to buffer",
+                            "Buffer size for tuple buffering optimization (tuples per batch).",
+                            &smol_tuple_buffer_size,
+                            64, /* default */
+                            1, /* min */
+                            256, /* max */
+                            PGC_USERSET,
+                            0,
                             NULL, NULL, NULL);
 
     /* RLE is always considered; no GUC. */
