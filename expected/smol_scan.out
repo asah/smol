@@ -366,7 +366,7 @@ SET enable_indexonlyscan = on;
 SELECT count(*), sum(k), sum(v) FROM t_tuple_buffer WHERE k >= 100 AND k <= 200;
  count |  sum  |  sum  
 -------+-------+-------
-    86 | 12255 | 24510
+   101 | 15150 | 30300
 (1 row)
 
 -- Test 2: Multiple INCLUDE columns
@@ -375,9 +375,9 @@ CREATE UNLOGGED TABLE t_multi_include(k int4, v1 int4, v2 int4, v3 int4);
 INSERT INTO t_multi_include SELECT i, i*2, i*3, i*4 FROM generate_series(1, 500) i;
 CREATE INDEX t_multi_include_idx ON t_multi_include USING smol(k) INCLUDE (v1, v2, v3);
 SELECT count(*), sum(v1), sum(v2), sum(v3) FROM t_multi_include WHERE k >= 50 AND k <= 450;
- count |  sum  |  sum  |  sum  
--------+-------+-------+-------
-   136 | 31960 | 47940 | 63920
+ count |  sum   |  sum   |  sum   
+-------+--------+--------+--------
+   401 | 200500 | 300750 | 401000
 (1 row)
 
 -- Cleanup tuple buffering tests
