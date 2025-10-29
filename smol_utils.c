@@ -693,12 +693,37 @@ smol_cmp_keyptr_bound_generic(FmgrInfo *cmp, Oid collation, const char *keyp, ui
     }
     else
     {
-        kd = PointerGetDatum((void *) keyp);
+        /* Non-byval types: handle text vs other fixed-length types (UUID, etc.) */
+        if (key_len == 8 || key_len == 32)
+        {
+            /* Text type: convert zero-padded data to proper varlena */
+            /* Find actual length (up to first zero byte or key_len) */
+            const char *end = (const char *) memchr(keyp, '\0', key_len);
+            int actual_len = end ? (int)(end - keyp) : key_len;
+
+            /* Create a temporary text varlena */
+            text *t = (text *) palloc(VARHDRSZ + actual_len);
+            SET_VARSIZE(t, VARHDRSZ + actual_len);
+            if (actual_len > 0)
+                memcpy(VARDATA(t), keyp, actual_len);
+
+            kd = PointerGetDatum(t);
+        }
+        else
+        {
+            /* Fixed-length type (UUID=16 bytes, etc.): pass raw pointer */
+            kd = PointerGetDatum((void *) keyp);
+        }
     }
     /* Fix for "char" type and other types with no collation (collation=0).
      * FunctionCall2Coll expects InvalidOid for non-collatable types, not 0. */
     Oid coll = (collation == 0) ? InvalidOid : collation;
     int32 c = DatumGetInt32(FunctionCall2Coll(cmp, coll, kd, bound));
+
+    /* Free temporary varlena if we allocated one (only for text types) */
+    if (!key_byval && (key_len == 8 || key_len == 32))
+        pfree(DatumGetPointer(kd));
+
     return (c > 0) - (c < 0);
 }
 
