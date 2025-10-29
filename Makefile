@@ -163,8 +163,19 @@ bench-help:
 PG_BIN := $(dir $(PG_CONFIG))
 PGDATA := /home/postgres/pgdata
 
-production: stop clean install start installcheck
-	@echo "rebuilding and testing production build from scratch."
+production: stop clean install start
+	@if $(MAKE) installcheck; then \
+	  echo "rebuilding and testing production build from scratch."; \
+	else \
+	  if [ -f regression.diffs ]; then \
+	    echo ""; \
+	    echo "===== Test failure - First 100 lines of regression.diffs ====="; \
+	    head -100 regression.diffs; \
+	    echo "===== End of regression.diffs excerpt ====="; \
+	    echo ""; \
+	  fi; \
+	  exit 1; \
+	fi
 
 buildclean:
 	@echo "cleaning current build: make=$(MAKE)"
@@ -224,8 +235,19 @@ psql:
 pgcheck: build start
 	@echo "Running regression tests (installcheck)"
 	@set -euo pipefail; \
-	  $(MAKE) installcheck; \
-	  $(MAKE) stop
+	  if $(MAKE) installcheck; then \
+	    $(MAKE) stop; \
+	  else \
+	    if [ -f regression.diffs ]; then \
+	      echo ""; \
+	      echo "===== Test failure - First 100 lines of regression.diffs ====="; \
+	      head -100 regression.diffs; \
+	      echo "===== End of regression.diffs excerpt ====="; \
+	      echo ""; \
+	    fi; \
+	    $(MAKE) stop; \
+	    exit 1; \
+	  fi
 
 # ---------------------------------------------------------------------------
 # Code Coverage Targets (Ubuntu 24.04/Docker only)
@@ -270,6 +292,13 @@ coverage-test: stop start
 	      echo "[coverage] ✗ Test $$test FAILED"; \
 	      failed_tests="$$failed_tests $$test"; \
 	      tail -10 /tmp/test_$$test.log; \
+	      if [ -f regression.diffs ]; then \
+	        echo ""; \
+	        echo "[coverage] ===== First 100 lines of regression.diffs ====="; \
+	        head -100 regression.diffs; \
+	        echo "[coverage] ===== End of regression.diffs excerpt ====="; \
+	        echo ""; \
+	      fi; \
 	    fi; \
 	    $(PG_BIN)pg_ctl -D $(PGDATA) restart -w > /dev/null 2>&1; \
 	    sleep 1; \
