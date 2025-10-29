@@ -1236,7 +1236,6 @@ smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash)
             p += key_len + sizeof(uint16);
         }
     }
-    /* GCOV_EXCL_START */
     else
     {
         /* Plain page: add all keys to bloom filter */
@@ -1249,13 +1248,13 @@ smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash)
             /* Extract datum based on key type */
             switch (typid)
             {
-                case INT2OID:
-                    {
-                        int16 v;
-                        memcpy(&v, keys + i * key_len, sizeof(int16));
-                        d = Int16GetDatum(v);
-                        break;
-                    }
+                case INT2OID: // GCOV_EXCL_LINE
+                    { // GCOV_EXCL_LINE
+                        int16 v; // GCOV_EXCL_LINE
+                        memcpy(&v, keys + i * key_len, sizeof(int16)); // GCOV_EXCL_LINE
+                        d = Int16GetDatum(v); // GCOV_EXCL_LINE
+                        break; // GCOV_EXCL_LINE
+                    } // GCOV_EXCL_LINE
                 case INT4OID:
                     {
                         int32 v;
@@ -1270,20 +1269,19 @@ smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash)
                         d = Int64GetDatum(v);
                         break;
                     }
-                default:
-                    /* For other types, treat as int64 for now */
-                    {
-                        int64 v;
-                        memcpy(&v, keys + i * key_len, Min(sizeof(int64), key_len));
-                        d = Int64GetDatum(v);
-                        break;
-                    }
+                default: // GCOV_EXCL_LINE
+                    /* For other types, treat as int64 for now */ // GCOV_EXCL_LINE
+                    { // GCOV_EXCL_LINE
+                        int64 v; // GCOV_EXCL_LINE
+                        memcpy(&v, keys + i * key_len, Min(sizeof(int64), key_len)); // GCOV_EXCL_LINE
+                        d = Int64GetDatum(v); // GCOV_EXCL_LINE
+                        break; // GCOV_EXCL_LINE
+                    } // GCOV_EXCL_LINE
             }
 
             smol_bloom_add(&bloom, d, typid, nhash);
         }
     }
-    /* GCOV_EXCL_STOP */
 
     return bloom;
 }

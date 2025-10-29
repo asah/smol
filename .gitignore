@@ -1,4 +1,7 @@
 .gitconfig
+archive/
+expected/archive/
+sql/archive/
 
 # postgres dir for LLMs to study
 postgres/
