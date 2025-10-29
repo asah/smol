@@ -338,33 +338,6 @@ SET smol.prefetch_depth = 4;
 -- enable_seqscan is already off, continue using index scans
 -- Query with prefetching on single-column index (parallel index scan)
 SELECT COUNT(*) FROM t_batch_coverage WHERE k BETWEEN 1000 AND 50000;
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
  count 
 -------
  49001
@@ -372,43 +345,6 @@ WARNING:  smol: prefetch_depth > 1 not fully tested
 
 -- Query with prefetching on two-column index (parallel index scan)
 SELECT COUNT(*) FROM t_batch_twocol WHERE k1 BETWEEN 10 AND 500;
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
  count 
 -------
  49100
@@ -416,61 +352,6 @@ WARNING:  smol: prefetch_depth > 1 not fully tested
 
 -- Large range scan to ensure prefetch code is exercised
 SELECT COUNT(*) FROM t_batch_coverage WHERE k > 100;
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
-WARNING:  smol: prefetch_depth > 1 not fully tested
  count 
 -------
  99900
