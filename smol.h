@@ -223,7 +223,32 @@ typedef struct SmolMeta
     uint8       padding;              /* alignment padding */
     /* v3 field: collation for text keys */
     Oid         collation_oid;        /* collation for first text key (InvalidOid if not text or C collation) */
+    /* v4 field: leaf directory for parallel scan */
+    BlockNumber directory_blkno;      /* block number of directory page (InvalidBlockNumber if none) */
 } SmolMeta;
+
+/*
+ * Leaf Directory - Fixed-size directory for parallel scan partitioning
+ *
+ * Stored in a single regular page (no special opaque area).
+ * Samples leaves to create ~100-500 partition points.
+ * Workers divide entries and scan their assigned leaf ranges.
+ */
+#define SMOL_DIR_MAGIC 0x534D4452  /* 'SMDR' */
+#define SMOL_DIR_MAX_ENTRIES 1000   /* Conservative: fits in 8KB page */
+
+typedef struct SmolDirEntry
+{
+    int32       key_prefix;    /* First key in partition (for debugging) */
+    BlockNumber leaf_blkno;    /* Leaf page block number */
+} SmolDirEntry;
+
+typedef struct SmolDirectory
+{
+    uint32      magic;          /* SMOL_DIR_MAGIC */
+    uint32      num_entries;    /* Number of valid entries */
+    SmolDirEntry entries[SMOL_DIR_MAX_ENTRIES];
+} SmolDirectory;
 
 /* Page opaque data */
 typedef struct SmolPageOpaqueData
@@ -376,6 +401,12 @@ typedef struct SmolScanOpaqueData
     uint32      leaf_cap;       /* capacity of leaf_k1/leaf_k2 arrays */
     uint32      chunk_left;     /* parallel: leaves remaining in locally claimed chunk */
     BufferAccessStrategy bstrategy; /* bulk-read strategy for index leafs */
+
+    /* Directory-based parallel scan (atomic claiming of directory entries) */
+    bool        use_directory;       /* true if using directory for parallel scans */
+    SmolDirectory *dir_data;         /* cached directory data */
+    uint32      dir_current_idx;     /* current directory entry being scanned */
+    BlockNumber dir_current_end;     /* end block for current directory entry */
 
     /* Equal-key run optimization (single-key indices): */
     bool        run_active;
@@ -777,6 +808,10 @@ extern void smol_collect_leaf_stats(SmolLeafStats *stats, const void *keys, uint
 extern void smol_bloom_add(uint64 *bloom, Datum key, Oid typid, int nhash);
 extern bool smol_bloom_test(uint64 bloom, Datum key, Oid typid, int nhash);
 extern uint64 smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash);
+
+/* Leaf directory functions (smol_utils.c) */
+extern BlockNumber smol_build_and_write_directory(Relation idx);
+extern SmolDirectory *smol_read_directory(Relation idx, BlockNumber dir_blk);
 
 /* Parallel build worker entry (must be extern for dynamic loading) */
 extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);

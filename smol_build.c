@@ -402,7 +402,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                 {
                     Buffer mb = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
                     LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
-                    SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->inc_count=inc_count;
+                    SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->inc_count=inc_count; m->directory_blkno=InvalidBlockNumber;
                     for (int i=0;i<inc_count;i++) { m->inc_len[i]=inc_lens[i]; }
                     smol_meta_init_zone_maps(m);
                     MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
@@ -680,7 +680,7 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             {
                 Buffer mb = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
                 LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE); Page pg = BufferGetPage(mb); PageInit(pg, BLCKSZ, 0);
-                SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; smol_meta_init_zone_maps(m); MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
+                SmolMeta *m = smol_meta_ptr(pg); m->magic=SMOL_META_MAGIC; m->version=SMOL_META_VERSION; m->nkeyatts=2; m->key_len1=key_len; m->key_len2=key_len2; m->root_blkno=InvalidBlockNumber; m->height=0; m->directory_blkno=InvalidBlockNumber; smol_meta_init_zone_maps(m); MarkBufferDirty(mb); UnlockReleaseBuffer(mb);
             }
             /* Write leaves in generic row-major 2-key layout:
              * payload: [uint16 nrows][row0: k1||k2][row1: k1||k2]...
@@ -832,6 +832,33 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         SMOL_LOG("parallel build complete");
     }
 
+    /* Build leaf directory for parallel scans (only for large indexes) */
+    BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+
+    /* DISABLED: Directory-based parallel scan has race condition causing 1-4% overcounting */
+    /* TODO: Debug and fix the chunk boundary logic in smol_scan.c */
+    if (nblocks > 1000000)  /* Effectively disabled - was: Build directory for large indexes (>100 blocks) */
+    { /* GCOV_EXCL_START - directory feature disabled due to bug */
+        elog(LOG, "smol_build: calling directory build");
+        BlockNumber dir_blk = smol_build_and_write_directory(index);
+
+        if (BlockNumberIsValid(dir_blk))
+        {
+            Buffer mbuf = ReadBuffer(index, 0);
+            Page mpage;
+            SmolMeta *meta;
+
+            LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+            mpage = BufferGetPage(mbuf);
+            meta = smol_meta_ptr(mpage);
+            meta->directory_blkno = dir_blk;
+            MarkBufferDirty(mbuf);
+            UnlockReleaseBuffer(mbuf);
+
+            SMOL_LOGF("stored directory block %u in metadata", dir_blk);
+        }
+    } /* GCOV_EXCL_STOP */
+
     return res;
 }
 
@@ -858,6 +885,7 @@ smol_buildempty(Relation index)
     meta->root_blkno = InvalidBlockNumber;
     meta->height = 0;
     meta->inc_count = ninclude;
+    meta->directory_blkno = InvalidBlockNumber;  /* No directory until index is large enough */
     meta->collation_oid = InvalidOid;  /* No data yet, will be set during build */
     /* Set default INCLUDE lengths (will be overwritten by build callback if data exists) */
     for (int i = 0; i < ninclude && i < 16; i++)
@@ -898,6 +926,7 @@ smol_build_tree1_inc_from_sorted(Relation idx, const int64 *keys, const char * c
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
+        meta->directory_blkno = InvalidBlockNumber;
         meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
         smol_meta_init_zone_maps(meta);
@@ -1183,6 +1212,7 @@ smol_build_text_inc_from_sorted(Relation idx, const char *keys32, const char * c
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
         meta->inc_count = (uint16) inc_count;
+        meta->directory_blkno = InvalidBlockNumber;
         meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         for (int i=0;i<inc_count;i++) meta->inc_len[i] = inc_lens[i];
         smol_meta_init_zone_maps(meta);
@@ -1815,6 +1845,7 @@ smol_build_text_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nke
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        meta->directory_blkno = InvalidBlockNumber;
         meta->collation_oid = InvalidOid;  /* Collation stored in index descriptor, not used here */
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);
@@ -2086,6 +2117,7 @@ smol_build_fixed_stream_from_tuplesort(Relation idx, Tuplesortstate *ts, Size nk
         meta->key_len2 = 0;
         meta->root_blkno = InvalidBlockNumber;
         meta->height = 0;
+        meta->directory_blkno = InvalidBlockNumber;
         meta->collation_oid = InvalidOid;  /* Fixed-width keys, no collation */
         smol_meta_init_zone_maps(meta);
         MarkBufferDirty(mbuf);

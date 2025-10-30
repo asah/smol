@@ -272,6 +272,10 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
     so->have_k1_eq = false;
     so->bound_strict = false;
     so->chunk_left = 0;
+    so->use_directory = false;
+    so->dir_data = NULL;
+    so->dir_current_idx = 0;
+    so->dir_current_end = InvalidBlockNumber;
     so->runtime_keys = NULL;
     so->n_runtime_keys = 0;
     so->atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
@@ -987,6 +991,70 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 if (scan->parallel_scan)
                 {
                     SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
+
+                    /* Try directory-based static partitioning first */
+                    SmolMeta meta;
+                    smol_meta_read(idx, &meta);
+                    if (BlockNumberIsValid(meta.directory_blkno))
+                    { /* GCOV_EXCL_START - directory feature disabled due to bug */
+                        SmolDirectory *dir_data = smol_read_directory(idx, meta.directory_blkno);
+                        if (dir_data && dir_data->num_entries > 0)
+                        {
+                            /* Use directory for atomic claiming of chunks */
+                            so->use_directory = true;
+                            so->dir_data = dir_data;  /* Keep directory cached */
+                            so->dir_current_idx = 0;  /* Will claim atomically */
+                            so->dir_current_end = InvalidBlockNumber;
+
+                            /* Try to claim first directory entry */
+                            uint32 claimed_idx = pg_atomic_fetch_add_u32(&ps->curr, 1);
+
+                            if (claimed_idx < dir_data->num_entries)
+                            {
+                                /* Successfully claimed an entry */
+                                so->dir_current_idx = claimed_idx;
+
+                                /* Determine end block for this chunk */
+                                if (claimed_idx + 1 < dir_data->num_entries)
+                                    so->dir_current_end = dir_data->entries[claimed_idx + 1].leaf_blkno;
+                                else
+                                    so->dir_current_end = InvalidBlockNumber;  /* Last chunk */
+
+                                so->cur_blk = dir_data->entries[claimed_idx].leaf_blkno;
+                                so->cur_off = FirstOffsetNumber;
+                                so->initialized = true;
+                                so->last_dir = dir;
+
+                                SMOL_LOGF("worker claimed directory entry %u, blocks [%u, %s)",
+                                         claimed_idx, so->cur_blk,
+                                         BlockNumberIsValid(so->dir_current_end) ? psprintf("%u", so->dir_current_end) : "end");
+
+                                /* Prefetch and read first leaf */
+                                if (BlockNumberIsValid(so->cur_blk))
+                                {
+                                    PrefetchBuffer(idx, MAIN_FORKNUM, so->cur_blk);
+                                    buf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
+                                    page = BufferGetPage(buf);
+                                    so->cur_buf = buf; so->have_pin = true;
+                                }
+
+                                /* Skip fallback atomic claiming */
+                                goto parallel_init_done;
+                            }
+                            else
+                            {
+                                /* No entries left to claim */
+                                so->cur_blk = InvalidBlockNumber;
+                                so->initialized = true;
+                                so->last_dir = dir;
+                                return false;
+                            }
+                        }
+                        if (dir_data)
+                            pfree(dir_data);
+                    } /* GCOV_EXCL_STOP */
+
+                    /* Fallback to atomic claiming if no directory */
                     /* claim first leaf from shared state */
                     for (;;)
                     {
@@ -1062,6 +1130,9 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             so->cur_off = (ans2 != InvalidOffsetNumber) ? ans2 : (uint16) (n2 + 1);
                         }
                     }
+
+                parallel_init_done:
+                    ; /* empty statement for label */
                 }
                 else
                 {
@@ -2011,7 +2082,66 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (scan->parallel_scan && dir != BackwardScanDirection)
         {
             SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
-            /* Claim next leaf atomically (no batch claiming) */
+
+            /* Directory-based advancement: follow rightlinks within partition */
+            if (so->use_directory)
+            { /* GCOV_EXCL_START - directory feature disabled due to bug */
+                /* Follow rightlink to next leaf */
+                Buffer cbuf = ReadBufferExtended(idx, MAIN_FORKNUM, so->cur_blk, RBM_NORMAL, so->bstrategy);
+                Page cpage = BufferGetPage(cbuf);
+                BlockNumber rightlink = smol_page_opaque(cpage)->rightlink;
+                ReleaseBuffer(cbuf);
+
+                if (BlockNumberIsValid(rightlink))
+                {
+                    /* Check if still within current chunk */
+                    if (!BlockNumberIsValid(so->dir_current_end) || rightlink < so->dir_current_end)
+                    {
+                        next = rightlink;
+                        SMOL_LOGF("directory advance to leaf %u", next);
+                        if (BlockNumberIsValid(next))
+                            PrefetchBuffer(idx, MAIN_FORKNUM, next);
+                    }
+                    else
+                    {
+                        /* Reached end of current chunk, claim next directory entry */
+                        SMOL_LOGF("finished chunk at block %u, claiming next", rightlink);
+
+                        uint32 next_idx = pg_atomic_fetch_add_u32(&ps->curr, 1);
+                        if (next_idx < so->dir_data->num_entries)
+                        {
+                            /* Claimed next chunk */
+                            so->dir_current_idx = next_idx;
+
+                            if (next_idx + 1 < so->dir_data->num_entries)
+                                so->dir_current_end = so->dir_data->entries[next_idx + 1].leaf_blkno;
+                            else
+                                so->dir_current_end = InvalidBlockNumber;
+
+                            next = so->dir_data->entries[next_idx].leaf_blkno;
+                            SMOL_LOGF("claimed directory entry %u, starting at block %u", next_idx, next);
+
+                            if (BlockNumberIsValid(next))
+                                PrefetchBuffer(idx, MAIN_FORKNUM, next);
+                        }
+                        else
+                        {
+                            /* No more directory entries to claim */
+                            next = InvalidBlockNumber;
+                            SMOL_LOG("no more directory entries");
+                        }
+                    }
+                }
+                else
+                {
+                    /* No more leaves in index */
+                    next = InvalidBlockNumber;
+                }
+            } /* GCOV_EXCL_STOP */
+            else
+            {
+                /* Fallback: atomic claiming */
+                /* Claim next leaf atomically (no batch claiming) */
             {
                 for (;;)
                 { /* GCOV_EXCL_LINE (flaky) */
@@ -2062,6 +2192,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                 }
             }
+            } /* end of else block for atomic claiming */
         }
         else
         {

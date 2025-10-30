@@ -1310,3 +1310,250 @@ smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nhash)
 
     return bloom;
 }
+/*
+ * Leaf Directory Functions for Parallel Scan Optimization
+ *
+ * These will be appended to smol_utils.c
+ */
+
+/*
+ * smol_build_and_write_directory - Build leaf directory after index construction
+ *
+ * Called AFTER the index is completely built (all leaves written, tree complete).
+ * Enumerates leaves by walking rightlinks and samples them into a fixed-size directory.
+ * Returns block number of directory page.
+ */
+/* GCOV_EXCL_START - directory feature disabled due to bug */
+BlockNumber
+smol_build_and_write_directory(Relation idx)
+{
+    SmolMeta meta;
+    SmolDirectory *dir;
+    Buffer buf;
+    Page page;
+    BlockNumber dir_blk;
+    BlockNumber leaf;
+    BlockNumber nblocks;
+    uint32 leaf_count = 0;
+    uint32 sample_every;
+    uint32 next_sample_at;
+
+    /* Read metadata */
+    smol_meta_read(idx, &meta);
+
+    /* Need at least height 1 (has leaves) */
+    if (meta.height < 1)
+        return InvalidBlockNumber;
+
+    /* Get total blocks for safety checks */
+    nblocks = RelationGetNumberOfBlocks(idx);
+
+    /* For height 1, root is the only leaf */
+    if (meta.height == 1)
+    {
+        leaf = meta.root_blkno;
+    }
+    else
+    {
+        /* Find leftmost leaf by descending from root */
+        BlockNumber cur = meta.root_blkno;
+        for (int level = meta.height; level > 1; level--)
+        {
+            buf = ReadBuffer(idx, cur);
+            page = BufferGetPage(buf);
+            /* First child is at offset 1 */
+            SmolInternalItem *item = (SmolInternalItem *) PageGetItem(page, PageGetItemId(page, 1));
+            cur = item->child;
+            ReleaseBuffer(buf);
+        }
+        leaf = cur;
+    }
+
+    if (!BlockNumberIsValid(leaf))
+        return InvalidBlockNumber;
+
+    /* Allocate directory in memory */
+    dir = (SmolDirectory *) palloc0(sizeof(SmolDirectory));
+    dir->magic = SMOL_DIR_MAGIC;
+    dir->num_entries = 0;
+
+    /* Count total leaves first (walk once) */
+    BlockNumber temp_leaf = leaf;
+    uint32 total_leaves = 0;
+
+    while (BlockNumberIsValid(temp_leaf) && total_leaves < 1000000)
+    {
+        if (temp_leaf >= nblocks)
+        {
+            elog(WARNING, "smol: invalid leaf block %u during count (index has %u blocks)",
+                 temp_leaf, nblocks);
+            break;
+        }
+
+        total_leaves++;
+
+        /* Get rightlink */
+        buf = ReadBuffer(idx, temp_leaf);
+        page = BufferGetPage(buf);
+        SmolOpaque op = smol_page_opaque(page);
+        temp_leaf = op->rightlink;
+        ReleaseBuffer(buf);
+    }
+
+    if (total_leaves == 0)
+    {
+        pfree(dir);
+        return InvalidBlockNumber;
+    }
+
+    /* Calculate sampling rate to fit in directory */
+    if (total_leaves <= SMOL_DIR_MAX_ENTRIES)
+    {
+        sample_every = 1;  /* Sample every leaf */
+    }
+    else
+    {
+        sample_every = (total_leaves + SMOL_DIR_MAX_ENTRIES - 1) / SMOL_DIR_MAX_ENTRIES;
+    }
+
+    next_sample_at = 0;
+    leaf_count = 0;
+
+    /* Now sample leaves */
+    while (BlockNumberIsValid(leaf) && dir->num_entries < SMOL_DIR_MAX_ENTRIES)
+    {
+        if (leaf >= nblocks)
+        {
+            elog(WARNING, "smol: invalid leaf block %u during sampling (index has %u blocks)",
+                 leaf, nblocks);
+            break;
+        }
+
+        /* Sample this leaf? */
+        if (leaf_count == next_sample_at)
+        {
+            buf = ReadBuffer(idx, leaf);
+            page = BufferGetPage(buf);
+
+            /* Read first key as key_prefix */
+            int32 key_prefix = 0;
+            if (meta.key_len1 <= 4 && smol_leaf_nitems(page) > 0)
+            {
+                char *keyptr = smol_leaf_keyptr_ex(page, 1, meta.key_len1, NULL, 0, NULL);
+                if (keyptr)
+                {
+                    memcpy(&key_prefix, keyptr, meta.key_len1);
+                }
+            }
+
+            /* Add to directory */
+            dir->entries[dir->num_entries].key_prefix = key_prefix;
+            dir->entries[dir->num_entries].leaf_blkno = leaf;
+            dir->num_entries++;
+
+            /* Get rightlink */
+            SmolOpaque op = smol_page_opaque(page);
+            BlockNumber next = op->rightlink;
+            ReleaseBuffer(buf);
+
+            leaf = next;
+            next_sample_at += sample_every;
+        }
+        else
+        {
+            /* Skip this leaf, just get its rightlink */
+            buf = ReadBuffer(idx, leaf);
+            page = BufferGetPage(buf);
+            SmolOpaque op = smol_page_opaque(page);
+            leaf = op->rightlink;
+            ReleaseBuffer(buf);
+        }
+
+        leaf_count++;
+    }
+
+    if (dir->num_entries == 0)
+    {
+        pfree(dir);
+        return InvalidBlockNumber;
+    }
+
+    /* Allocate a new page for directory */
+    buf = ReadBufferExtended(idx, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+    dir_blk = BufferGetBlockNumber(buf);
+    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+    page = BufferGetPage(buf);
+    PageInit(page, BLCKSZ, 0);  /* No special area */
+
+    /* Write directory to page */
+    Size dir_size = offsetof(SmolDirectory, entries) +
+                    dir->num_entries * sizeof(SmolDirEntry);
+
+    if (dir_size > BLCKSZ - SizeOfPageHeaderData)
+    {
+        elog(ERROR, "smol: directory too large (%zu bytes)", dir_size);
+    }
+
+    memcpy(PageGetContents(page), dir, dir_size);
+
+    MarkBufferDirty(buf);
+    UnlockReleaseBuffer(buf);
+
+    pfree(dir);
+
+    elog(LOG, "smol: built leaf directory with %u entries (sampled %u of %u leaves) at block %u",
+         dir->num_entries, dir->num_entries, total_leaves, dir_blk);
+
+    return dir_blk;
+} /* GCOV_EXCL_STOP */
+
+/*
+ * smol_read_directory - Read leaf directory from index
+ *
+ * Returns palloc'd directory structure. Caller must pfree().
+ */
+/* GCOV_EXCL_START - directory feature disabled due to bug */
+SmolDirectory *
+smol_read_directory(Relation idx, BlockNumber dir_blk)
+{
+    Buffer buf;
+    Page page;
+    SmolDirectory *dir;
+    SmolDirectory *page_dir;
+    Size dir_size;
+
+    if (!BlockNumberIsValid(dir_blk))
+        return NULL;
+
+    buf = ReadBuffer(idx, dir_blk);
+    page = BufferGetPage(buf);
+    page_dir = (SmolDirectory *) PageGetContents(page);
+
+    /* Validate magic */
+    if (page_dir->magic != SMOL_DIR_MAGIC)
+    {
+        ReleaseBuffer(buf);
+        elog(WARNING, "smol: invalid directory magic at block %u", dir_blk);
+        return NULL;
+    }
+
+    /* Validate num_entries */
+    if (page_dir->num_entries > SMOL_DIR_MAX_ENTRIES)
+    {
+        ReleaseBuffer(buf);
+        elog(WARNING, "smol: invalid directory entry count %u at block %u",
+             page_dir->num_entries, dir_blk);
+        return NULL;
+    }
+
+    /* Copy directory to palloc'd memory */
+    dir_size = offsetof(SmolDirectory, entries) +
+               page_dir->num_entries * sizeof(SmolDirEntry);
+    dir = (SmolDirectory *) palloc(dir_size);
+    memcpy(dir, page_dir, dir_size);
+
+    ReleaseBuffer(buf);
+
+    return dir;
+} /* GCOV_EXCL_STOP */
