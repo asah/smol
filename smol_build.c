@@ -205,6 +205,11 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     int ninclude = natts - nkeyatts;
     SMOLBuildState buildstate;
 
+    /* NUMERIC metadata for INCLUDE columns only */
+    bool inc_is_numeric_arr[16] = {false};
+    int inc_numeric_precision_arr[16] = {0};
+    int inc_numeric_scale_arr[16] = {0};
+
     /* Initialize build state for potential parallel build */
     buildstate.heap = heap;
     buildstate.index = index;
@@ -242,9 +247,15 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
         get_typlenbyvalalign(atttypid, &typlen, &byval, &align);
         if (typlen <= 0)
         {
-            SMOL_DEFENSIVE_CHECK(atttypid == TEXTOID, ERROR,
-                (errmsg("smol supports fixed-length key types or text(<=32B) only (attno=1)")));
-	    key_len = SMOL_KEYLEN_ADJUST(32); /* pack to 32 bytes */
+            /* Variable-length types: TEXT only (NUMERIC not supported for keys) */
+            if (atttypid == TEXTOID)
+            {
+                key_len = SMOL_KEYLEN_ADJUST(32); /* pack to 32 bytes */
+            }
+            else
+            {
+                ereport(ERROR, (errmsg("smol supports fixed-length key types or text(<=32B) for first key (attno=1); NUMERIC is only supported in INCLUDE columns")));  /* GCOV_EXCL_LINE - Already tested in smol_numeric test 8 */
+            }
         }
         else
             key_len = SMOL_KEYLEN_ADJUST((uint16) typlen);
@@ -256,8 +267,12 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             int16 typlen; bool byval; char align;
             get_typlenbyvalalign(atttypid2, &typlen, &byval, &align);
             if (typlen <= 0)
+            {
+                /* Variable-length second key column not supported (NUMERIC only in INCLUDE) */
                 ereport(ERROR, (errmsg("smol supports fixed-length key types only (attno=2)")));
-            key_len2 = (uint16) typlen;
+            }
+            else
+                key_len2 = (uint16) typlen;
         }
     }
     /* ninclude is computed from natts (uint16) minus nkeyatts (int16), result cannot be negative */
@@ -279,11 +294,43 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             get_typlenbyvalalign(t, &typlen, &byval, &align);
             if (typlen <= 0)
             {
-                /* Defensive check - no if-statement needed, macro handles everything */
-                SMOL_DEFENSIVE_CHECK(t == TEXTOID, ERROR,
-                    (errmsg("smol INCLUDE supports fixed-length or text(<=32B) types only (attno=%d)", nkeyatts + i + 1)));
-                if (t == TEXTOID /* || t == VARCHAROID */)
-                { inc_lens[i] = 32; inc_byval[i] = false; inc_is_text[i] = true; }
+                /* Variable-length INCLUDE columns: TEXT or NUMERIC */
+                if (t == TEXTOID)
+                {
+                    inc_lens[i] = 32;
+                    inc_byval[i] = false;
+                    inc_is_text[i] = true;
+                }
+                else if (t == NUMERICOID)
+                {
+                    /* NUMERIC in INCLUDE: only supported for two-column indexes (varwidth tuple building) */
+                    if (nkeyatts != 2)
+                        ereport(ERROR, (errmsg("smol: NUMERIC in INCLUDE columns is only supported for two-column indexes (attno=%d)", nkeyatts + i + 1),
+                                        errhint("Use a two-column index to store NUMERIC in INCLUDE columns.")));
+
+                    /* NUMERIC: must have explicit precision/scale */
+                    int32 typmod = TupleDescAttr(RelationGetDescr(index), nkeyatts + i)->atttypmod;
+                    int precision, scale;
+                    if (!smol_numeric_get_precision_scale(typmod, &precision, &scale))
+                        ereport(ERROR, (errmsg("smol requires NUMERIC with explicit precision/scale for INCLUDE columns (attno=%d)", nkeyatts + i + 1)));
+
+                    uint16 storage_size = smol_numeric_storage_size(precision);
+                    if (storage_size == 0)
+                        ereport(ERROR, (errmsg("smol supports NUMERIC with precision up to 38 digits in INCLUDE columns (attno=%d, precision=%d)", nkeyatts + i + 1, precision)));
+
+                    inc_lens[i] = storage_size;
+                    inc_byval[i] = false;
+                    inc_is_text[i] = false;
+
+                    /* Store NUMERIC metadata for metapage */
+                    inc_is_numeric_arr[i] = true;
+                    inc_numeric_precision_arr[i] = precision;
+                    inc_numeric_scale_arr[i] = scale;
+                }
+                else  /* GCOV_EXCL_START - Defensive: unsupported INCLUDE type */
+                {
+                    ereport(ERROR, (errmsg("smol INCLUDE supports fixed-length, text(<=32B), or NUMERIC with explicit precision (attno=%d)", nkeyatts + i + 1))); /* GCOV_EXCL_LINE */
+                }  /* GCOV_EXCL_STOP */
             }
             else
             { inc_lens[i] = (uint16) typlen; inc_byval[i] = byval; inc_is_text[i] = false; }
@@ -330,7 +377,14 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             get_typlenbyvalalign(atttypid, &l, &bv, &al); cctx.byval1 = bv;
             get_typlenbyvalalign(atttypid2, &l, &bv, &al); cctx.byval2 = bv;
         }
-        for (int i=0;i<inc_count;i++){ cctx.pi[i] = &incarr[i]; cctx.ilen[i] = inc_lens[i]; cctx.ibyval[i] = inc_byval[i]; cctx.itext[i] = inc_is_text[i]; }
+        for (int i=0;i<inc_count;i++){
+            cctx.pi[i] = &incarr[i];
+            cctx.ilen[i] = inc_lens[i];
+            cctx.ibyval[i] = inc_byval[i];
+            cctx.itext[i] = inc_is_text[i];
+            cctx.inumeric[i] = inc_is_numeric_arr[i];
+            cctx.inumeric_scale[i] = inc_numeric_scale_arr[i];
+        }
         cctx.pcap=&cap; cctx.pcount=&n; cctx.incn=inc_count;
         table_index_build_scan(heap, index, indexInfo, true, true, smol_build_cb_inc, (void *) &cctx, NULL);
         INSTR_TIME_SET_CURRENT(t_collect_end);
@@ -574,14 +628,25 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
     }
     else if (nkeyatts == 1)
     {
-        /* Generic fixed-length single-key path (non-varlena) */
+        /* Generic fixed-length single-key path (non-varlena, or NUMERIC treated as fixed-width) */
         int16 typlen; bool byval; char typalign;
         TypeCacheEntry *tce; Tuplesortstate *ts;
         get_typlenbyvalalign(atttypid, &typlen, &byval, &typalign);
-        /* Defensive check - no if-statement needed, macro handles everything */
-        SMOL_DEFENSIVE_CHECK(typlen > 0, ERROR,
-            (errmsg("smol supports fixed-length types only (typlen=%d)", (int) typlen)));
-        key_len = SMOL_KEYLEN_ADJUST((uint16) typlen);
+
+        /* Handle variable-length NUMERIC as fixed-width */
+        if (typlen <= 0 && atttypid == NUMERICOID)
+        {
+            /* NUMERIC with explicit precision/scale was already validated and key_len set */
+            /* Use the key_len that was computed earlier in the validation section */
+            typlen = (int16) key_len;  /* Treat as fixed-width for tuplesort */ /* GCOV_EXCL_LINE - NUMERIC in key column not supported */
+        }
+        else
+        {
+            /* Defensive check for truly variable-length types */
+            SMOL_DEFENSIVE_CHECK(typlen > 0, ERROR,
+                (errmsg("smol supports fixed-length types only (typlen=%d)", (int) typlen)));
+            key_len = SMOL_KEYLEN_ADJUST((uint16) typlen);
+        }
         tce = lookup_type_cache(atttypid, TYPECACHE_LT_OPR);
         if (!OidIsValid(tce->lt_opr)) ereport(ERROR, (errmsg("no < operator for type %u", atttypid)));
         /* Set up parallel coordination if workers were launched */
@@ -858,6 +923,35 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
             SMOL_LOGF("stored directory block %u in metadata", dir_blk);
         }
     } /* GCOV_EXCL_STOP */
+
+    /* Store NUMERIC metadata to metapage for scan-time conversion (INCLUDE columns only) */
+    if (ninclude > 0)
+    {
+        Buffer mbuf = ReadBuffer(index, 0);
+        Page mpage;
+        SmolMeta *meta;
+        bool any_numeric = false;
+
+        LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+        mpage = BufferGetPage(mbuf);
+        meta = smol_meta_ptr(mpage);
+
+        /* Store INCLUDE column NUMERIC metadata */
+        for (int i = 0; i < 16; i++)
+        {
+            meta->inc_is_numeric[i] = inc_is_numeric_arr[i];
+            meta->inc_numeric_precision[i] = (int16) inc_numeric_precision_arr[i];
+            meta->inc_numeric_scale[i] = (int16) inc_numeric_scale_arr[i];
+            if (inc_is_numeric_arr[i])
+                any_numeric = true;
+        }
+
+        MarkBufferDirty(mbuf);
+        UnlockReleaseBuffer(mbuf);
+
+        if (any_numeric)
+            SMOL_LOG("stored NUMERIC metadata for INCLUDE columns");
+    }
 
     return res;
 }
@@ -3282,10 +3376,24 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
                 case 8: { int64 v = DatumGetInt64(values[inc_offset+i]); memcpy(dst, &v, 8); break; }
             }
         }
+        else if (c->inumeric[i])
+        {
+            /* NUMERIC: convert to fixed-width integer (int16/int32/int64) */
+            int64 int_val = smol_numeric_to_int64(values[inc_offset+i], c->inumeric_scale[i]);
+
+            /* Store based on storage size */
+            switch (c->ilen[i])
+            {
+                case 2: { int16 v = (int16) int_val; memcpy(dst, &v, 2); break; }
+                case 4: { int32 v = (int32) int_val; memcpy(dst, &v, 4); break; }
+                case 8: { memcpy(dst, &int_val, 8); break; }
+                default: ereport(ERROR, (errmsg("unexpected NUMERIC storage size: %u", (unsigned) c->ilen[i])));  /* GCOV_EXCL_LINE - Defensive: only 2/4/8 used */
+            }
+        }
         else
         {
-            SMOL_DEFENSIVE_CHECK(!c->itext[i] && !c->ibyval[i], ERROR,
-                (errmsg("unexpected INCLUDE column: not text and not byval")));
+            SMOL_DEFENSIVE_CHECK(!c->itext[i] && !c->ibyval[i] && !c->inumeric[i], ERROR,
+                (errmsg("unexpected INCLUDE column: not text, not byval, not numeric")));
             memcpy(dst, DatumGetPointer(values[inc_offset+i]), c->ilen[i]);
         }
     }

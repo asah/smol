@@ -28,10 +28,10 @@ endif
 REGRESS_BASE = smol_core smol_scan smol_rle
 
 # Coverage-only tests (10 consolidated tests)
-# smol_coverage3 now includes all bloom filter edge cases (consolidates 8 tests into 1)
+# smol_coverage3 now includes all bloom filter edge cases and NUMERIC tests (consolidates 9 tests into 1)
 # Tuple buffering tests merged into smol_scan (production test)
 # UTF-8 collation tests merged into smol_advanced
-REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip
+REGRESS_COVERAGE_ONLY = smol_coverage1 smol_coverage2a smol_coverage2b smol_coverage2c smol_coverage2d smol_advanced smol_zone_maps_coverage smol_bloom_skip_coverage smol_int2_bloom_skip smol_int8_bloom_skip smol_coverage3
 
 # Full test list: 13 tests for coverage builds (3 production + 10 coverage-only), 3 for production
 ifeq ($(COVERAGE),1)

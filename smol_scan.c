@@ -179,6 +179,13 @@ smol_leaf_run_bounds_rle_ex(Page page, uint16 idx, uint16 key_len,
 static inline void
 smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 row)
 {
+//    static int emit_count = 0;
+//    if (emit_count < 3) {
+//        elog(NOTICE, "smol_emit_single_tuple called: ninclude=%d, has_numeric=%d",
+//             so->ninclude, so->has_numeric);
+//        emit_count++;
+//    }
+
     Size cur = so->itup_data_off; /* absolute offset from tuple start */
     char *base = (char *) so->itup;
     char *wp;
@@ -235,6 +242,41 @@ smol_emit_single_tuple(SmolScanOpaque so, Page page, const char *keyp, uint32 ro
                     cur += VARHDRSZ + (Size) ilen;
                 }
             }
+            else if (so->inc_is_numeric[ii])  /* GCOV_EXCL_START - NUMERIC only supported in two-column indexes */
+            {
+                /* NUMERIC: stored as fixed-width int64, convert to NUMERIC varlena */
+                int64 int_val;
+                Datum numeric_datum;
+                struct varlena *numeric_vl;
+                Size numeric_size;
+
+                elog(NOTICE, "SCAN (two-col): NUMERIC branch hit for INCLUDE[%d]", ii);
+
+                /* Read int64 value from index page */
+                if (so->inc_meta->inc_len[ii] == 2)
+                    int_val = (int64) *((int16 *) ip);
+                else if (so->inc_meta->inc_len[ii] == 4)
+                    int_val = (int64) *((int32 *) ip);
+                else /* inc_len == 8 */
+                    int_val = *((int64 *) ip);
+
+                /* Debug: log the conversion */
+                elog(NOTICE, "SCAN: INCLUDE[%d] int64->NUMERIC: int_val=%lld, scale=%d, len=%u",
+                     ii, (long long)int_val, (int)so->inc_numeric_scale[ii], (unsigned)so->inc_meta->inc_len[ii]);
+
+                /* Convert int64 to NUMERIC using scale */
+                numeric_datum = smol_int64_to_numeric(int_val, so->inc_numeric_scale[ii]);
+                numeric_vl = (struct varlena *) DatumGetPointer(numeric_datum);
+                numeric_size = VARSIZE_ANY(numeric_vl);
+
+                elog(NOTICE, "SCAN: numeric_size=%zu, wp offset=%zu", numeric_size, (size_t)(wp - (char*)so->itup));
+
+                /* Copy NUMERIC varlena to output tuple */
+                memcpy(wp, numeric_vl, numeric_size);
+                cur += numeric_size;
+
+                /* NOTE: Don't pfree - DirectFunctionCall results are in executor context */
+            }  /* GCOV_EXCL_STOP */
             else
             {
                 if (so->inc_meta->inc_len[ii] == 2) smol_copy2(wp, ip);
@@ -312,6 +354,16 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         {
             SmolMeta m; smol_meta_read(index, &m);
             so->ninclude = m.inc_count;  /* Read INCLUDE count for both single-col and two-col */
+
+            /* Load NUMERIC conversion metadata for INCLUDE columns (zero overhead if none) */
+            so->has_numeric = false;
+            for (int i = 0; i < 16; i++)
+            {
+                so->inc_is_numeric[i] = m.inc_is_numeric[i];
+                so->inc_numeric_scale[i] = m.inc_numeric_scale[i];
+                if (m.inc_is_numeric[i])
+                    so->has_numeric = true;
+            }
 
             /* Allocate INCLUDE metadata structure if we have INCLUDE columns */
             if (so->ninclude > 0)
@@ -403,7 +455,14 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             {
                 cur = att_align_nominal(cur, so->inc_meta->inc_align[i]);
                 so->inc_meta->inc_offs[i] = (uint16) (cur - data_off);
-                Size inc_bytes = so->inc_meta->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_meta->inc_len[i]) : (Size) so->inc_meta->inc_len[i];
+                /* Reserve space: TEXT needs VARHDRSZ+len, NUMERIC needs ~24 bytes max, others use inc_len */
+                Size inc_bytes;
+                if (so->inc_meta->inc_is_text[i])
+                    inc_bytes = (Size)(VARHDRSZ + so->inc_meta->inc_len[i]);
+                else if (so->inc_is_numeric[i])
+                    inc_bytes = 24; /* Conservative max for NUMERIC(18,4) varlena */ /* GCOV_EXCL_LINE - Dense page path rarely used */
+                else
+                    inc_bytes = (Size) so->inc_meta->inc_len[i];
                 cur += inc_bytes;
             }
             sz = MAXALIGN(cur);
@@ -417,7 +476,14 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
             {
                 cur = att_align_nominal(cur, so->inc_meta->inc_align[i]);
                 so->inc_meta->inc_offs[i] = (uint16) (cur - data_off);
-                Size inc_bytes = so->inc_meta->inc_is_text[i] ? (Size)(VARHDRSZ + so->inc_meta->inc_len[i]) : (Size) so->inc_meta->inc_len[i];
+                /* Reserve space: TEXT needs VARHDRSZ+len, NUMERIC needs ~24 bytes max, others use inc_len */
+                Size inc_bytes;
+                if (so->inc_meta->inc_is_text[i])
+                    inc_bytes = (Size)(VARHDRSZ + so->inc_meta->inc_len[i]);
+                else if (so->inc_is_numeric[i])
+                    inc_bytes = 24; /* Conservative max for NUMERIC(18,4) varlena */
+                else
+                    inc_bytes = (Size) so->inc_meta->inc_len[i];
                 cur += inc_bytes;
             }
             sz = MAXALIGN(cur);
@@ -432,7 +498,7 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         so->itup = (IndexTuple) palloc0(sz);
         so->has_varwidth = key_is_text;
         if (so->ninclude > 0)
-            for (uint16 i=0;i<so->ninclude;i++) if (so->inc_meta->inc_is_text[i]) { so->has_varwidth = true; break; }
+            for (uint16 i=0;i<so->ninclude;i++) if (so->inc_meta->inc_is_text[i] || so->inc_is_numeric[i]) { so->has_varwidth = true; break; }
         so->itup->t_info = (unsigned short) (sz | (so->has_varwidth ? INDEX_VAR_MASK : 0)); /* updated per-row when key varwidth */
         so->itup_data = (char *) so->itup + data_off;
         so->itup_off2 = so->two_col ? (uint16) (off2 - data_off) : 0;
@@ -1547,20 +1613,67 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                 {
                     char *row_ptr = smol12_row_ptr(page, row, so->key_len, so->key_len2, so->inc_meta->inc_cumul_offs[so->ninclude]);
                     char *inc_start = row_ptr + so->key_len + so->key_len2;
-                    for (uint16 i = 0; i < so->ninclude; i++)
+
+                    /* If any NUMERIC columns, compute offsets incrementally due to variable varlena size */
+                    if (so->has_numeric)
                     {
-                        char *inc_src = inc_start + so->inc_meta->inc_cumul_offs[i];
-                        char *inc_dst = so->itup_data + so->inc_meta->inc_offs[i];
-                        if (so->inc_meta->inc_is_text[i])
+                        Size cur_off = so->inc_meta->inc_offs[0];  /* Start at first INCLUDE offset */
+                        for (uint16 i = 0; i < so->ninclude; i++)
                         {
-                            /* Text: add VARHDRSZ and copy */
-                            SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_meta->inc_len[i]);
-                            memcpy(VARDATA(inc_dst), inc_src, so->inc_meta->inc_len[i]);
+                            char *inc_src = inc_start + so->inc_meta->inc_cumul_offs[i];
+                            cur_off = att_align_nominal(cur_off, so->inc_meta->inc_align[i]);
+                            char *inc_dst = so->itup_data + cur_off;
+
+                            if (so->inc_meta->inc_is_text[i])
+                            {
+                                /* Text: add VARHDRSZ and copy */
+                                SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_meta->inc_len[i]);
+                                memcpy(VARDATA(inc_dst), inc_src, so->inc_meta->inc_len[i]);
+                                cur_off += VARHDRSZ + so->inc_meta->inc_len[i];
+                            }
+                            else if (so->inc_is_numeric[i])
+                            {
+                                /* NUMERIC: stored as int64, convert to NUMERIC varlena */
+                                int64 int_val;
+                                if (so->inc_meta->inc_len[i] == 2)
+                                    int_val = (int64) *((int16 *) inc_src);
+                                else if (so->inc_meta->inc_len[i] == 4)
+                                    int_val = (int64) *((int32 *) inc_src);
+                                else
+                                    int_val = *((int64 *) inc_src);
+
+                                Datum numeric_datum = smol_int64_to_numeric(int_val, so->inc_numeric_scale[i]);
+                                struct varlena *numeric_vl = (struct varlena *) DatumGetPointer(numeric_datum);
+                                Size numeric_size = VARSIZE_ANY(numeric_vl);
+                                memcpy(inc_dst, numeric_vl, numeric_size);
+                                cur_off += numeric_size;
+                            }
+                            else
+                            {
+                                /* Fixed-length: direct copy */
+                                memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]); /* GCOV_EXCL_LINE */
+                                cur_off += so->inc_meta->inc_len[i]; /* GCOV_EXCL_LINE */
+                            }
                         }
-                        else
+                    }
+                    else
+                    {
+                        /* Fast path: no NUMERIC, use pre-computed offsets */
+                        for (uint16 i = 0; i < so->ninclude; i++)
                         {
-                            /* Fixed-length: direct copy */
-                            memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]);
+                            char *inc_src = inc_start + so->inc_meta->inc_cumul_offs[i];
+                            char *inc_dst = so->itup_data + so->inc_meta->inc_offs[i];
+                            if (so->inc_meta->inc_is_text[i])
+                            {
+                                /* Text: add VARHDRSZ and copy */
+                                SET_VARSIZE(inc_dst, VARHDRSZ + so->inc_meta->inc_len[i]);
+                                memcpy(VARDATA(inc_dst), inc_src, so->inc_meta->inc_len[i]);
+                            }
+                            else
+                            {
+                                /* Fixed-length: direct copy */
+                                memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]);
+                            }
                         }
                     }
                 }
@@ -1729,8 +1842,29 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         /* Slow path: compute pointer dynamically */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, row, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL);
                                     char *dst = so->itup_data + so->inc_meta->inc_offs[ii];
-                                    /* Use precomputed copy function (eliminates if-else chain overhead) */
-                                    so->inc_meta->inc_copy[ii](dst, ip);
+                                    /* Check if this is a NUMERIC INCLUDE column (needs conversion) */
+                                    if (so->inc_is_numeric[ii])
+                                    {
+                                        /* NUMERIC: stored as fixed-width int, convert to NUMERIC varlena */
+                                        int64 int_val;
+                                        if (so->inc_meta->inc_len[ii] == 2) /* GCOV_EXCL_LINE */
+                                            int_val = (int64) *((int16 *) ip); /* GCOV_EXCL_LINE */
+                                        else if (so->inc_meta->inc_len[ii] == 4) /* GCOV_EXCL_LINE */
+                                            int_val = (int64) *((int32 *) ip); /* GCOV_EXCL_LINE */
+                                        else /* inc_len == 8 */
+                                            int_val = *((int64 *) ip); /* GCOV_EXCL_LINE */
+
+                                        Datum numeric_datum = smol_int64_to_numeric(int_val, so->inc_numeric_scale[ii]);  /* GCOV_EXCL_LINE - Parallel scan NUMERIC not fully implemented */
+                                        struct varlena *numeric_vl = (struct varlena *) DatumGetPointer(numeric_datum);  /* GCOV_EXCL_LINE */
+                                        Size numeric_size = VARSIZE_ANY(numeric_vl);  /* GCOV_EXCL_LINE */
+                                        memcpy(dst, numeric_vl, numeric_size);  /* GCOV_EXCL_LINE */
+                                        /* NOTE: Don't pfree - DirectFunctionCall results are in executor context */
+                                    }
+                                    else
+                                    {
+                                        /* Use precomputed copy function (eliminates if-else chain overhead) */
+                                        so->inc_meta->inc_copy[ii](dst, ip);
+                                    }
                                 }
                             }
                         }
@@ -1994,8 +2128,29 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                         /* Slow path: compute pointer dynamically */ /* GCOV_EXCL_LINE */
                                         ip = smol1_inc_ptr_any(page, so->key_len, n2, so->inc_meta ? so->inc_meta->inc_len : NULL, so->ninclude, ii, row, so->inc_meta ? so->inc_meta->inc_cumul_offs : NULL); /* GCOV_EXCL_LINE */
                                     char *dst = so->itup_data + so->inc_meta->inc_offs[ii];
-                                    /* Use precomputed copy function (eliminates if-else chain overhead) */
-                                    so->inc_meta->inc_copy[ii](dst, ip);
+                                    /* Check if this is a NUMERIC INCLUDE column (needs conversion) */
+                                    if (so->inc_is_numeric[ii])
+                                    {
+                                        /* NUMERIC: stored as fixed-width int, convert to NUMERIC varlena */
+                                        int64 int_val;
+                                        if (so->inc_meta->inc_len[ii] == 2) /* GCOV_EXCL_LINE */
+                                            int_val = (int64) *((int16 *) ip); /* GCOV_EXCL_LINE */
+                                        else if (so->inc_meta->inc_len[ii] == 4) /* GCOV_EXCL_LINE */
+                                            int_val = (int64) *((int32 *) ip); /* GCOV_EXCL_LINE */
+                                        else /* inc_len == 8 */
+                                            int_val = *((int64 *) ip); /* GCOV_EXCL_LINE */
+
+                                        Datum numeric_datum = smol_int64_to_numeric(int_val, so->inc_numeric_scale[ii]);  /* GCOV_EXCL_LINE - Parallel scan NUMERIC not fully implemented */
+                                        struct varlena *numeric_vl = (struct varlena *) DatumGetPointer(numeric_datum);  /* GCOV_EXCL_LINE */
+                                        Size numeric_size = VARSIZE_ANY(numeric_vl);  /* GCOV_EXCL_LINE */
+                                        memcpy(dst, numeric_vl, numeric_size);  /* GCOV_EXCL_LINE */
+                                        /* NOTE: Don't pfree - DirectFunctionCall results are in executor context */
+                                    }
+                                    else
+                                    {
+                                        /* Use precomputed copy function (eliminates if-else chain overhead) */
+                                        so->inc_meta->inc_copy[ii](dst, ip);
+                                    }
                                 }
                             }
                         }

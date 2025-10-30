@@ -47,6 +47,7 @@
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "utils/pg_locale.h"
+#include "utils/numeric.h"
 #include "portability/instr_time.h"
 #include "pgstat.h"
 #include "utils/selfuncs.h"
@@ -225,6 +226,10 @@ typedef struct SmolMeta
     Oid         collation_oid;        /* collation for first text key (InvalidOid if not text or C collation) */
     /* v4 field: leaf directory for parallel scan */
     BlockNumber directory_blkno;      /* block number of directory page (InvalidBlockNumber if none) */
+    /* v5 fields: NUMERIC type metadata for INCLUDE columns only */
+    bool        inc_is_numeric[16];   /* true if INCLUDE column is NUMERIC */
+    int16       inc_numeric_precision[16];  /* precision for INCLUDE NUMERIC columns */
+    int16       inc_numeric_scale[16];      /* scale for INCLUDE NUMERIC columns */
 } SmolMeta;
 
 /*
@@ -378,6 +383,11 @@ typedef struct SmolScanOpaqueData
     uint16      ninclude;
     SmolIncludeMetadata *inc_meta;  /* NULL if ninclude == 0, else dynamically allocated */
     bool        run_inc_evaluated;  /* inc_const[] computed for current run */
+
+    /* NUMERIC conversion metadata for INCLUDE columns (zero overhead if has_numeric == false) */
+    bool        has_numeric;        /* fast check: true if any INCLUDE column is NUMERIC */
+    bool        inc_is_numeric[16]; /* true if INCLUDE column is NUMERIC */
+    int16       inc_numeric_scale[16]; /* scale for INCLUDE columns */
 
     /* lightweight profiling (enabled by smol.profile) */
     bool        prof_enabled;
@@ -547,7 +557,8 @@ typedef struct SmolIncludeContext {
     bool byval1, byval2;  /* pass-by-value flags for 2-key */
     /* include buffers (pointers-to-pointers so we can grow/assign) */
     char **pi[16];
-    uint16 ilen[16]; bool ibyval[16]; bool itext[16];
+    uint16 ilen[16]; bool ibyval[16]; bool itext[16]; bool inumeric[16];
+    int16 inumeric_scale[16];  /* scale for NUMERIC INCLUDE columns */
     Size *pcap; Size *pcount; int incn;
 } SmolIncludeContext;
 typedef struct SMOLShared
@@ -812,6 +823,12 @@ extern uint64 smol_bloom_build_page(Page page, uint16 key_len, Oid typid, int nh
 /* Leaf directory functions (smol_utils.c) */
 extern BlockNumber smol_build_and_write_directory(Relation idx);
 extern SmolDirectory *smol_read_directory(Relation idx, BlockNumber dir_blk);
+
+/* NUMERIC support functions (smol_utils.c) */
+extern bool smol_numeric_get_precision_scale(int32 typmod, int *precision_out, int *scale_out);
+extern uint16 smol_numeric_storage_size(int precision);
+extern int64 smol_numeric_to_int64(Datum numeric_datum, int scale);
+extern Datum smol_int64_to_numeric(int64 value, int scale);
 
 /* Parallel build worker entry (must be extern for dynamic loading) */
 extern PGDLLEXPORT void smol_parallel_build_main(dsm_segment *seg, shm_toc *toc);

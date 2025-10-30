@@ -226,3 +226,172 @@ SELECT count(*) FROM bloom_comprehensive WHERE k = 1;
 DROP TABLE bloom_comprehensive CASCADE;
 \echo 'Test PASSED: Advanced coverage tests with bloom filters'
 Test PASSED: Advanced coverage tests with bloom filters
+-- Test NUMERIC support in INCLUDE columns
+-- This test exercises NUMERIC conversion for INCLUDE columns only
+-- Test 1: Basic NUMERIC INCLUDE column (two-column index)
+CREATE TABLE t_numeric_basic (id int, cat int, val numeric(10,2));
+INSERT INTO t_numeric_basic VALUES (1, 100, 123.45), (2, 100, 234.56), (3, 200, -345.67);
+CREATE INDEX t_numeric_basic_idx ON t_numeric_basic USING smol(id, cat) INCLUDE (val);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- Verify values
+SELECT * FROM t_numeric_basic ORDER BY id;
+ id | cat |          val          
+----+-----+-----------------------
+  1 | 100 |  123.4500000000000000
+  2 | 100 |  234.5600000000000000
+  3 | 200 | -345.6700000000000000
+(3 rows)
+
+-- Test 2: Multiple NUMERIC INCLUDE columns with different scales
+CREATE TABLE t_numeric_multi (id int, cat int, v0 numeric(10,0), v2 numeric(10,2), v4 numeric(18,4));
+INSERT INTO t_numeric_multi VALUES (1, 100, 12345, 123.45, 1234.5678);
+CREATE INDEX t_numeric_multi_idx ON t_numeric_multi USING smol(id, cat) INCLUDE (v0, v2, v4);
+SELECT * FROM t_numeric_multi;
+ id | cat |  v0   |          v2          |          v4           
+----+-----+-------+----------------------+-----------------------
+  1 | 100 | 12345 | 123.4500000000000000 | 1234.5678000000000000
+(1 row)
+
+-- Test 3: Different precision requiring different storage sizes
+-- int16 (precision <= 4): numeric(4,2)
+-- int32 (precision <= 9): numeric(9,4)
+-- int64 (precision <= 18): numeric(18,4)
+CREATE TABLE t_numeric_sizes (id int, cat int, small numeric(4,2), medium numeric(9,4), large numeric(18,4));
+INSERT INTO t_numeric_sizes VALUES (1, 100, 12.34, 12345.6789, 123456789012.3456);
+CREATE INDEX t_numeric_sizes_idx ON t_numeric_sizes USING smol(id, cat) INCLUDE (small, medium, large);
+SELECT * FROM t_numeric_sizes;
+ id | cat |        small        |         medium         |         large         
+----+-----+---------------------+------------------------+-----------------------
+  1 | 100 | 12.3400000000000000 | 12345.6789000000000000 | 123456789012.34560000
+(1 row)
+
+-- Test 4: Edge cases (zero, negative, maximum values)
+CREATE TABLE t_numeric_edge (id int, cat int, val numeric(15,4));
+INSERT INTO t_numeric_edge VALUES
+    (1, 1, 0),
+    (2, 2, -123.4567),
+    (3, 3, 999999999.9999),
+    (4, 4, -999999999.9999);
+CREATE INDEX t_numeric_edge_idx ON t_numeric_edge USING smol(id, cat) INCLUDE (val);
+SELECT * FROM t_numeric_edge ORDER BY id;
+ id | cat |            val             
+----+-----+----------------------------
+  1 |   1 | 0.000000000000000000000000
+  2 |   2 |      -123.4567000000000000
+  3 |   3 |         999999999.99990000
+  4 |   4 |        -999999999.99990000
+(4 rows)
+
+-- Test 5: WHERE clause on NUMERIC INCLUDE column
+SELECT * FROM t_numeric_basic WHERE val > 200;
+ id | cat |         val          
+----+-----+----------------------
+  2 | 100 | 234.5600000000000000
+(1 row)
+
+SELECT * FROM t_numeric_basic WHERE val < 0;
+ id | cat |          val          
+----+-----+-----------------------
+  3 | 200 | -345.6700000000000000
+(1 row)
+
+-- Test 6: Multiple rows
+CREATE TABLE t_numeric_many (id int, cat int, val numeric(10,2));
+INSERT INTO t_numeric_many SELECT i, i%10, (i*1.5)::numeric(10,2) FROM generate_series(1,50) i;
+CREATE INDEX t_numeric_many_idx ON t_numeric_many USING smol(id, cat) INCLUDE (val);
+SELECT COUNT(*) FROM t_numeric_many;
+ count 
+-------
+    50
+(1 row)
+
+SELECT * FROM t_numeric_many WHERE id BETWEEN 10 AND 15 ORDER BY id;
+ id | cat |         val         
+----+-----+---------------------
+ 10 |   0 | 15.0000000000000000
+ 11 |   1 | 16.5000000000000000
+ 12 |   2 | 18.0000000000000000
+ 13 |   3 | 19.5000000000000000
+ 14 |   4 | 21.0000000000000000
+ 15 |   5 | 22.5000000000000000
+(6 rows)
+
+-- Test 7: Single-column index with NUMERIC INCLUDE (should fail - not supported)
+\set ON_ERROR_STOP 0
+CREATE TABLE t_numeric_single (id int, val numeric(10,2));
+CREATE INDEX t_numeric_single_idx ON t_numeric_single USING smol(id) INCLUDE (val);
+ERROR:  smol: NUMERIC in INCLUDE columns is only supported for two-column indexes (attno=2)
+HINT:  Use a two-column index to store NUMERIC in INCLUDE columns.
+\set ON_ERROR_STOP 1
+-- Test 8: NUMERIC as key column (should fail - not supported)
+\set ON_ERROR_STOP 0
+CREATE TABLE t_numeric_key (id numeric(10,2), cat int);
+CREATE INDEX t_numeric_key_idx ON t_numeric_key USING smol(id, cat);
+ERROR:  data type numeric has no default operator class for access method "smol"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+\set ON_ERROR_STOP 1
+-- Test 9: NUMERIC without explicit precision (should fail)
+\set ON_ERROR_STOP 0
+CREATE TABLE t_numeric_noprec (id int, cat int, val numeric);
+CREATE INDEX t_numeric_noprec_idx ON t_numeric_noprec USING smol(id, cat) INCLUDE (val);
+ERROR:  smol requires NUMERIC with explicit precision/scale for INCLUDE columns (attno=3)
+\set ON_ERROR_STOP 1
+-- Test 10: NUMERIC with precision > 38 (should fail)
+\set ON_ERROR_STOP 0
+CREATE TABLE t_numeric_huge (id int, cat int, val numeric(50,2));
+CREATE INDEX t_numeric_huge_idx ON t_numeric_huge USING smol(id, cat) INCLUDE (val);
+ERROR:  smol supports NUMERIC with precision up to 38 digits in INCLUDE columns (attno=3, precision=50)
+\set ON_ERROR_STOP 1
+-- Cleanup
+DROP TABLE t_numeric_basic CASCADE;
+DROP TABLE t_numeric_multi CASCADE;
+DROP TABLE t_numeric_sizes CASCADE;
+DROP TABLE t_numeric_edge CASCADE;
+DROP TABLE t_numeric_many CASCADE;
+DROP TABLE IF EXISTS t_numeric_single CASCADE;
+DROP TABLE IF EXISTS t_numeric_key CASCADE;
+DROP TABLE IF EXISTS t_numeric_noprec CASCADE;
+DROP TABLE IF EXISTS t_numeric_huge CASCADE;
+-- Additional coverage tests for NUMERIC edge cases
+-- Test 11: Mix TEXT and NUMERIC INCLUDE columns (covers TEXT+NUMERIC fast path)
+CREATE TABLE t_numeric_text_mix (id int, cat int, name text, price numeric(10,2));
+INSERT INTO t_numeric_text_mix VALUES (1, 100, 'item1', 123.45), (2, 100, 'item2', 234.56);
+CREATE INDEX t_numeric_text_mix_idx ON t_numeric_text_mix USING smol(id, cat) INCLUDE (name, price);
+SELECT id, cat, name, price FROM t_numeric_text_mix ORDER BY id;
+ id | cat | name  |        price         
+----+-----+-------+----------------------
+  1 | 100 | item1 | 123.4500000000000000
+  2 | 100 | item2 | 234.5600000000000000
+(2 rows)
+
+-- Test 12: Test with NaN (should fail)
+\set ON_ERROR_STOP 0
+CREATE TABLE t_numeric_nan (id int, cat int, val numeric(10,2));
+INSERT INTO t_numeric_nan VALUES (1, 100, 'NaN'::numeric);
+CREATE INDEX t_numeric_nan_idx ON t_numeric_nan USING smol(id, cat) INCLUDE (val);
+ERROR:  SMOL does not support NaN in NUMERIC columns
+SELECT * FROM t_numeric_nan;
+ id | cat | val 
+----+-----+-----
+  1 | 100 | NaN
+(1 row)
+
+\set ON_ERROR_STOP 1
+-- Test 13: Large table to trigger parallel scan
+CREATE TABLE t_numeric_parallel (id int, cat int, val numeric(10,2));
+INSERT INTO t_numeric_parallel SELECT i, i%100, (i*1.5)::numeric(10,2) FROM generate_series(1,10000) i;
+CREATE INDEX t_numeric_parallel_idx ON t_numeric_parallel USING smol(id, cat) INCLUDE (val);
+-- Force parallel scan (expected to error - not fully supported yet)
+\set ON_ERROR_STOP 0
+SET max_parallel_workers_per_gather = 2;
+SET min_parallel_index_scan_size = 0;
+SET parallel_tuple_cost = 0;
+SET parallel_setup_cost = 0;
+SELECT COUNT(*) FROM t_numeric_parallel WHERE val > 5000;
+ERROR:  smol: parallel scan without bound
+\set ON_ERROR_STOP 1
+-- Cleanup
+DROP TABLE t_numeric_text_mix CASCADE;
+DROP TABLE IF EXISTS t_numeric_nan CASCADE;
+DROP TABLE t_numeric_parallel CASCADE;

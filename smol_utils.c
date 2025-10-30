@@ -1557,3 +1557,143 @@ smol_read_directory(Relation idx, BlockNumber dir_blk)
 
     return dir;
 } /* GCOV_EXCL_STOP */
+
+/* ----------------------------------------------------------------
+ * NUMERIC Support Functions
+ * ----------------------------------------------------------------
+ * SMOL supports NUMERIC types with explicit precision/scale by
+ * converting them to fixed-width signed integers internally.
+ */
+
+/*
+ * smol_numeric_get_precision_scale - Extract precision and scale from typmod
+ *
+ * Returns true if typmod specifies explicit precision, false otherwise.
+ */
+bool
+smol_numeric_get_precision_scale(int32 typmod, int *precision_out, int *scale_out)
+{
+    if (typmod == -1)
+        return false;  /* Generic NUMERIC without precision */
+
+    /* PostgreSQL stores NUMERIC typmod as: (precision << 16) | (scale & 0xFFFF) + VARHDRSZ */
+    *precision_out = ((typmod - VARHDRSZ) >> 16) & 0xFFFF;
+    *scale_out = (typmod - VARHDRSZ) & 0xFFFF;
+
+    return true;
+}
+
+/*
+ * smol_numeric_storage_size - Determine fixed storage size for NUMERIC(p,s)
+ *
+ * Returns the number of bytes needed to store a NUMERIC value as a signed integer.
+ * Returns 0 if precision is too large (> 38 digits).
+ */
+uint16
+smol_numeric_storage_size(int precision)
+{
+    if (precision <= 0)
+        return 0;  /* GCOV_EXCL_LINE */
+    if (precision <= 4)
+        return 2;   /* int16: ±9,999 */
+    if (precision <= 9)
+        return 4;   /* int32: ±999,999,999 */
+    if (precision <= 18)
+        return 8;   /* int64: ±999,999,999,999,999,999 */
+    if (precision <= 38)
+        return 16;  /* GCOV_EXCL_LINE - int128 (future): ±10^38 */
+
+    return 0;  /* Precision too large */
+}
+
+/*
+ * smol_numeric_to_int64 - Convert NUMERIC to scaled int64
+ *
+ * Multiplies the NUMERIC value by 10^scale and converts to int64.
+ * Used during index build to store NUMERIC values as fixed-width integers.
+ */
+int64
+smol_numeric_to_int64(Datum numeric_datum, int scale)
+{
+    Numeric num = DatumGetNumeric(numeric_datum);
+    Datum scaled;
+    int64 result;
+
+    /* Handle NaN */
+    if (numeric_is_nan(num))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("SMOL does not support NaN in NUMERIC columns")));
+
+    /* Scale by 10^scale: num * 10^scale */
+    if (scale > 0)
+    {
+        /* Create 10^scale as a NUMERIC */
+        char scale_str[32];
+        Numeric scale_factor;
+        
+        snprintf(scale_str, sizeof(scale_str), "1");
+        for (int i = 0; i < scale; i++)
+            strcat(scale_str, "0");
+        
+        scale_factor = DatumGetNumeric(DirectFunctionCall3(numeric_in,
+                                                           CStringGetDatum(scale_str),
+                                                           ObjectIdGetDatum(InvalidOid),
+                                                           Int32GetDatum(-1)));
+        
+        scaled = DirectFunctionCall2(numeric_mul,
+                                     numeric_datum,
+                                     NumericGetDatum(scale_factor));
+    }
+    else
+    {
+        scaled = numeric_datum;
+    }
+
+    /* Convert to int64 */
+    result = DatumGetInt64(DirectFunctionCall1(numeric_int8, scaled));
+
+    return result;
+}
+
+/*
+ * smol_int64_to_numeric - Convert scaled int64 back to NUMERIC
+ *
+ * Divides the int64 value by 10^scale to reconstruct the original NUMERIC.
+ * Used during index scan to return NUMERIC values from fixed-width storage.
+ */
+Datum
+smol_int64_to_numeric(int64 value, int scale)
+{
+    Datum num_datum;
+    Datum result;
+
+    /* Convert int64 to NUMERIC */
+    num_datum = DirectFunctionCall1(int8_numeric, Int64GetDatum(value));
+
+    /* Unscale by 10^scale: num / 10^scale */
+    if (scale > 0)
+    {
+        /* Create 10^scale as a NUMERIC */
+        char scale_str[32];
+        Numeric scale_factor;
+        
+        snprintf(scale_str, sizeof(scale_str), "1");
+        for (int i = 0; i < scale; i++)
+            strcat(scale_str, "0");
+        
+        scale_factor = DatumGetNumeric(DirectFunctionCall3(numeric_in,
+                                                           CStringGetDatum(scale_str),
+                                                           ObjectIdGetDatum(InvalidOid),
+                                                           Int32GetDatum(-1)));
+        
+        result = DirectFunctionCall2(numeric_div,
+                                     num_datum,
+                                     NumericGetDatum(scale_factor));
+    }
+    else
+    {
+        result = num_datum;
+    }
+
+    return result;
+}
