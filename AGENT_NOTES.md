@@ -175,6 +175,7 @@ Bugs to watch out for:
 - Segfault inside `visibilitymap_set`: I initially passed `InvalidBuffer` for `heapBuf` and hadn’t set PD_ALL_VISIBLE; `visibilitymap_set` requires `PageIsAllVisible(heapBuf)`. Fix: set PD_ALL_VISIBLE under exclusive lock and pass `heapBuf` into `visibilitymap_set`.
 - INCLUDE columns mismatch: using `itupdesc->natts` caused me to think I had `natts` attrs to store, but on-disk we only store key attrs. Fix: set `bst.natts = nkeyatts`. Keep `amcaninclude=true` but restrict INCLUDE to single-key indexes and copy INCLUDE payloads from page to the prebuilt tuple in scans.
 - Starting scan at block 0 (metapage) was wrong. Fix: start at block 1.
+- SmolMeta structure size changes: Adding fields to SmolMeta breaks the `smol.test_max_tuples_per_page` test GUC, preventing multi-page indexes and causing bloom filter tests to fail. See `archive/SMOLMETA_INVESTIGATION.md` for details.
 
 Flags and opclasses
 - `amstrategies = 5` for (<, <=, =, >=, >); `amsupport = 1` comparator proc. `amcanorder=true`, `amcanbackward=true`, `amcanparallel=true`, `amsearcharray=false`, `amsearchnulls=false`, `amgetbitmap=NULL`, `amcaninclude=true` (single-key only).
