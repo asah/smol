@@ -1002,53 +1002,34 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                                 else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
                             }
                             BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
-                            /* publish rightlink(left) or skip ahead by batch-1 to reserve a local chunk */
+                            /* Optimized: claim leaf and publish rightlink without batch skip-ahead
+                             * This eliminates 15+ page reads per claim (pure overhead) */
                             Buffer lbuf = ReadBufferExtended(idx, MAIN_FORKNUM, left, RBM_NORMAL, so->bstrategy);
                             Page lpg = BufferGetPage(lbuf);
-                            BlockNumber step = smol_page_opaque(lpg)->rightlink;
-                            uint32 claimed = 0;
-                            for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                            {
-                                Buffer nb = ReadBufferExtended(idx, MAIN_FORKNUM, step, RBM_NORMAL, so->bstrategy);
-                                Page np = BufferGetPage(nb);
-                                BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                                ReleaseBuffer(nb);
-                                step = rl2;
-                                claimed++;
-                            }
+                            BlockNumber next_leaf = smol_page_opaque(lpg)->rightlink;
                             ReleaseBuffer(lbuf);
                             uint32 expect = 0u;
-                            uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                            uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                             {
-			        so->cur_blk = left; so->chunk_left = claimed;
+			        so->cur_blk = left; so->chunk_left = 0;
 				break;
 			    }
                             continue; /* GCOV_EXCL_LINE (flaky) - CAS retry: covered by simulate_atomic_race but non-deterministic */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
-                        /* claim current and optionally skip ahead by batch-1 */
+                        /* claim current leaf without batch skip-ahead */
                         Buffer tbuf = ReadBufferExtended(idx, MAIN_FORKNUM, (BlockNumber) curv, RBM_NORMAL, so->bstrategy);
                         Page tpg = BufferGetPage(tbuf);
-                        BlockNumber step = smol_page_opaque(tpg)->rightlink;
-                        uint32 claimed = 0;
-                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                        {
-                            Buffer nb = ReadBufferExtended(idx, MAIN_FORKNUM, step, RBM_NORMAL, so->bstrategy);
-                            Page np = BufferGetPage(nb);
-                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                            ReleaseBuffer(nb);
-                            step = rl2;
-                            claimed++;
-                        }
+                        BlockNumber next_leaf = smol_page_opaque(tpg)->rightlink;
                         ReleaseBuffer(tbuf);
                         uint32 expected = curv;
-                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                        uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                         if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expected, newv))
                         {
 			    so->cur_blk = (BlockNumber) curv;
-			    so->chunk_left = claimed;
+			    so->chunk_left = 0;
 			    break;
 			}
                     }
@@ -1189,44 +1170,24 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                             Buffer lbuf = ReadBuffer(idx, left);
                             Page lpg = BufferGetPage(lbuf);
-                            BlockNumber step = smol_page_opaque(lpg)->rightlink;
-                            uint32 claimed = 0;
-                            for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                            {
-                                Buffer nb = ReadBuffer(idx, step);
-                                Page np = BufferGetPage(nb);
-                                BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                                ReleaseBuffer(nb);
-                                step = rl2;
-                                claimed++;
-                            }
+                            BlockNumber next_leaf = smol_page_opaque(lpg)->rightlink;
                             ReleaseBuffer(lbuf);
                             uint32 expect = 0u;
-                            uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                            uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                             if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
-                            { so->cur_blk = left; so->chunk_left = claimed; break; }
+                            { so->cur_blk = left; so->chunk_left = 0; break; }
                             continue; /* GCOV_EXCL_LINE - CAS retry: requires precise parallel timing */
                         }
                         if (curv == (uint32) InvalidBlockNumber)
                         { so->cur_blk = InvalidBlockNumber; break; }
                         Buffer tbuf = ReadBuffer(idx, (BlockNumber) curv);
                         Page tpg = BufferGetPage(tbuf);
-                        BlockNumber step = smol_page_opaque(tpg)->rightlink;
-                        uint32 claimed = 0;
-                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                        {
-                            Buffer nb = ReadBuffer(idx, step);
-                            Page np = BufferGetPage(nb);
-                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                            ReleaseBuffer(nb);
-                            step = rl2;
-                            claimed++;
-                        }
+                        BlockNumber next_leaf = smol_page_opaque(tpg)->rightlink;
                         ReleaseBuffer(tbuf);
                         uint32 expected = curv;
-                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                        uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                         if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expected, newv))
-                        { so->cur_blk = (BlockNumber) curv; so->chunk_left = claimed; break; }
+                        { so->cur_blk = (BlockNumber) curv; so->chunk_left = 0; break; }
                     }
                     so->cur_group = 0;
                     so->pos_in_group = 0;
@@ -2050,32 +2011,7 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (scan->parallel_scan && dir != BackwardScanDirection)
         {
             SmolParallelScan *ps = (SmolParallelScan *) ((char *) scan->parallel_scan + scan->parallel_scan->ps_offset_am);
-            /* If we reserved a local chunk, take the next rightlink without touching shared state. */
-            if (so->chunk_left > 0)
-            {
-                op = smol_page_opaque(page);
-                next = op->rightlink;
-                so->chunk_left--;
-                if (BlockNumberIsValid(next))
-                {
-                    PrefetchBuffer(idx, MAIN_FORKNUM, next);
-                    SMOL_LOGF("PARALLEL: prefetch_depth=%d, next=%u", smol_prefetch_depth, next);
-                    if (smol_prefetch_depth > 1)
-                    {
-                        SMOL_LOG("PARALLEL: INSIDE prefetch_depth > 1 branch!");
-                        BlockNumber nblocks = RelationGetNumberOfBlocks(idx);
-                        for (int d=2; d<=smol_prefetch_depth; d++)
-                        {
-                            BlockNumber pb = next + (BlockNumber) (d-1);
-                            if (pb < nblocks)
-                                PrefetchBuffer(idx, MAIN_FORKNUM, pb);
-                            else
-                                break; /* break when prefetch reaches end of index */
-                        }
-                    }
-                }
-            }
-            else
+            /* Claim next leaf atomically (no batch claiming) */
             {
                 for (;;)
                 { /* GCOV_EXCL_LINE (flaky) */
@@ -2093,24 +2029,14 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                         BlockNumber left = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                         Buffer lbuf = ReadBufferExtended(idx, MAIN_FORKNUM, left, RBM_NORMAL, so->bstrategy);
                         Page lpg = BufferGetPage(lbuf);
-                        BlockNumber step = smol_page_opaque(lpg)->rightlink;
-                        uint32 claimed = 0;
-                        for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                        {
-                            Buffer nb = ReadBuffer(idx, step);
-                            Page np = BufferGetPage(nb);
-                            BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                            ReleaseBuffer(nb);
-                            step = rl2;
-                            claimed++;
-                        }
+                        BlockNumber next_leaf = smol_page_opaque(lpg)->rightlink;
                         ReleaseBuffer(lbuf);
                         uint32 expect = 0u;
-                        uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                        uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                         if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expect, newv))
                         {
                             next = left;
-                            so->chunk_left = claimed;
+                            so->chunk_left = 0;
                             if (BlockNumberIsValid(next))
                                 PrefetchBuffer(idx, MAIN_FORKNUM, next);
                             break;
@@ -2119,27 +2045,17 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     } /* GCOV_EXCL_STOP */
                     if (curv == (uint32) InvalidBlockNumber)
                     { next = InvalidBlockNumber; break; }
-                    /* Read rightlink to publish next (batch skip) */
+                    /* Read rightlink to publish next without batch skip */
                     Buffer tbuf = ReadBufferExtended(idx, MAIN_FORKNUM, (BlockNumber) curv, RBM_NORMAL, so->bstrategy);
                     Page tpg = BufferGetPage(tbuf);
-                    BlockNumber step = smol_page_opaque(tpg)->rightlink;
-                    uint32 claimed = 0;
-                    for (int i = 1; i < smol_parallel_claim_batch && BlockNumberIsValid(step); i++)
-                    {
-                        Buffer nb = ReadBufferExtended(idx, MAIN_FORKNUM, step, RBM_NORMAL, so->bstrategy);
-                        Page np = BufferGetPage(nb);
-                        BlockNumber rl2 = smol_page_opaque(np)->rightlink;
-                        ReleaseBuffer(nb);
-                        step = rl2;
-                        claimed++;
-                    }
+                    BlockNumber next_leaf = smol_page_opaque(tpg)->rightlink;
                     ReleaseBuffer(tbuf);
                     uint32 expected = curv;
-                    uint32 newv = (uint32) (BlockNumberIsValid(step) ? step : InvalidBlockNumber);
+                    uint32 newv = (uint32) (BlockNumberIsValid(next_leaf) ? next_leaf : InvalidBlockNumber);
                     if (SMOL_ATOMIC_CAS_U32(&ps->curr, &expected, newv))
                     {
                         next = (BlockNumber) curv;
-                        so->chunk_left = claimed;
+                        so->chunk_left = 0;
                         if (BlockNumberIsValid(next))
                             PrefetchBuffer(idx, MAIN_FORKNUM, next);
                         break;
