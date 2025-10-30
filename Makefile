@@ -14,6 +14,8 @@ endif
 PG_CFLAGS=-Wno-declaration-after-statement
 
 # Coverage build flags (gcov-compatible)
+# Use -O0 for accurate line-level coverage (no inlining/optimization)
+# Benchmarks build separately with -O3 for maximum performance
 ifeq ($(COVERAGE),1)
 PG_CFLAGS += --coverage -O0 -DSMOL_TEST_COVERAGE
 PG_CPPFLAGS += -DSMOL_TEST_COVERAGE
@@ -113,11 +115,16 @@ dclaude:
 .PHONY: bench-pressure bench-extreme bench-legacy
 
 # Main benchmark targets using Python runner (new v2 suite)
+# Benchmarks build with -O3 (no COVERAGE flag) for maximum performance
 bench-quick: start
+	@echo "$(shell tput bold)Rebuilding with -O3 for benchmarks...$(shell tput sgr0)"
+	@$(MAKE) COVERAGE= clean all install >/dev/null 2>&1
 	@echo "$(shell tput bold)Running quick benchmark suite...$(shell tput sgr0)"
 	@python3 bench/runner.py --quick
 
 bench-full: start
+	@echo "$(shell tput bold)Rebuilding with -O3 for benchmarks...$(shell tput sgr0)"
+	@$(MAKE) COVERAGE= clean all install >/dev/null 2>&1
 	@echo "$(shell tput bold)Running full comprehensive benchmark suite...$(shell tput sgr0)"
 	@python3 bench/runner.py --full
 

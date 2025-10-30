@@ -87,6 +87,14 @@ class ReportGenerator:
             elif compression > 3:
                 rec = "✓ RECOMMEND SMOL (size)"
                 reason = f"{compression:.1f}x smaller, similar performance"
+            elif speedup < 0.8:
+                # Severe slowdown (>25%): recommend BTREE regardless of compression
+                rec = "✗ USE BTREE"
+                reason = f"SMOL is {1/speedup:.1f}x slower"
+            elif speedup < 0.9 and compression >= 2.0:
+                # Moderate slowdown (10-25%) justified by significant space savings (2x or more)
+                rec = "~ NEUTRAL (tie)"
+                reason = f"{compression:.1f}x smaller, {1/speedup:.1f}x slower"
             elif speedup < 0.9:
                 rec = "✗ USE BTREE"
                 reason = f"SMOL is {1/speedup:.1f}x slower"
@@ -146,11 +154,14 @@ class ReportGenerator:
             elif compression > 3:
                 # RECOMMEND SMOL (size)
                 continue
-            elif speedup < 0.9:
-                # USE BTREE
+            elif speedup < 0.8:
+                # Severe slowdown (>25%): recommend BTREE regardless of compression
+                return True
+            elif speedup < 0.9 and compression < 2.0:
+                # Moderate slowdown without sufficient compression: USE BTREE
                 return True
             else:
-                # NEUTRAL (tie)
+                # NEUTRAL (tie) or acceptable trade-off
                 continue
 
         return False
