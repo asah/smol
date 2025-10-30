@@ -112,6 +112,49 @@ class ReportGenerator:
 
         return '\n'.join(lines)
 
+    def has_btree_recommendations(self) -> bool:
+        """Check if any workload recommends BTREE over SMOL
+
+        Uses the same logic as generate_decision_tree() to ensure consistency.
+        Only fails if the overall workload recommends BTREE, not individual queries.
+        """
+        by_workload = defaultdict(list)
+        for r in self.results:
+            by_workload[r.workload_id].append(r)
+
+        for workload_id, workload_results in by_workload.items():
+            # Find btree and smol results for same query/cache (first match)
+            btree_results = [r for r in workload_results if r.engine == 'btree']
+            smol_results = [r for r in workload_results if r.engine == 'smol']
+
+            if not btree_results or not smol_results:
+                continue
+
+            btree = btree_results[0]
+            smol = smol_results[0]
+
+            speedup = btree.latency_p50_ms / smol.latency_p50_ms if smol.latency_p50_ms > 0 else 0
+            compression = btree.index_size_mb / smol.index_size_mb if smol.index_size_mb > 0 else 0
+
+            # Match generate_decision_tree() recommendation logic exactly
+            if speedup > 1.5 and compression > 2:
+                # STRONGLY RECOMMEND SMOL
+                continue
+            elif speedup > 1.2:
+                # RECOMMEND SMOL
+                continue
+            elif compression > 3:
+                # RECOMMEND SMOL (size)
+                continue
+            elif speedup < 0.9:
+                # USE BTREE
+                return True
+            else:
+                # NEUTRAL (tie)
+                continue
+
+        return False
+
     def save_results(self, filepath: str):
         """Save results to JSON file"""
         import json

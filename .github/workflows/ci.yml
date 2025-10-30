@@ -42,3 +42,7 @@ jobs:
         run: |
           docker exec -u postgres -w /home/postgres smol bash -c "./scripts/calc_cov.sh -e -v"
 
+      - name: Run benchmark suite (quick)
+        run: |
+          docker exec -u postgres -w /home/postgres smol bash -c "make bench-quick"
+

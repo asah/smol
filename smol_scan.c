@@ -1146,14 +1146,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                     else
                     {
-                        /* Integer types or unbounded: use fast integer-only path */
+                        /* Integer and date types or unbounded: use fast integer-only path */
                         int64 lb = 0;  /* Default for unbounded scans: start at leftmost leaf */
                         if (so->have_bound)
                         {
                             if (so->atttypid == INT2OID) lb = (int64) DatumGetInt16(so->bound_datum);
                             else if (so->atttypid == INT4OID) lb = (int64) DatumGetInt32(so->bound_datum);
                             else if (so->atttypid == INT8OID) lb = DatumGetInt64(so->bound_datum);
-                            else lb = 0;  /* Non-INT types (date, timestamp, etc.): leftmost leaf */
+                            else if (so->atttypid == DATEOID) lb = (int64) DatumGetInt32(so->bound_datum);  /* DATE is int32 internally */
+                            else lb = 0;  /* Other types (timestamp, etc.): leftmost leaf */
                         }
                         so->cur_blk = smol_find_first_leaf(idx, lb, so->atttypid, so->key_len);
                     }

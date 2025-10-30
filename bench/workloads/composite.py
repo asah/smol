@@ -30,7 +30,7 @@ class CompositeWorkload(WorkloadBase):
         SELECT
             ('2024-01-01'::date + (i % 365)) AS order_date,
             i AS order_id,
-            (random() * 5000)::numeric(10,2) AS amount,
+            (random() * 5000)::int AS amount,
             (random() * 1000)::int AS customer_id
         FROM generate_series(1, {rows}) i
         ORDER BY 1, 2;
@@ -59,7 +59,7 @@ class CompositeWorkload(WorkloadBase):
                 sql=f"""
                     SELECT count(*)
                     FROM {self.table_name}
-                    WHERE order_date = '2024-06-15'
+                    WHERE order_date >= '2024-06-15' AND order_date < '2024-06-16'
                 """,
                 description="Single day orders"
             )

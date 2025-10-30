@@ -271,6 +271,14 @@ class BenchmarkRunner:
         # Print decision tree
         print("\n" + reporter.generate_decision_tree())
 
+        # Check for BTREE recommendations and fail CI if found
+        if reporter.has_btree_recommendations():
+            print("\n" + "="*70)
+            print("ERROR: One or more workloads recommend BTREE over SMOL")
+            print("This indicates a performance regression in SMOL")
+            print("="*70)
+            sys.exit(1)
+
     def check_regressions(self):
         """Check for regressions against baseline"""
         detector = RegressionDetector()
