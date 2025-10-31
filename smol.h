@@ -637,6 +637,7 @@ extern void smol_copy2(char *dst, const char *src);
 extern void smol_copy4(char *dst, const char *src);
 extern void smol_copy8(char *dst, const char *src);
 extern void smol_copy16(char *dst, const char *src);
+extern void smol_copy32(char *dst, const char *src);
 extern void smol_copy_small(char *dst, const char *src, uint16 len);
 extern uint64 smol_norm64(int64 v);
 extern int smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp);
@@ -666,6 +667,11 @@ static inline void smol_copy8(char *dst, const char *src)
 static inline void smol_copy16(char *dst, const char *src)
 {
     __builtin_memcpy(dst, src, 16);
+}
+
+static inline void smol_copy32(char *dst, const char *src)
+{
+    __builtin_memcpy(dst, src, 32);
 }
 
 /* Generic small copy for uncommon fixed lengths (<= 32) */

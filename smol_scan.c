@@ -518,7 +518,8 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
                 else if (so->inc_meta->inc_len[i] == 4) so->inc_meta->inc_copy[i] = smol_copy4;
                 else if (so->inc_meta->inc_len[i] == 8) so->inc_meta->inc_copy[i] = smol_copy8;
                 else if (so->inc_meta->inc_len[i] == 16) so->inc_meta->inc_copy[i] = smol_copy16;
-                else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes */
+                else if (so->inc_meta->inc_len[i] == 32) so->inc_meta->inc_copy[i] = smol_copy32;
+                else /* GCOV_EXCL_LINE - defensive: all PostgreSQL fixed-length types are 1/2/4/8/16 bytes, TEXT32 is 32 bytes */
                     elog(ERROR, "smol: unsupported INCLUDE column size %u", so->inc_meta->inc_len[i]);
             }
         }

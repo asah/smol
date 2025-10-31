@@ -42,6 +42,11 @@ void smol_copy16(char *dst, const char *src)
 	__builtin_memcpy(dst, src, 16);
 }
 
+void smol_copy32(char *dst, const char *src)
+{
+	__builtin_memcpy(dst, src, 32);
+}
+
 /* Generic small copy for uncommon fixed lengths (<= 32) */
 void
 smol_copy_small(char *dst, const char *src, uint16_t len)
