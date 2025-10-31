@@ -209,11 +209,24 @@ CREATE TABLE t_numeric_key (id numeric(10,2), cat int);
 CREATE INDEX t_numeric_key_idx ON t_numeric_key USING smol(id, cat);
 \set ON_ERROR_STOP 1
 
--- Test 9: NUMERIC without explicit precision (should fail)
-\set ON_ERROR_STOP 0
+-- Test 9: NUMERIC without explicit precision (uses default NUMERIC(18,4))
 CREATE TABLE t_numeric_noprec (id int, cat int, val numeric);
+
+-- Insert data BEFORE creating index (SMOL is read-only)
+INSERT INTO t_numeric_noprec VALUES
+    (1, 100, 123.456789),       -- More than 4 decimal places (should be rounded)
+    (2, 100, -999.9999),         -- Negative with exact 4 decimals
+    (3, 100, 1000000.12),        -- Large value
+    (4, 100, 0.0001);            -- Small value
+
+-- Now create the index (should see NOTICE about default NUMERIC(18,4))
 CREATE INDEX t_numeric_noprec_idx ON t_numeric_noprec USING smol(id, cat) INCLUDE (val);
-\set ON_ERROR_STOP 1
+
+-- Query using the index to verify data is correctly stored and retrieved
+SELECT id, cat, val FROM t_numeric_noprec WHERE id >= 1 AND cat = 100 ORDER BY id;
+
+-- Verify the values show proper scaling (rounded to 4 decimals)
+SELECT id, val::text FROM t_numeric_noprec WHERE id = 1;
 
 -- Test 10: NUMERIC with precision > 38 (should fail)
 \set ON_ERROR_STOP 0

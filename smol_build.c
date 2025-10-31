@@ -313,11 +313,16 @@ smol_build(Relation heap, Relation index, struct IndexInfo *indexInfo)
                         ereport(ERROR, (errmsg("smol: NUMERIC in INCLUDE columns is only supported for two-column indexes (attno=%d)", nkeyatts + i + 1),
                                         errhint("Use a two-column index to store NUMERIC in INCLUDE columns.")));
 
-                    /* NUMERIC: must have explicit precision/scale */
+                    /* NUMERIC: get precision/scale, or use default for unbounded NUMERIC */
                     int32 typmod = TupleDescAttr(RelationGetDescr(index), nkeyatts + i)->atttypmod;
                     int precision, scale;
                     if (!smol_numeric_get_precision_scale(typmod, &precision, &scale))
-                        ereport(ERROR, (errmsg("smol requires NUMERIC with explicit precision/scale for INCLUDE columns (attno=%d)", nkeyatts + i + 1)));
+                    {
+                        /* Unbounded NUMERIC: default to NUMERIC(18,4) which uses 8-byte int64 storage */
+                        precision = 18;
+                        scale = 4;
+                        elog(NOTICE, "smol: Using default NUMERIC(18,4) for unbounded NUMERIC in INCLUDE column (attno=%d)", nkeyatts + i + 1);
+                    }
 
                     uint16 storage_size = smol_numeric_storage_size(precision);
                     if (storage_size == 0)
