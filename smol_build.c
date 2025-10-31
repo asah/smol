@@ -60,7 +60,7 @@ smol_pair_qsort_cmp(const void *pa, const void *pb)
     char *a1 = smol_sort_k1_buffer + (size_t) ia * smol_sort_key_len1;
     char *b1 = smol_sort_k1_buffer + (size_t) ib * smol_sort_key_len1;
 
-    /* Fast path: inline comparison for common integer types */
+    /* Fast path: inline comparison for common types */
     int32 r1;
     if (smol_sort_typoid1 == INT2OID && smol_sort_key_len1 == 2)
     {
@@ -76,6 +76,11 @@ smol_pair_qsort_cmp(const void *pa, const void *pb)
     {
         int64 v1 = *(int64*)a1, v2 = *(int64*)b1;
         r1 = (v1 > v2) ? 1 : ((v1 < v2) ? -1 : 0);
+    }
+    else if (smol_sort_typoid1 == TEXTOID)
+    {
+        /* TEXT keys are stored as 32-byte padded, use binary comparison */
+        r1 = memcmp(a1, b1, smol_sort_key_len1);
     }
     else
     {
@@ -3322,7 +3327,17 @@ smol_build_cb_inc(Relation rel, ItemPointer tid, Datum *values, bool *isnull, bo
     {
         /* Collect first key */
         char *dst1 = (*c->pk1buf) + ((size_t) (*c->pcount) * (size_t) c->key_len);
-        if (c->byval1)
+        if (c->key_is_text32)
+        {
+            /* pack text key to fixed key_len bytes (C collation assumed) */
+            text *t = DatumGetTextPP(values[0]);
+            int blen = VARSIZE_ANY_EXHDR(t);
+            Assert(blen <= (int) c->key_len); /* GCOV_EXCL_LINE - defensive check, should never fail */
+            const char *src = VARDATA_ANY(t);
+            if (blen > 0) memcpy(dst1, src, blen);
+            if (blen < (int) c->key_len) memset(dst1 + blen, 0, c->key_len - blen);
+        }
+        else if (c->byval1)
         {
             switch (c->key_len)
             {

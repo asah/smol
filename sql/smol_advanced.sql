@@ -600,3 +600,96 @@ DROP TABLE t_utf8_basic CASCADE;
 DROP TABLE t_utf8_long CASCADE;
 DROP TABLE t_utf8_lengths CASCADE;
 DROP TABLE t_c_collation CASCADE;
+
+--
+-- Test TEXT two-column indexes (TEXT + INT4)
+-- These tests verify that TEXT can be used as the first key in a two-column index
+-- with proper handling of 32-byte fixed-width storage and null-padding
+--
+
+-- Test 1: Basic TEXT+INT two-column index with INCLUDE
+CREATE TABLE t_text_twocol (k1 text, k2 int4, v int);
+INSERT INTO t_text_twocol VALUES
+  ('abc', 1, 100),
+  ('abc', 2, 200),
+  ('abc', 3, 300),
+  ('def', 1, 400),
+  ('def', 2, 500),
+  ('xyz', 1, 600);
+
+CREATE INDEX t_text_twocol_idx ON t_text_twocol USING smol(k1, k2) INCLUDE (v);
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- Equality on k1, range on k2
+EXPLAIN (COSTS OFF) SELECT * FROM t_text_twocol WHERE k1 = 'abc' AND k2 >= 0 ORDER BY k2;
+SELECT * FROM t_text_twocol WHERE k1 = 'abc' AND k2 >= 0 ORDER BY k2;
+
+-- Equality on both k1 and k2
+EXPLAIN (COSTS OFF) SELECT * FROM t_text_twocol WHERE k1 = 'def' AND k2 = 2;
+SELECT * FROM t_text_twocol WHERE k1 = 'def' AND k2 = 2;
+
+-- Range on k1
+EXPLAIN (COSTS OFF) SELECT * FROM t_text_twocol WHERE k1 >= 'abc' AND k1 < 'xyz' ORDER BY k1, k2;
+SELECT * FROM t_text_twocol WHERE k1 >= 'abc' AND k1 < 'xyz' ORDER BY k1, k2;
+
+-- Backward scan
+EXPLAIN (COSTS OFF) SELECT * FROM t_text_twocol WHERE k1 = 'abc' ORDER BY k2 DESC;
+SELECT * FROM t_text_twocol WHERE k1 = 'abc' ORDER BY k2 DESC;
+
+-- Test 2: TEXT+INT without INCLUDE column
+CREATE TABLE t_text_twocol_noinc (k1 text, k2 int4);
+INSERT INTO t_text_twocol_noinc VALUES
+  ('foo', 10),
+  ('foo', 20),
+  ('bar', 30);
+
+CREATE INDEX t_text_twocol_noinc_idx ON t_text_twocol_noinc USING smol(k1, k2);
+
+EXPLAIN (COSTS OFF) SELECT k1, k2 FROM t_text_twocol_noinc WHERE k1 = 'foo' ORDER BY k2;
+SELECT k1, k2 FROM t_text_twocol_noinc WHERE k1 = 'foo' ORDER BY k2;
+
+-- Test 3: TEXT with various lengths (empty, short, medium, near 32-byte boundary)
+CREATE TABLE t_text_lengths_twocol (k1 text, k2 int4, id int);
+INSERT INTO t_text_lengths_twocol VALUES
+  ('', 1, 1),                                      -- empty string
+  ('a', 2, 2),                                     -- 1 byte
+  ('short', 3, 3),                                 -- 5 bytes
+  ('medium length text', 4, 4),                    -- 18 bytes
+  ('exactly 31 bytes long text!!', 5, 5),         -- 30 bytes
+  ('this text is exactly 32 bytes!', 6, 6);       -- 32 bytes (boundary)
+
+CREATE INDEX t_text_lengths_twocol_idx ON t_text_lengths_twocol USING smol(k1, k2) INCLUDE (id);
+
+-- Query each length category
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = '' AND k2 = 1;
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = 'a' AND k2 = 2;
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = 'short' AND k2 = 3;
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = 'medium length text' AND k2 = 4;
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = 'exactly 31 bytes long text!!' AND k2 = 5;
+SELECT k1, k2, id FROM t_text_lengths_twocol WHERE k1 = 'this text is exactly 32 bytes!' AND k2 = 6;
+
+-- Test 4: TEXT+INT with duplicate k1 values (tests RLE compression)
+CREATE TABLE t_text_rle_twocol (k1 text, k2 int4, data int);
+INSERT INTO t_text_rle_twocol SELECT 'duplicate', i, i*10 FROM generate_series(1, 50) i;
+INSERT INTO t_text_rle_twocol SELECT 'another', i, i*20 FROM generate_series(1, 30) i;
+
+CREATE INDEX t_text_rle_twocol_idx ON t_text_rle_twocol USING smol(k1, k2) INCLUDE (data);
+
+-- Query with many duplicate k1 values
+SELECT count(*) FROM t_text_rle_twocol WHERE k1 = 'duplicate';
+SELECT count(*) FROM t_text_rle_twocol WHERE k1 = 'another';
+SELECT k1, k2, data FROM t_text_rle_twocol WHERE k1 = 'duplicate' AND k2 BETWEEN 10 AND 15 ORDER BY k2;
+
+-- Verify index structure
+SELECT total_pages >= 1 AS has_pages, leaf_pages >= 1 AS has_leaves FROM smol_inspect('t_text_rle_twocol_idx');
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- Cleanup
+DROP TABLE t_text_twocol CASCADE;
+DROP TABLE t_text_twocol_noinc CASCADE;
+DROP TABLE t_text_lengths_twocol CASCADE;
+DROP TABLE t_text_rle_twocol CASCADE;

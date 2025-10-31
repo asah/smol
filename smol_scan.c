@@ -470,7 +470,8 @@ smol_beginscan(Relation index, int nkeys, int norderbys)
         else
         {
             /* Two-col: compute offset/aligned size for key2, then INCLUDE attrs */
-            off2 = att_align_nominal(off1 + so->key_len, align2);
+            Size k1_size = key_is_text ? (Size)(VARHDRSZ + so->key_len) : (Size) so->key_len;
+            off2 = att_align_nominal(off1 + k1_size, align2);
             Size cur = off2 + so->key_len2;
             for (uint16 i=0;i<so->ninclude;i++)
             {
@@ -1596,17 +1597,34 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     }
                 }
                 /* Optimized copies for common fixed lengths; fallback for others */
-                if (so->key_len == 2) smol_copy2(so->itup_data, k1p);
+                int text_len = 0;
+                if (so->key_is_text32)
+                {
+                    /* TEXT: wrap in varlena header */
+                    while (text_len < (int)so->key_len && k1p[text_len] != '\0') text_len++;
+                    SET_VARSIZE(so->itup_data, VARHDRSZ + text_len);
+                    if (text_len > 0) memcpy(VARDATA(so->itup_data), k1p, text_len);
+                }
+                else if (so->key_len == 2) smol_copy2(so->itup_data, k1p);
                 else if (so->key_len == 4) smol_copy4(so->itup_data, k1p);
                 else if (so->key_len == 8) smol_copy8(so->itup_data, k1p);
                 else if (so->key_len == 16) smol_copy16(so->itup_data, k1p);
                 else smol_copy_small(so->itup_data, k1p, so->key_len);
 
-                if (so->key_len2 == 2) smol_copy2(so->itup_data + so->itup_off2, k2p);
-                else if (so->key_len2 == 4) smol_copy4(so->itup_data + so->itup_off2, k2p);
-                else if (so->key_len2 == 8) smol_copy8(so->itup_data + so->itup_off2, k2p);
-                else if (so->key_len2 == 16) smol_copy16(so->itup_data + so->itup_off2, k2p);
-                else smol_copy_small(so->itup_data + so->itup_off2, k2p, so->key_len2);
+                /* For two-column indexes, compute k2 offset dynamically when k1 is TEXT */
+                uint16 k2_off = so->itup_off2;
+                if (so->two_col && so->key_is_text32)
+                {
+                    /* TEXT k1 is variable-length, so k2 offset depends on actual text length */
+                    Size k1_actual_size = VARHDRSZ + text_len;
+                    k2_off = (uint16) att_align_nominal(k1_actual_size, so->align2);
+                }
+
+                if (so->key_len2 == 2) smol_copy2(so->itup_data + k2_off, k2p);
+                else if (so->key_len2 == 4) smol_copy4(so->itup_data + k2_off, k2p);
+                else if (so->key_len2 == 8) smol_copy8(so->itup_data + k2_off, k2p);
+                else if (so->key_len2 == 16) smol_copy16(so->itup_data + k2_off, k2p);
+                else smol_copy_small(so->itup_data + k2_off, k2p, so->key_len2);
 
                 /* Copy INCLUDE columns for two-column indexes */
                 if (so->ninclude > 0)
@@ -1614,10 +1632,15 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                     char *row_ptr = smol12_row_ptr(page, row, so->key_len, so->key_len2, so->inc_meta->inc_cumul_offs[so->ninclude]);
                     char *inc_start = row_ptr + so->key_len + so->key_len2;
 
-                    /* If any NUMERIC columns, compute offsets incrementally due to variable varlena size */
-                    if (so->has_numeric)
+                    /* If any NUMERIC columns or TEXT k1 in two-column, compute offsets incrementally due to variable varlena size */
+                    if (so->has_numeric || (so->two_col && so->key_is_text32))
                     {
-                        Size cur_off = so->inc_meta->inc_offs[0];  /* Start at first INCLUDE offset */
+                        /* Start offset: for TEXT k1, must compute from actual k2 position */
+                        Size cur_off;
+                        if (so->two_col && so->key_is_text32)
+                            cur_off = k2_off + so->key_len2;
+                        else
+                            cur_off = so->inc_meta->inc_offs[0];
                         for (uint16 i = 0; i < so->ninclude; i++)
                         {
                             char *inc_src = inc_start + so->inc_meta->inc_cumul_offs[i];
@@ -1651,8 +1674,8 @@ smol_gettuple(IndexScanDesc scan, ScanDirection dir)
                             else
                             {
                                 /* Fixed-length: direct copy */
-                                memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]); /* GCOV_EXCL_LINE */
-                                cur_off += so->inc_meta->inc_len[i]; /* GCOV_EXCL_LINE */
+                                memcpy(inc_dst, inc_src, so->inc_meta->inc_len[i]);
+                                cur_off += so->inc_meta->inc_len[i];
                             }
                         }
                     }

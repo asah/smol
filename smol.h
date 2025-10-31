@@ -858,8 +858,10 @@ smol_cmp_keyptr_to_bound(SmolScanOpaque so, const char *keyp)
         int blen = VARSIZE_ANY_EXHDR(bt);
         const char *b = VARDATA_ANY(bt);
         /* Compute key length up to first zero using memchr */
-        const char *kend = (const char *) memchr(keyp, '\0', 32);
-        int klen = kend ? (int)(kend - keyp) : 32;
+        /* In two-column indexes, k2 follows immediately after k1, so we must limit search to so->key_len */
+        int search_len = so->two_col ? so->key_len : 32;
+        const char *kend = (const char *) memchr(keyp, '\0', search_len);
+        int klen = kend ? (int)(kend - keyp) : search_len;
         int minl = (klen < blen) ? klen : blen;
         int cmp = minl ? memcmp(keyp, b, minl) : 0;
         if (cmp != 0) return (cmp > 0) - (cmp < 0);
@@ -894,8 +896,10 @@ smol_cmp_keyptr_to_upper_bound(SmolScanOpaque so, const char *keyp)
         text *bt = DatumGetTextPP(so->upper_bound_datum);
         int blen = VARSIZE_ANY_EXHDR(bt);
         const char *b = VARDATA_ANY(bt);
-        const char *kend = (const char *) memchr(keyp, '\0', 32);
-        int klen = kend ? (int)(kend - keyp) : 32;
+        /* In two-column indexes, k2 follows immediately after k1, so we must limit search to so->key_len */
+        int search_len = so->two_col ? so->key_len : 32;
+        const char *kend = (const char *) memchr(keyp, '\0', search_len);
+        int klen = kend ? (int)(kend - keyp) : search_len;
         int minl = (klen < blen) ? klen : blen;
         int cmp = minl ? memcmp(keyp, b, minl) : 0;
         if (cmp != 0) return (cmp > 0) - (cmp < 0);
